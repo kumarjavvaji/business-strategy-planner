@@ -4,6 +4,7 @@ import { useWorkspace }              from './hooks/useWorkspace'
 import { DEMO_STRATEGY_BASIS_PACKAGE } from './data/demoPackage'
 import Stage1View                    from './components/Stage1View'
 import Stage2View                    from './components/Stage2View'
+import Stage3View                    from './components/Stage3View'
 
 // ── Stage definitions ─────────────────────────────────────────────────────────
 const STAGES = [
@@ -15,15 +16,21 @@ const STAGES = [
 ]
 
 // ── Stage placeholder ─────────────────────────────────────────────────────────
+const STAGE_PLACEHOLDER_COPY = {
+  4: 'Stage 4 will translate Stage 3 execution plans into PDLC strategy, epic-level requirements, acceptance criteria, non-functional requirements, delivery sequencing, and implementation governance.',
+  5: 'Stage 5 will synthesise all stages into a unified strategic deliverable.',
+}
+
 function StagePlaceholder({ stage }) {
+  const copy = STAGE_PLACEHOLDER_COPY[stage.id] || 'Not yet implemented.'
   return (
     <div style={{ padding: '70px 20px', textAlign: 'center' }}>
       <div style={{ fontSize: 26, marginBottom: 14, opacity: .2, lineHeight: 1 }}>◯</div>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--muted2)' }}>
         {stage.label} — {stage.sub}
       </div>
-      <div style={{ fontSize: 10, fontFamily: 'var(--fm)', color: 'var(--muted)', maxWidth: 360, margin: '0 auto', lineHeight: 1.7 }}>
-        Not yet implemented.
+      <div style={{ fontSize: 10, fontFamily: 'var(--fm)', color: 'var(--muted)', maxWidth: 420, margin: '0 auto', lineHeight: 1.7 }}>
+        {copy}
       </div>
     </div>
   )
@@ -262,15 +269,18 @@ export default function App() {
     saveStage1AIRevision,
     clearWorkspace,
   } = useWorkspace()
-  const [activeStage,          setActiveStage]          = useState(1)
+  const [activeStage,           setActiveStage]           = useState(1)
   const [stage2PendingGenerate, setStage2PendingGenerate] = useState(false)
+  const [stage3PendingGenerate, setStage3PendingGenerate] = useState(false)
 
-  // Navigate to Stage 2 AND trigger an immediate full regeneration.
-  // Stage2View consumes the shouldAutoGenerate flag via useEffect on mount/update,
-  // runs its existing handleGenerate(), and saves a new revision into the normal history.
   function handleRegenerateAndGoToStage2() {
     setStage2PendingGenerate(true)
     setActiveStage(2)
+  }
+
+  function handleRegenerateAndGoToStage3() {
+    setStage3PendingGenerate(true)
+    setActiveStage(3)
   }
 
   // No workspace — show import screen
@@ -310,7 +320,6 @@ export default function App() {
   const stage2Revisions = fullWorkspace?.stageRevisions?.stage2 ?? []
   const stage2ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage2 ?? null
 
-  // Stage 2 is stale when its latest revision was generated from a different Stage 1 rev
   const latestStage2Rev = stage2Revisions.length > 0
     ? [...stage2Revisions].sort((a, b) => b.revisionNumber - a.revisionNumber)[0]
     : null
@@ -318,6 +327,23 @@ export default function App() {
 
   function handleSaveStage2Revision(revisionRecord) {
     saveRawRevision('stage2', revisionRecord)
+  }
+
+  // Stage 3 revision data
+  const stage3Revisions = fullWorkspace?.stageRevisions?.stage3 ?? []
+  const stage3ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage3 ?? null
+
+  const latestStage3Rev = stage3Revisions.length > 0
+    ? [...stage3Revisions].sort((a, b) => b.revisionNumber - a.revisionNumber)[0]
+    : null
+  // Stage 3 is stale when Stage 1 OR Stage 2 has changed since it was generated
+  const stage3IsStale = !!(latestStage3Rev && (
+    latestStage3Rev.sourceBasisRevisionId  !== stage1ActiveId ||
+    latestStage3Rev.sourceStage2RevisionId !== stage2ActiveId
+  ))
+
+  function handleSaveStage3Revision(revisionRecord) {
+    saveRawRevision('stage3', revisionRecord)
   }
 
   return (
@@ -351,6 +377,7 @@ export default function App() {
       <nav className="stage-nav">
         {STAGES.map(s => {
           const isStale2 = s.id === 2 && stage2IsStale && stage2Revisions.length > 0
+          const isStale3 = s.id === 3 && stage3IsStale && stage3Revisions.length > 0
           return (
             <button
               key={s.id}
@@ -365,6 +392,16 @@ export default function App() {
                 {isStale2 && (
                   <span
                     title="Stage 2 is stale — regenerate from the updated Stage 1"
+                    style={{
+                      display: 'inline-block', width: 6, height: 6,
+                      borderRadius: '50%', background: '#fb923c',
+                      flexShrink: 0, marginTop: 1,
+                    }}
+                  />
+                )}
+                {isStale3 && (
+                  <span
+                    title="Stage 3 is stale — regenerate from the updated upstream stages"
                     style={{
                       display: 'inline-block', width: 6, height: 6,
                       borderRadius: '50%', background: '#fb923c',
@@ -403,11 +440,29 @@ export default function App() {
             stage2ActiveId={stage2ActiveId}
             onSaveRevision={handleSaveStage2Revision}
             onNavigateToStage3={() => setActiveStage(3)}
+            onRegenerateAndGoToStage3={handleRegenerateAndGoToStage3}
+            stage3IsStale={stage3IsStale}
+            stage3HasRevisions={stage3Revisions.length > 0}
             shouldAutoGenerate={stage2PendingGenerate}
             onAutoGenerateComplete={() => setStage2PendingGenerate(false)}
           />
         )}
-        {activeStage > 2 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
+        {activeStage === 3 && (
+          <Stage3View
+            workspace={workspace}
+            stage1Revisions={stage1Revisions}
+            stage1ActiveId={stage1ActiveId}
+            stage2Revisions={stage2Revisions}
+            stage2ActiveId={stage2ActiveId}
+            stage3Revisions={stage3Revisions}
+            stage3ActiveId={stage3ActiveId}
+            onSaveRevision={handleSaveStage3Revision}
+            onNavigateToStage4={() => setActiveStage(4)}
+            shouldAutoGenerate={stage3PendingGenerate}
+            onAutoGenerateComplete={() => setStage3PendingGenerate(false)}
+          />
+        )}
+        {activeStage > 3 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
       </main>
 
     </div>

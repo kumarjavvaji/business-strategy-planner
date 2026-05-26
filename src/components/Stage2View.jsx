@@ -318,6 +318,9 @@ export default function Stage2View({
   stage2ActiveId,
   onSaveRevision,           // (revisionRecord) => void   — receives pre-built record
   onNavigateToStage3,
+  onRegenerateAndGoToStage3,// () => void — navigate + trigger Stage 3 regeneration
+  stage3IsStale,            // boolean — Stage 3 stale relative to current Stage 2
+  stage3HasRevisions,       // boolean — Stage 3 has at least one revision
   shouldAutoGenerate,       // boolean — set by Stage 1 "Regenerate & View Stage 2" CTA
   onAutoGenerateComplete,   // () => void — clears the flag after we consume it
 }) {
@@ -707,30 +710,62 @@ export default function Stage2View({
 
       {/* ── Stage 3 CTA ────────────────────────────────────────────────── */}
       <div style={{
-        background: 'var(--surface)', border: '1px solid rgba(59,130,246,.3)',
+        background: 'var(--surface)',
+        border: `1px solid ${stage3IsStale && stage3HasRevisions ? 'rgba(251,146,60,.35)' : 'rgba(59,130,246,.3)'}`,
         borderRadius: 'var(--r)', padding: '16px 18px',
         display: 'flex', alignItems: 'center', gap: 16,
       }}>
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
-            Continue to Stage 3 — Execution Planning
+            {stage3IsStale && stage3HasRevisions
+              ? 'Stage 3 is stale — business unit mapping has changed'
+              : 'Continue to Stage 3 — Execution Planning'
+            }
           </div>
           <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.65 }}>
-            Stage 3 will map responsibilities into execution plans per business unit.
-            Business unit mapping is ready.
+            {stage3IsStale && stage3HasRevisions
+              ? 'The active Stage 2 BU mapping has changed since Stage 3 was generated. Regenerate to re-align execution plans, or view the existing Stage 3.'
+              : 'Stage 3 will generate execution plans per business unit — including prioritised initiatives, sequencing, dependencies, and constraints.'
+            }
           </div>
         </div>
-        <button
-          onClick={onNavigateToStage3}
-          style={{
-            flexShrink: 0,
-            fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
-            padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
-            background: 'var(--accent)', border: 'none', color: '#000',
-          }}
-        >
-          Stage 3 →
-        </button>
+        {stage3IsStale && stage3HasRevisions ? (
+          <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+            <button
+              onClick={onNavigateToStage3}
+              style={{
+                fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '7px 16px', borderRadius: 5, cursor: 'pointer',
+                background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted2)',
+              }}
+            >
+              View Stage 3
+            </button>
+            <button
+              onClick={onRegenerateAndGoToStage3}
+              style={{
+                fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '7px 16px', borderRadius: 5, cursor: 'pointer',
+                background: 'rgba(251,146,60,.15)', border: '1px solid rgba(251,146,60,.4)',
+                color: '#fb923c',
+              }}
+            >
+              ↻ Regenerate & View →
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={onNavigateToStage3}
+            style={{
+              flexShrink: 0,
+              fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+              padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
+              background: 'var(--accent)', border: 'none', color: '#000',
+            }}
+          >
+            Stage 3 →
+          </button>
+        )}
       </div>
 
     </div>

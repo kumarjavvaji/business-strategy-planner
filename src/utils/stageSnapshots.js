@@ -243,3 +243,105 @@ export function buildStage2RevisionRecord({
     contentSnapshot:      buildStage2Snapshot(businessUnits, summaryNote),
   }
 }
+
+// ── Stage 3 snapshot ──────────────────────────────────────────────────────────
+
+/**
+ * Captures Stage 3 execution-plan content as a plain serialisable object.
+ * Each executionPlan corresponds to one Stage 2 business unit.
+ */
+export function buildStage3Snapshot(executionPlans, summaryNote) {
+  return {
+    executionPlans: (executionPlans || []).map(p => ({ ...p })),
+    summaryNote:    summaryNote || '',
+  }
+}
+
+/**
+ * Flattens a Stage 3 snapshot into a single text string for word-level diff.
+ */
+export function stage3SnapshotToText(snapshot) {
+  const lines = []
+  if (snapshot?.summaryNote) lines.push(`[Summary] ${snapshot.summaryNote}`)
+
+  ;(snapshot?.executionPlans || []).forEach((plan, i) => {
+    lines.push(`\n[Plan ${i + 1}: ${plan.buName}]`)
+
+    const push = (label, val) => { if (val) lines.push(`  ${label}: ${val}`) }
+    const list = (label, arr) => {
+      if (arr?.length) {
+        lines.push(`  ${label}:`)
+        arr.forEach(item => {
+          if (typeof item === 'string') lines.push(`    - ${item}`)
+          else if (item?.text)         lines.push(`    - [${item.type || '?'}] ${item.text}`)
+        })
+      }
+    }
+
+    push('Mission',               plan.mission)
+    list('Strategic Objectives',  plan.strategicObjectives)
+    list('Mission Critical',      plan.initiativesMissionCritical)
+    list('Optional',              plan.initiativesOptional)
+    list('Deferred',              plan.initiativesDeferred)
+    list('Blocked',               plan.initiativesBlocked)
+    push('Sequencing',            plan.sequencingNarrative)
+    list('Key Milestones',        plan.keyMilestones)
+    list('Cross-functional Deps', plan.crossFunctionalDependencies)
+    list('Required Capabilities', plan.requiredCapabilities)
+    list('Staffing/Ownership',    plan.staffingOwnership)
+    list('Systems/Tools',         plan.systemsTools)
+    list('Governance Cadence',    plan.governanceCadence)
+    list('Decision Rights',       plan.decisionRights)
+    list('Risks',                 plan.risks)
+    list('Constraints',           plan.constraints)
+    list('Unresolved Unknowns',   plan.unresolvedUnknowns)
+    list('Assumptions',           plan.assumptions)
+    list('Leading Indicators',    plan.leadingIndicators)
+    list('Success Metrics',       plan.keySuccessMetrics)
+    list('Failure Signals',       plan.failureSignals)
+    push('Readiness Assessment',  plan.readinessAssessment)
+    push('Execution Risk',        plan.executionRisk)
+    push('Dependency Complexity', plan.dependencyComplexity)
+    push('Confidence Level',      plan.confidenceLevel)
+    push('Org Readiness',         plan.organizationalReadiness)
+  })
+
+  return lines.join('\n')
+}
+
+/**
+ * Creates a Stage 3 revision record.
+ * source: 'ai' | 'mock' | 'manual'
+ * sourceBasisRevisionId:  Stage 1 revision ID active when generated.
+ * sourceStage2RevisionId: Stage 2 revision ID active when generated.
+ * refinementType: 'unit' | 'stage' | null
+ * affectedUnit:   BU name for unit-level refinements, null otherwise.
+ */
+export function buildStage3RevisionRecord({
+  executionPlans,
+  summaryNote,
+  revisionNumber,
+  sourceBasisRevisionId,
+  sourceStage2RevisionId,
+  source,
+  prompt,
+  impactSummary,
+  refinementType,
+  affectedUnit,
+}) {
+  const isFirst = revisionNumber === 1
+  return {
+    id:                     revisionId(),
+    revisionNumber,
+    label:                  isFirst ? 'Initial generation' : `Revision ${revisionNumber}`,
+    prompt:                 prompt        || '',
+    impactSummary:          impactSummary || '',
+    createdAt:              new Date().toISOString(),
+    source,
+    sourceBasisRevisionId:  sourceBasisRevisionId  || null,
+    sourceStage2RevisionId: sourceStage2RevisionId || null,
+    refinementType:         refinementType || null,
+    affectedUnit:           affectedUnit   || null,
+    contentSnapshot:        buildStage3Snapshot(executionPlans, summaryNote),
+  }
+}

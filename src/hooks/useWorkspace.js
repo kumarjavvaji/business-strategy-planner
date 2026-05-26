@@ -39,6 +39,26 @@ function emptyActiveIds() {
   return { stage1: null, stage2: null, stage3: null, stage4: null, stage5: null }
 }
 
+// ── Deduplication ─────────────────────────────────────────────────────────────
+
+/**
+ * Removes duplicate revisions that share the same revisionNumber within a stage.
+ * Keeps the first occurrence (lowest index = earliest created).
+ * Fixes data corrupted by React StrictMode double-invoking effects.
+ */
+function dedupeStageRevisions(stageRevisions) {
+  const result = {}
+  for (const [stage, revs] of Object.entries(stageRevisions || {})) {
+    const seen = new Set()
+    result[stage] = (revs || []).filter(r => {
+      if (seen.has(r.revisionNumber)) return false
+      seen.add(r.revisionNumber)
+      return true
+    })
+  }
+  return result
+}
+
 // ── Migration ─────────────────────────────────────────────────────────────────
 
 /**
@@ -82,11 +102,17 @@ function loadFromStorage() {
     // Detect and migrate old shape
     if (stored.workspace && !stored.normalizedWorkspace) {
       const migrated = migrateOldShape(stored)
+      if (migrated) {
+        migrated.stageRevisions = dedupeStageRevisions(migrated.stageRevisions)
+      }
       return migrated   // will be saved on next effect cycle
     }
 
-    // New shape — verify minimal required fields
-    if (stored.id && stored.normalizedWorkspace) return stored
+    // New shape — verify minimal required fields; dedupe on load
+    if (stored.id && stored.normalizedWorkspace) {
+      stored.stageRevisions = dedupeStageRevisions(stored.stageRevisions || emptyStageRevisions())
+      return stored
+    }
   } catch {}
   return null
 }
