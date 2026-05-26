@@ -8,9 +8,17 @@
 import React from 'react'
 
 function sourceLabel(source) {
-  if (source === 'import') return { text: 'Import', color: 'var(--accent)' }
-  if (source === 'manual') return { text: 'Manual', color: '#fb923c' }
-  return { text: source, color: 'var(--muted)' }
+  if (source === 'import') return { text: 'Import',    color: 'var(--accent)' }
+  if (source === 'manual') return { text: 'Manual',    color: '#fb923c'       }
+  if (source === 'ai')     return { text: 'AI',        color: '#3b82f6'       }
+  if (source === 'mock')   return { text: 'Mock',      color: '#fb923c'       }
+  return { text: source,             color: 'var(--muted)'  }
+}
+
+function refinementLabel(refinementType) {
+  if (refinementType === 'unit')  return { text: '↻ unit',  color: '#a78bfa' }
+  if (refinementType === 'stage') return { text: '⊞ stage', color: '#38bdf8' }
+  return null
 }
 
 export default function RevisionHistory({ revisions, activeRevisionId, onCompare, compareRevId }) {
@@ -60,6 +68,7 @@ export default function RevisionHistory({ revisions, activeRevisionId, onCompare
           const isActive    = rev.id === activeRevisionId
           const isComparing = rev.id === compareRevId
           const sl          = sourceLabel(rev.source)
+          const rl          = refinementLabel(rev.refinementType)
           const isFirst     = idx === 0  // newest
 
           return (
@@ -108,6 +117,27 @@ export default function RevisionHistory({ revisions, activeRevisionId, onCompare
                     }}>
                       {sl.text}
                     </span>
+                    {rl && (
+                      <span style={{
+                        fontSize: 7, fontFamily: 'var(--fm)', padding: '1px 5px', borderRadius: 2,
+                        background: `${rl.color}18`, border: `1px solid ${rl.color}30`,
+                        color: rl.color,
+                      }}>
+                        {rl.text}
+                      </span>
+                    )}
+                    {rev.affectedUnit && (
+                      <span style={{
+                        fontSize: 7, fontFamily: 'var(--fm)', padding: '1px 5px', borderRadius: 2,
+                        background: 'rgba(167,139,250,.12)', border: '1px solid rgba(167,139,250,.25)',
+                        color: '#a78bfa', maxWidth: 180,
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}
+                        title={rev.affectedUnit}
+                      >
+                        {rev.affectedUnit}
+                      </span>
+                    )}
                   </div>
 
                   <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 4 }}>

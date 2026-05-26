@@ -133,6 +133,124 @@ export function parseStage2Response(rawText) {
   }
 }
 
+// ── Unit-level refinement prompt builder ──────────────────────────────────────
+
+/**
+ * Build messages for regenerating a single business unit while preserving the rest.
+ * @param {object}   stage1Snapshot   — contentSnapshot from active Stage 1 revision
+ * @param {object[]} allBusinessUnits — full current BU array (all units)
+ * @param {number}   targetIndex      — 0-based index of the unit to regenerate
+ * @param {string}   refinementPrompt — the user's refinement instruction
+ * @returns {{ messages: Array<{ role, content }>, systemPrompt: string }}
+ */
+export function buildStage2UnitRefinementMessages(stage1Snapshot, allBusinessUnits, targetIndex, refinementPrompt) {
+  const context    = stageSnapshotToText(stage1Snapshot)
+  const targetUnit = allBusinessUnits[targetIndex]
+
+  // Summarise the other units for coherence context (name + level + purpose only)
+  const otherUnitsSummary = allBusinessUnits
+    .filter((_, i) => i !== targetIndex)
+    .map(u => `- ${u.name} (${u.involvementLevel}): ${u.purpose || '—'}`)
+    .join('\n')
+
+  const systemPrompt = `You are a strategic business analyst regenerating ONE specific business unit inside an existing Stage 2 business unit mapping.
+
+Preserve organisational coherence with the other units listed below. Do not alter dependencies, roles, or responsibilities that belong to other units.
+
+Return ONLY a valid JSON object for the single business unit — no markdown, no prose, no code fences. Exact schema:
+
+{
+  "name": "string — business unit or function name",
+  "purpose": "string — this unit's reason for existing in this specific strategic context",
+  "strategicInvolvement": "string — how this unit is involved",
+  "involvementLevel": "primary | supporting | informed",
+  "keyResponsibilities": ["string", "..."],
+  "dependencies": ["string", "..."],
+  "risksAndUnknowns": ["string", "..."],
+  "keySuccessMetrics": ["string", "..."]
+}
+
+Rules:
+- keyResponsibilities, dependencies, risksAndUnknowns, keySuccessMetrics: 2–5 items each
+- Be specific to this company, strategy, and unit — no generic lists
+- Respect and preserve role alignment with the other units listed in context`
+
+  const userPrompt = `Stage 1 Strategic Context:
+${context}
+
+Other business units in this mapping (for coherence — do not modify):
+${otherUnitsSummary}
+
+Business unit to regenerate:
+  Name: ${targetUnit.name}
+  Current purpose: ${targetUnit.purpose || '—'}
+  Current involvement: ${targetUnit.involvementLevel}
+  Current strategic role: ${targetUnit.strategicInvolvement || '—'}
+
+Refinement instruction:
+${refinementPrompt}
+
+Return only the updated JSON object for "${targetUnit.name}".`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt   },
+    ],
+    systemPrompt,
+  }
+}
+
+/**
+ * Parse a single business unit from a unit-level regeneration response.
+ * @param {string} rawText
+ * @returns {{ unit: object|null, error: string|null }}
+ */
+export function parseStage2UnitResponse(rawText) {
+  if (!rawText?.trim()) {
+    return { unit: null, error: 'Empty response from API.' }
+  }
+
+  let jsonStr = rawText.trim()
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (fenceMatch) jsonStr = fenceMatch[1].trim()
+
+  const firstBrace = jsonStr.indexOf('{')
+  const lastBrace  = jsonStr.lastIndexOf('}')
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    jsonStr = jsonStr.slice(firstBrace, lastBrace + 1)
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(jsonStr)
+  } catch {
+    return { unit: null, error: 'Could not parse JSON from unit response.' }
+  }
+
+  if (!parsed?.name) {
+    return { unit: null, error: 'Response did not contain a valid business unit object.' }
+  }
+
+  const safeStr  = v => (typeof v === 'string' ? v.trim() : String(v ?? ''))
+  const safeList = v => (Array.isArray(v) ? v.map(safeStr).filter(Boolean) : [])
+  const LEVELS   = new Set(['primary', 'supporting', 'informed'])
+
+  return {
+    unit: {
+      name:                 safeStr(parsed.name)                || 'Unnamed unit',
+      purpose:              safeStr(parsed.purpose),
+      strategicInvolvement: safeStr(parsed.strategicInvolvement),
+      involvementLevel:     LEVELS.has(parsed.involvementLevel) ? parsed.involvementLevel : 'supporting',
+      keyResponsibilities:  safeList(parsed.keyResponsibilities),
+      dependencies:         safeList(parsed.dependencies),
+      risksAndUnknowns:     safeList(parsed.risksAndUnknowns),
+      keySuccessMetrics:    safeList(parsed.keySuccessMetrics),
+    },
+    error: null,
+  }
+}
+
 // ── Mock generator ────────────────────────────────────────────────────────────
 
 /**

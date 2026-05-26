@@ -12,8 +12,8 @@
 
 const ANTHROPIC_BASE    = 'https://api.anthropic.com/v1'
 const ANTHROPIC_VERSION = '2023-06-01'
-const DEFAULT_MODEL     = 'claude-3-5-sonnet-20241022'
-const TIMEOUT_MS        = 45_000
+const DEFAULT_MODEL     = 'claude-sonnet-4-6'
+const TIMEOUT_MS        = 120_000
 
 // ── Key detection ─────────────────────────────────────────────────────────────
 
@@ -123,4 +123,4 @@ export async function callAI(messages, options = {}) {
 }
 
 // ── Named model constant for display ─────────────────────────────────────────
-export const AI_MODEL_LABEL = 'Claude (claude-3-5-sonnet)'
+export const AI_MODEL_LABEL = 'Claude (claude-sonnet-4-6)'

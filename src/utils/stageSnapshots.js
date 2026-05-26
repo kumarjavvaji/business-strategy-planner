@@ -191,6 +191,11 @@ export function buildManualRevision(normalizedWorkspace, revisionNumber, prompt,
  * Creates a Stage 2 revision record.
  * source: 'ai' | 'mock' | 'manual'
  * sourceBasisRevisionId: the Stage 1 revision ID active when this was generated.
+ * refinementType: 'unit' | 'stage' | null
+ *   'unit'  — a single BU was regenerated via localised refinement
+ *   'stage' — a cross-functional / org-wide correction note was recorded
+ *   null    — initial generation or full regeneration (no refinement context)
+ * affectedUnit: string | null — BU name for unit-level refinements
  */
 export function buildStage2RevisionRecord({
   businessUnits,
@@ -200,6 +205,8 @@ export function buildStage2RevisionRecord({
   source,
   prompt,
   impactSummary,
+  refinementType,
+  affectedUnit,
 }) {
   const isFirst = revisionNumber === 1
   return {
@@ -211,6 +218,8 @@ export function buildStage2RevisionRecord({
     createdAt:            new Date().toISOString(),
     source,                                         // 'ai' | 'mock' | 'manual'
     sourceBasisRevisionId: sourceBasisRevisionId || null,
+    refinementType:       refinementType || null,   // 'unit' | 'stage' | null
+    affectedUnit:         affectedUnit   || null,   // BU name for unit refinements
     contentSnapshot:      buildStage2Snapshot(businessUnits, summaryNote),
   }
 }

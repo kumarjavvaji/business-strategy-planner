@@ -1,11 +1,25 @@
 // Stage 2 — Business Unit Mapping
 // Generates an inferred BU structure from the active Stage 1 revision.
-// Supports: AI generation (VITE_OPENAI_API_KEY) + mock mode (no key required).
+// Supports: AI generation (VITE_ANTHROPIC_API_KEY) + mock mode (no key required).
+//
+// Refinement architecture:
+//   Unit-level  — localised panel inside each BU card; regenerates one unit via AI,
+//                 merges back into full snapshot, saves a new Stage 2 revision.
+//   Stage-level — bottom-of-stage RefinementPanel for cross-functional / org-wide
+//                 correction notes; creates full revision snapshots (manual, no AI).
+//
+// Revision history remains strictly stage-level — no nested unit histories.
 
 import React, { useState, useCallback } from 'react'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
-import { buildStage2Messages, parseStage2Response, generateMockStage2 } from '../utils/stage2Prompts'
-import { buildStage2RevisionRecord, stage2SnapshotToText }              from '../utils/stageSnapshots'
+import {
+  buildStage2Messages,
+  parseStage2Response,
+  generateMockStage2,
+  buildStage2UnitRefinementMessages,
+  parseStage2UnitResponse,
+} from '../utils/stage2Prompts'
+import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
 import RefinementPanel    from './RefinementPanel'
@@ -58,10 +72,40 @@ function SubList({ label, items, borderColor }) {
 }
 
 // ── Business unit card ────────────────────────────────────────────────────────
+// onRefineUnit: async (prompt: string, impact: string) => { error: string|null }
+// apiMode:      'ai' | 'mock'
+// globalBusy:   true while a parent-level generation is running
 
-function BUCard({ bu, index }) {
-  const [open, setOpen] = useState(true)
+function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
+  const [open,         setOpen]         = useState(true)
+  const [refineOpen,   setRefineOpen]   = useState(false)
+  const [refinePrompt, setRefinePrompt] = useState('')
+  const [refineImpact, setRefineImpact] = useState('')
+  const [isRefining,   setIsRefining]   = useState(false)
+  const [refineError,  setRefineError]  = useState(null)
+  const [refineDone,   setRefineDone]   = useState(false)
+
   const ls = levelStyle(bu.involvementLevel)
+
+  const canRefine  = apiMode === 'ai' && refinePrompt.trim().length > 0 && !isRefining && !globalBusy
+  const aiDisabled = apiMode !== 'ai'
+
+  async function handleRefine() {
+    if (!canRefine) return
+    setIsRefining(true)
+    setRefineError(null)
+    const { error } = await onRefineUnit(refinePrompt.trim(), refineImpact.trim())
+    setIsRefining(false)
+    if (error) {
+      setRefineError(error)
+    } else {
+      setRefineDone(true)
+      setRefinePrompt('')
+      setRefineImpact('')
+      setRefineOpen(false)
+      setTimeout(() => setRefineDone(false), 2500)
+    }
+  }
 
   return (
     <div style={{
@@ -91,6 +135,11 @@ function BUCard({ bu, index }) {
         <span style={{ fontSize: 12, fontWeight: 600, flex: 1, color: 'var(--text)' }}>
           {bu.name}
         </span>
+        {refineDone && (
+          <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4', flexShrink: 0 }}>
+            ✓ Updated
+          </span>
+        )}
         <Badge color={ls.color}>{bu.involvementLevel}</Badge>
         {bu.strategicInvolvement && (
           <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -118,6 +167,141 @@ function BUCard({ bu, index }) {
             <SubList label="Risks & Unknowns"     items={bu.risksAndUnknowns}    borderColor="rgba(248,113,113,.45)" />
             <SubList label="Key Success Metrics"  items={bu.keySuccessMetrics}   borderColor="rgba(0,229,180,.4)"   />
           </div>
+
+          {/* ── Unit-level refinement panel ───────────────────────────────── */}
+          <div style={{
+            marginTop: 10,
+            borderTop: '1px solid var(--border)',
+            paddingTop: 10,
+          }}>
+            {/* Toggle row */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <button
+                onClick={() => { setRefineOpen(o => !o); setRefineError(null) }}
+                disabled={globalBusy}
+                style={{
+                  fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+                  padding: '3px 10px', borderRadius: 4,
+                  cursor: globalBusy ? 'not-allowed' : 'pointer',
+                  background: refineOpen ? 'rgba(59,130,246,.12)' : 'var(--s2)',
+                  border: `1px solid ${refineOpen ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
+                  color: refineOpen ? 'var(--accent)' : 'var(--muted)',
+                  transition: 'background .12s, color .12s',
+                }}
+              >
+                ↻ Refine this unit {refineOpen ? '▲' : '▼'}
+              </button>
+              {aiDisabled && (
+                <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+                  Requires API key
+                </span>
+              )}
+            </div>
+
+            {/* Refinement fields */}
+            {refineOpen && (
+              <div style={{
+                marginTop: 10,
+                background: 'var(--s2)', border: '1px solid var(--border)',
+                borderRadius: 6, padding: '12px 12px 10px',
+              }}>
+                {/* Refinement prompt */}
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{
+                    fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+                    textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4,
+                  }}>
+                    Refinement instruction <span style={{ color: '#f87171' }}>*</span>
+                  </div>
+                  <textarea
+                    value={refinePrompt}
+                    onChange={e => setRefinePrompt(e.target.value)}
+                    rows={3}
+                    disabled={aiDisabled || isRefining}
+                    placeholder={`e.g. Mark ${bu.name} as primary, not supporting — they own the compliance sign-off. Add regulatory monitoring as a key responsibility.`}
+                    style={{
+                      width: '100%', boxSizing: 'border-box',
+                      fontSize: 10, fontFamily: 'var(--fm)',
+                      color: 'var(--text)', background: aiDisabled ? 'var(--s2)' : 'var(--surface)',
+                      border: '1px solid var(--border)', borderRadius: 4,
+                      padding: '7px 9px', resize: 'vertical', outline: 'none',
+                      lineHeight: 1.6, opacity: aiDisabled ? 0.5 : 1,
+                    }}
+                  />
+                </div>
+
+                {/* Impact summary */}
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{
+                    fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+                    textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4,
+                  }}>
+                    Impact summary <span style={{ opacity: .5 }}>(optional)</span>
+                  </div>
+                  <textarea
+                    value={refineImpact}
+                    onChange={e => setRefineImpact(e.target.value)}
+                    rows={2}
+                    disabled={aiDisabled || isRefining}
+                    placeholder="e.g. Elevates compliance to primary — now blocks pilot launch without sign-off."
+                    style={{
+                      width: '100%', boxSizing: 'border-box',
+                      fontSize: 10, fontFamily: 'var(--fm)',
+                      color: 'var(--text)', background: aiDisabled ? 'var(--s2)' : 'var(--surface)',
+                      border: '1px solid var(--border)', borderRadius: 4,
+                      padding: '7px 9px', resize: 'vertical', outline: 'none',
+                      lineHeight: 1.6, opacity: aiDisabled ? 0.5 : 1,
+                    }}
+                  />
+                </div>
+
+                {/* Actions row */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <button
+                    onClick={handleRefine}
+                    disabled={!canRefine}
+                    style={{
+                      fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+                      padding: '5px 14px', borderRadius: 4,
+                      cursor: canRefine ? 'pointer' : 'not-allowed',
+                      background: canRefine ? 'var(--accent)' : 'var(--s2)',
+                      border: `1px solid ${canRefine ? 'var(--accent)' : 'var(--border)'}`,
+                      color: canRefine ? '#000' : 'var(--muted)',
+                      opacity: canRefine ? 1 : 0.6,
+                      transition: 'background .12s, color .12s',
+                    }}
+                  >
+                    {isRefining ? 'Regenerating…' : 'Regenerate this unit'}
+                  </button>
+                  {!canRefine && !isRefining && !aiDisabled && (
+                    <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+                      Enter an instruction to regenerate.
+                    </span>
+                  )}
+                  {isRefining && (
+                    <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+                      Regenerating "{bu.name}" — preserving all other units…
+                    </span>
+                  )}
+                </div>
+
+                {/* Inline error */}
+                {refineError && (
+                  <div style={{
+                    marginTop: 8, fontSize: 9, fontFamily: 'var(--fm)',
+                    color: '#f87171', lineHeight: 1.6,
+                    padding: '6px 9px', borderRadius: 4,
+                    background: 'rgba(248,113,113,.07)',
+                    border: '1px solid rgba(248,113,113,.25)',
+                    display: 'flex', gap: 5,
+                  }}>
+                    <span style={{ flexShrink: 0 }}>⚠</span>
+                    <span>{refineError}</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -142,7 +326,7 @@ export default function Stage2View({
   const [compareRevId,   setCompareRevId]   = useState(null)
 
   // ── Derived state ───────────────────────────────────────────────────────────
-  const activeRev = stage2Revisions.find(r => r.id === stage2ActiveId) ?? null
+  const activeRev     = stage2Revisions.find(r => r.id === stage2ActiveId) ?? null
   const businessUnits = activeRev?.contentSnapshot?.businessUnits || []
   const summaryNote   = activeRev?.contentSnapshot?.summaryNote   || ''
 
@@ -157,7 +341,7 @@ export default function Stage2View({
   const compareRevision = compareRevId ? stage2Revisions.find(r => r.id === compareRevId) ?? null : null
   const apiMode = getApiMode()   // 'ai' | 'mock'
 
-  // ── Generation ──────────────────────────────────────────────────────────────
+  // ── Full Stage 2 generation ─────────────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
     if (!activeStage1Rev) return
     setIsGenerating(true)
@@ -165,13 +349,15 @@ export default function Stage2View({
     setRawResponse(null)
     setShowRaw(false)
 
+    console.log('[Stage2] hasApiKey:', hasApiKey(), '| path:', hasApiKey() ? 'AI' : 'mock')
+    console.log('[Stage2] VITE_ANTHROPIC_API_KEY present:', !!(import.meta.env.VITE_ANTHROPIC_API_KEY))
+
     const snapshot = activeStage1Rev.contentSnapshot
-    let businessUnits, summaryNote, source
+    let buList, note, source
 
     if (hasApiKey()) {
-      // ── AI path ──────────────────────────────────────────────────────────
       const { messages } = buildStage2Messages(snapshot)
-      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 2500 })
+      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 6000 })
 
       if (error) {
         setGenError(error)
@@ -188,45 +374,89 @@ export default function Stage2View({
         return
       }
 
-      businessUnits = parsed.businessUnits
-      summaryNote   = parsed.summaryNote
-      source        = 'ai'
+      buList = parsed.businessUnits
+      note   = parsed.summaryNote
+      source = 'ai'
 
     } else {
-      // ── Mock path ─────────────────────────────────────────────────────────
       const mock = generateMockStage2(snapshot)
-      businessUnits = mock.businessUnits
-      summaryNote   = mock.summaryNote
-      source        = 'mock'
+      buList = mock.businessUnits
+      note   = mock.summaryNote
+      source = 'mock'
     }
 
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
-      businessUnits,
-      summaryNote,
+      businessUnits:        buList,
+      summaryNote:          note,
       revisionNumber:       nextNum,
       sourceBasisRevisionId: stage1ActiveId,
       source,
       prompt:        '',
       impactSummary: `Generated from Stage 1 revision v${activeStage1Rev.revisionNumber} via ${source === 'ai' ? AI_MODEL_LABEL : 'mock generator'}.`,
+      // refinementType and affectedUnit intentionally omitted (null) for full regeneration
     })
 
     onSaveRevision(record)
     setIsGenerating(false)
   }, [activeStage1Rev, stage1ActiveId, stage2Revisions.length, onSaveRevision])
 
-  // ── Correction note (RefinementPanel handler) ────────────────────────────────
-  function handleSaveCorrectionNote({ prompt, impactSummary }) {
+  // ── Unit-level AI regeneration ──────────────────────────────────────────────
+  // Returns { error: string|null } — does NOT set global isGenerating.
+  // Loading state is owned by the BUCard that triggered the call.
+  const handleUnitRegenerate = useCallback(async (buIndex, refinementPrompt, impactSummary) => {
+    if (!activeStage1Rev)  return { error: 'No active Stage 1 revision.' }
+    if (!hasApiKey())      return { error: 'API key required for unit regeneration.' }
+    if (!activeRev)        return { error: 'No active Stage 2 revision to update.' }
+
+    const snapshot = activeStage1Rev.contentSnapshot
+    const { messages } = buildStage2UnitRefinementMessages(
+      snapshot, businessUnits, buIndex, refinementPrompt,
+    )
+
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 2000 })
+    if (error) return { error }
+
+    const parsed = parseStage2UnitResponse(result)
+    if (parsed.error || !parsed.unit) return { error: parsed.error || 'Response parse failed.' }
+
+    // Splice the regenerated unit back into the full BU array
+    const updatedBUs = businessUnits.map((bu, i) => (i === buIndex ? parsed.unit : bu))
+    const unitName   = businessUnits[buIndex]?.name || `Unit ${buIndex + 1}`
+
+    const nextNum = stage2Revisions.length + 1
+    const record  = buildStage2RevisionRecord({
+      businessUnits:         updatedBUs,
+      summaryNote,
+      revisionNumber:        nextNum,
+      sourceBasisRevisionId: activeRev.sourceBasisRevisionId,
+      source:                'ai',
+      prompt:                refinementPrompt,
+      impactSummary:         impactSummary || `Regenerated "${unitName}": ${refinementPrompt.slice(0, 80)}${refinementPrompt.length > 80 ? '…' : ''}`,
+      refinementType:        'unit',
+      affectedUnit:          unitName,
+    })
+
+    onSaveRevision(record)
+    return { error: null }
+  }, [activeStage1Rev, activeRev, businessUnits, summaryNote, stage2Revisions.length, onSaveRevision])
+
+  // ── Stage-level correction note ─────────────────────────────────────────────
+  // Cross-functional / org-wide corrections: saves a full revision snapshot (manual).
+  // Does not regenerate via AI — use "Regenerate with AI" for full AI regeneration.
+  function handleStageRefinement({ prompt, impactSummary }) {
     if (!activeRev) return
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
       businessUnits: activeRev.contentSnapshot.businessUnits,
       summaryNote:   activeRev.contentSnapshot.summaryNote,
-      revisionNumber:       nextNum,
+      revisionNumber:        nextNum,
       sourceBasisRevisionId: activeRev.sourceBasisRevisionId,
-      source:        'manual',
+      source:                'manual',
       prompt,
       impactSummary,
+      refinementType:        'stage',
+      affectedUnit:          null,
     })
     onSaveRevision(record)
   }
@@ -292,13 +522,16 @@ export default function Stage2View({
             </div>
           )}
         </div>
-        <GenerateButton
-          apiMode={apiMode}
-          isGenerating={isGenerating}
-          isRegenerate={true}
-          onGenerate={handleGenerate}
-          disabled={!activeStage1Rev}
-        />
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+          <GenerateButton
+            apiMode={apiMode}
+            isGenerating={isGenerating}
+            isRegenerate={true}
+            onGenerate={handleGenerate}
+            disabled={!activeStage1Rev}
+          />
+          <ApiModeStatus apiMode={apiMode} />
+        </div>
       </div>
 
       {/* ── Staleness banner ───────────────────────────────────────────── */}
@@ -389,9 +622,21 @@ export default function Stage2View({
             }}>
               {businessUnits.length}
             </span>
+            {apiMode === 'ai' && (
+              <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', opacity: .65 }}>
+                · Each unit has a localised ↻ Refine panel below its content
+              </span>
+            )}
           </div>
           {businessUnits.map((bu, i) => (
-            <BUCard key={i} bu={bu} index={i} />
+            <BUCard
+              key={i}
+              bu={bu}
+              index={i}
+              apiMode={apiMode}
+              globalBusy={isGenerating}
+              onRefineUnit={(prompt, impact) => handleUnitRegenerate(i, prompt, impact)}
+            />
           ))}
         </div>
       )}
@@ -414,14 +659,23 @@ export default function Stage2View({
         compareRevId={compareRevId}
       />
 
-      {/* ── Correction note ────────────────────────────────────────────── */}
+      {/* ── Stage-level cross-functional refinements ────────────────────── */}
       <RefinementPanel
-        onSaveRevision={handleSaveCorrectionNote}
-        title="Correction Note"
-        subtitle="Record a manual correction, context addition, or clarification against this BU mapping. Use 'Regenerate with AI' above to fully re-generate from Stage 1."
-        saveLabel="Save correction note"
-        promptLabel="Correction / context note"
-        promptPlaceholder="e.g. Legal & Compliance should be marked as primary, not supporting — regulatory sign-off is blocking the pilot. Add a Data Engineering unit to own the pipeline build."
+        onSaveRevision={handleStageRefinement}
+        title="Cross-functional Refinements"
+        subtitle={
+          'Use this section for organisation-wide or cross-department changes that affect multiple business units or the overall operating model. ' +
+          'This saves a correction note as a new revision — use "Regenerate with AI" above to fully re-generate the BU structure from Stage 1.'
+        }
+        saveLabel="Save refinement note"
+        promptLabel="Refinement instruction"
+        promptPlaceholder={
+          'Examples:\n' +
+          '· Finance should not participate until pilot validation is complete.\n' +
+          '· Add Partnerships as a new business unit.\n' +
+          '· Reduce staffing assumptions across all units to reflect the revised budget posture.\n' +
+          '· Elevate Legal & Compliance to primary across all units — regulatory risk is now the gating factor.'
+        }
         aiNotice={null}
       />
 
@@ -476,7 +730,7 @@ function EmptyState({
       <div style={{ fontSize: 11, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.7, maxWidth: 420, margin: '0 auto 24px' }}>
         {apiMode === 'ai'
           ? 'Generate an AI-inferred business-unit structure from the active Stage 1 strategy basis.'
-          : 'Generate a mock business-unit structure from the active Stage 1 strategy basis. Add VITE_OPENAI_API_KEY to .env.local for AI generation.'}
+          : 'Generate a mock business-unit structure from the active Stage 1 strategy basis. Add VITE_ANTHROPIC_API_KEY to .env.local and restart the dev server for AI generation.'}
       </div>
 
       {!activeStage1Rev && (
@@ -577,6 +831,10 @@ function GenerateButton({ apiMode, isGenerating, isRegenerate, onGenerate, disab
 // ── API mode status line ──────────────────────────────────────────────────────
 
 function ApiModeStatus({ apiMode }) {
+  const rawKey  = import.meta.env.VITE_ANTHROPIC_API_KEY
+  const keyLen  = rawKey ? rawKey.length : 0
+  const keyPreview = rawKey ? `${rawKey.slice(0, 10)}…` : '—'
+
   if (apiMode === 'ai') {
     return (
       <div style={{
@@ -587,24 +845,31 @@ function ApiModeStatus({ apiMode }) {
           display: 'inline-block', width: 5, height: 5, borderRadius: '50%',
           background: '#00e5b4', flexShrink: 0,
         }} />
-        API mode: AI enabled ({AI_MODEL_LABEL})
+        AI enabled · key length: {keyLen}
       </div>
     )
   }
   return (
     <div style={{
-      fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
-      display: 'flex', alignItems: 'center', gap: 4,
+      fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171',
+      display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 3,
     }}>
-      <span style={{
-        display: 'inline-block', width: 5, height: 5, borderRadius: '50%',
-        background: 'var(--border2)', flexShrink: 0,
-      }} />
-      API mode: Mock only — add{' '}
-      <code style={{ fontSize: 8, background: 'var(--s2)', padding: '0 3px', borderRadius: 2 }}>
-        VITE_ANTHROPIC_API_KEY
-      </code>
-      {' '}to .env.local and restart
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <span style={{
+          display: 'inline-block', width: 5, height: 5, borderRadius: '50%',
+          background: '#f87171', flexShrink: 0,
+        }} />
+        Key not detected — mock mode
+      </div>
+      <div style={{ color: 'var(--muted)', lineHeight: 1.5 }}>
+        raw value: <code style={{ fontSize: 8, background: 'var(--s2)', padding: '0 3px', borderRadius: 2 }}>
+          {keyPreview}
+        </code>
+        {' '}({keyLen} chars)
+      </div>
+      <div style={{ color: 'var(--muted)', lineHeight: 1.5 }}>
+        Add <code style={{ fontSize: 8, background: 'var(--s2)', padding: '0 3px', borderRadius: 2 }}>VITE_ANTHROPIC_API_KEY</code> to .env.local · restart server · hard-refresh browser
+      </div>
     </div>
   )
 }
