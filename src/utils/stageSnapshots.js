@@ -1,0 +1,152 @@
+// Stage snapshot utilities
+// Builds serialisable content snapshots of each stage's workspace data.
+// Used for revision storage and word-level diff comparisons.
+
+// ── Stage 1 snapshot ──────────────────────────────────────────────────────────
+
+/**
+ * Captures all displayable Stage 1 content from a normalized workspace.
+ * Returns a plain object — no functions, no React.
+ */
+export function buildStage1Snapshot(nw) {
+  const { entity, artifact, strategy, evidence, lineage } = nw
+  const data = artifact?.data || {}
+  return {
+    // Artifact identity
+    artifactTitle:     artifact?.title    || '',
+    artifactType:      artifact?.type     || '',
+    artifactSubtitle:  data.subtitle      || '',
+    personaSummary:    data.personaSummary || '',
+    versionNumber:     artifact?.versionNumber ?? null,
+
+    // Strategy basis
+    thesis:               strategy?.thesis               || '',
+    businessProblem:      strategy?.businessProblem      || '',
+    opportunity:          strategy?.opportunity          || '',
+    recommendedDirection: strategy?.recommendedDirection || '',
+    confidenceLevel:      strategy?.confidenceLevel      || '',
+    readinessLevel:       strategy?.readinessLevel       || '',
+    targetCustomer:       strategy?.targetCustomer       || '',
+
+    // Artifact content sections
+    sections: (data.sections || []).map(s => ({
+      heading: s.heading || '',
+      body:    s.body    || '',
+    })),
+
+    // Decisions / actions
+    keyDecisions:          data.keyDecisions           || [],
+    callToAction:          data.callToAction           || '',
+    validationCheckpoints: data.validationCheckpoints  || [],
+    readinessWarnings:     data.readinessWarnings      || [],
+
+    // Evidence
+    risks:                 evidence?.risks                 || [],
+    keyInsights:           evidence?.keyInsights           || [],
+    supportingClaims:      evidence?.supportingClaims      || [],
+    unresolvedQuestions:   evidence?.unresolvedQuestions   || [],
+    userContextAdditions:  evidence?.userContextAdditions  || [],
+    stage1Intent:          evidence?.stage1Intent          || '',
+    stage2Summary:         evidence?.stage2Summary         || '',
+    stage3Synthesis:       evidence?.stage3Synthesis       || '',
+
+    // Lineage
+    sourceStage:           lineage?.sourceStage           || '',
+    sourceArtifactVersion: lineage?.sourceArtifactVersion || '',
+    lineageNotes:          lineage?.notes                 || '',
+  }
+}
+
+/**
+ * Flattens a Stage 1 snapshot into a single text string for word-level diff.
+ * Preserves structure through section headers so diffs are legible.
+ */
+export function stageSnapshotToText(snapshot) {
+  const lines = []
+
+  function push(label, value) {
+    if (value) lines.push(`[${label}] ${value}`)
+  }
+  function pushList(label, arr) {
+    if (arr?.length) {
+      lines.push(`[${label}]`)
+      arr.forEach((item, i) => lines.push(`  ${i + 1}. ${item}`))
+    }
+  }
+
+  push('Title',                snapshot.artifactTitle)
+  push('Type',                 snapshot.artifactType)
+  push('Subtitle',             snapshot.artifactSubtitle)
+  push('Persona',              snapshot.personaSummary)
+  push('Target Customer',      snapshot.targetCustomer)
+  push('Confidence',           snapshot.confidenceLevel)
+  push('Readiness',            snapshot.readinessLevel)
+  push('Thesis',               snapshot.thesis)
+  push('Business Problem',     snapshot.businessProblem)
+  push('Opportunity',          snapshot.opportunity)
+  push('Recommended Direction',snapshot.recommendedDirection)
+
+  if (snapshot.sections?.length) {
+    snapshot.sections.forEach(sec => {
+      push(sec.heading || 'Section', sec.body)
+    })
+  }
+
+  pushList('Key Decisions',          snapshot.keyDecisions)
+  push('Call to Action',             snapshot.callToAction)
+  pushList('Validation Checkpoints', snapshot.validationCheckpoints)
+  pushList('Readiness Warnings',     snapshot.readinessWarnings)
+  pushList('Identified Risks',       snapshot.risks)
+  pushList('Key Insights',           snapshot.keyInsights)
+  pushList('Supporting Claims',      snapshot.supportingClaims)
+  pushList('Unresolved Questions',   snapshot.unresolvedQuestions)
+  pushList('User Context Additions', snapshot.userContextAdditions)
+
+  push('Stage 1 Intent',    snapshot.stage1Intent)
+  push('Stage 2 Summary',   snapshot.stage2Summary)
+  push('Stage 3 Synthesis', snapshot.stage3Synthesis)
+  push('Source Stage',      snapshot.sourceStage)
+  push('Lineage Notes',     snapshot.lineageNotes)
+
+  return lines.join('\n')
+}
+
+// ── Revision builders ─────────────────────────────────────────────────────────
+
+function revisionId() {
+  return 'rev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7)
+}
+
+/**
+ * Creates the first (import) revision for a stage.
+ */
+export function buildInitialRevision(normalizedWorkspace) {
+  const snapshot = buildStage1Snapshot(normalizedWorkspace)
+  return {
+    id:             revisionId(),
+    revisionNumber: 1,
+    label:          'Initial import',
+    prompt:         '',
+    impactSummary:  'Created from imported DomainIQ Strategy Basis Package.',
+    createdAt:      new Date().toISOString(),
+    source:         'import',
+    contentSnapshot: snapshot,
+  }
+}
+
+/**
+ * Creates a subsequent manual revision for a stage.
+ */
+export function buildManualRevision(normalizedWorkspace, revisionNumber, prompt, impactSummary) {
+  const snapshot = buildStage1Snapshot(normalizedWorkspace)
+  return {
+    id:             revisionId(),
+    revisionNumber,
+    label:          `Revision ${revisionNumber}`,
+    prompt:         prompt         || '',
+    impactSummary:  impactSummary  || '',
+    createdAt:      new Date().toISOString(),
+    source:         'manual',
+    contentSnapshot: snapshot,
+  }
+}

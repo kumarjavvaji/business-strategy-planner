@@ -2,6 +2,9 @@
 // Reads from the normalized workspace model. Never accesses the raw package.
 
 import React, { useState } from 'react'
+import RefinementPanel     from './RefinementPanel'
+import RevisionHistory     from './RevisionHistory'
+import RevisionDiffViewer  from './RevisionDiffViewer'
 
 // ── Posture colour map ────────────────────────────────────────────────────────
 const POSTURE_COLORS = {
@@ -91,7 +94,15 @@ function Section({ title, label, children, defaultOpen = true }) {
 
 // ── Main Stage 1 view ─────────────────────────────────────────────────────────
 
-export default function Stage1View({ workspace }) {
+export default function Stage1View({
+  workspace,
+  stageRevisions,
+  activeRevisionId,
+  onSaveRevision,
+  onNavigateToStage2,
+}) {
+  const [compareRevId, setCompareRevId] = useState(null)
+
   const { entity, artifact, strategy, evidence, lineage } = workspace
   const data     = artifact?.data    || {}
   const sections = data.sections     || []
@@ -100,6 +111,10 @@ export default function Stage1View({ workspace }) {
                   : strategy.confidenceLevel === 'Medium' ? '#fb923c'
                   : strategy.confidenceLevel === 'Low'    ? '#f87171'
                   : 'var(--muted)'
+
+  // Derive current and compare-target revisions for diff viewer
+  const currentRevision = stageRevisions?.find(r => r.id === activeRevisionId) ?? null
+  const compareRevision = compareRevId ? stageRevisions?.find(r => r.id === compareRevId) ?? null : null
 
   return (
     <div style={{ maxWidth: 840, padding: '0 16px 40px' }}>
@@ -310,6 +325,54 @@ export default function Stage1View({ workspace }) {
         )}
         {lineage.notes && <Field label="Notes" value={lineage.notes} />}
       </Section>
+
+      {/* ── Diff viewer (shown when a prior revision is selected for compare) */}
+      {compareRevision && currentRevision && (
+        <RevisionDiffViewer
+          revA={compareRevision}
+          revB={currentRevision}
+          onClose={() => setCompareRevId(null)}
+        />
+      )}
+
+      {/* ── Revision History ─────────────────────────────────────────────── */}
+      <RevisionHistory
+        revisions={stageRevisions}
+        activeRevisionId={activeRevisionId}
+        onCompare={id => setCompareRevId(id)}
+        compareRevId={compareRevId}
+      />
+
+      {/* ── Refinement Panel ─────────────────────────────────────────────── */}
+      <RefinementPanel onSaveRevision={onSaveRevision} />
+
+      {/* ── Stage 2 CTA ──────────────────────────────────────────────────── */}
+      <div style={{
+        background: 'var(--surface)', border: '1px solid rgba(59,130,246,.3)',
+        borderRadius: 'var(--r)', padding: '16px 18px', marginBottom: 10,
+        display: 'flex', alignItems: 'center', gap: 16,
+      }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
+            Continue to Stage 2 — Business Unit Mapping
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.65 }}>
+            Stage 2 will map this strategy into business-unit responsibilities.
+            Stage 1 import and refinement history are now ready.
+          </div>
+        </div>
+        <button
+          onClick={onNavigateToStage2}
+          style={{
+            flexShrink: 0,
+            fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+            padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
+            background: 'var(--accent)', border: 'none', color: '#000',
+          }}
+        >
+          Stage 2 →
+        </button>
+      </div>
 
     </div>
   )

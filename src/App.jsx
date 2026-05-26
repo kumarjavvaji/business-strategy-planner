@@ -15,14 +15,17 @@ const STAGES = [
 
 // ── Stage placeholder ─────────────────────────────────────────────────────────
 function StagePlaceholder({ stage }) {
+  const isStage2 = stage.id === 2
   return (
     <div style={{ padding: '70px 20px', textAlign: 'center' }}>
       <div style={{ fontSize: 26, marginBottom: 14, opacity: .2, lineHeight: 1 }}>◯</div>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--muted2)' }}>
         {stage.label} — {stage.sub}
       </div>
-      <div style={{ fontSize: 10, fontFamily: 'var(--fm)', color: 'var(--muted)', maxWidth: 320, margin: '0 auto', lineHeight: 1.7 }}>
-        Not yet implemented. Review and approve Stage 1 before this stage is unlocked.
+      <div style={{ fontSize: 10, fontFamily: 'var(--fm)', color: 'var(--muted)', maxWidth: 360, margin: '0 auto', lineHeight: 1.7 }}>
+        {isStage2
+          ? 'Stage 2 will map this strategy into business-unit responsibilities. Stage 1 import and refinement history are now ready.'
+          : 'Not yet implemented.'}
       </div>
     </div>
   )
@@ -50,7 +53,6 @@ function ImportPanel({ onImport }) {
       } catch {
         setFileStatus(null)
         setError(`Could not parse "${file.name}" — file does not contain valid JSON.`)
-        // Reset input so the same file can be re-selected after fixing an error
         if (fileInputRef.current) fileInputRef.current.value = ''
         return
       }
@@ -252,7 +254,14 @@ function ImportPanel({ onImport }) {
 
 // ── App shell ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const { workspace, importPackage, clearWorkspace } = useWorkspace()
+  const {
+    fullWorkspace,
+    workspace,
+    importedAt,
+    importPackage,
+    saveStageRevision,
+    clearWorkspace,
+  } = useWorkspace()
   const [activeStage, setActiveStage] = useState(1)
 
   // No workspace — show import screen
@@ -274,6 +283,14 @@ export default function App() {
     workspace.entity.domain   ||
     workspace.entity.name     || ''
 
+  // Stage 1 revision data
+  const stage1Revisions     = fullWorkspace?.stageRevisions?.stage1 ?? []
+  const stage1ActiveId      = fullWorkspace?.activeStageRevisionIds?.stage1 ?? null
+
+  function handleSaveStage1Revision({ prompt, impactSummary }) {
+    saveStageRevision('stage1', { prompt, impactSummary })
+  }
+
   return (
     <div className="app">
 
@@ -290,27 +307,27 @@ export default function App() {
           </>
         )}
         <div className="app-header-actions">
-          <span className="app-header-imported">
-            Imported {new Date(workspace.importedAt).toLocaleDateString()}
-          </span>
+          {importedAt && (
+            <span className="app-header-imported">
+              Imported {new Date(importedAt).toLocaleDateString()}
+            </span>
+          )}
           <button className="btn-clear" onClick={clearWorkspace}>
             Clear
           </button>
         </div>
       </header>
 
-      {/* Stage tab nav */}
+      {/* Stage tab nav — all tabs clickable */}
       <nav className="stage-nav">
         {STAGES.map(s => (
           <button
             key={s.id}
-            onClick={() => s.id === 1 && setActiveStage(1)}
+            onClick={() => setActiveStage(s.id)}
             className={[
               'stage-tab',
               activeStage === s.id ? 'active' : '',
-              s.id > 1 ? 'locked' : '',
             ].filter(Boolean).join(' ')}
-            title={s.id > 1 ? 'Not yet implemented' : undefined}
           >
             <span className="stage-tab-label">{s.label}</span>
             <span className="stage-tab-sub">{s.sub}</span>
@@ -320,8 +337,16 @@ export default function App() {
 
       {/* Content */}
       <main className="app-content">
-        {activeStage === 1 && <Stage1View workspace={workspace} />}
-        {activeStage > 1  && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
+        {activeStage === 1 && (
+          <Stage1View
+            workspace={workspace}
+            stageRevisions={stage1Revisions}
+            activeRevisionId={stage1ActiveId}
+            onSaveRevision={handleSaveStage1Revision}
+            onNavigateToStage2={() => setActiveStage(2)}
+          />
+        )}
+        {activeStage > 1 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
       </main>
 
     </div>
