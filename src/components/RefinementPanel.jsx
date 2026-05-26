@@ -1,10 +1,40 @@
 // RefinementPanel — Stage-agnostic correction-intent logger.
 // No AI calls. Prompts the user to describe what changed and why, then
 // saves a new revision snapshot via onSaveRevision().
+//
+// Props:
+//   onSaveRevision    (required) — ({ prompt, impactSummary }) => void
+//   title             (optional) — panel header title. Default: "Refinement & Corrections"
+//   subtitle          (optional) — description below the header. Default: generic Stage 1 text.
+//   saveLabel         (optional) — save button text. Default: "Save Stage 1 revision"
+//   promptLabel       (optional) — label for the prompt field. Default: "Refinement prompt"
+//   promptPlaceholder (optional) — placeholder text for the prompt textarea.
+//   aiNotice          (optional) — string | null | false
+//                                   string → show custom notice badge
+//                                   null/false → hide the notice entirely
+//                                   undefined (not passed) → show default "AI regeneration not enabled"
 
 import React, { useState } from 'react'
 
-export default function RefinementPanel({ onSaveRevision }) {
+const DEFAULT_SUBTITLE = (
+  'Describe a correction, context addition, or clarification you want to record against the current stage. ' +
+  'This creates a revision snapshot you can compare with earlier versions.'
+)
+
+const DEFAULT_PLACEHOLDER = (
+  'e.g. The target customer should also include VP of Finance, not just CFO. ' +
+  'The readiness level needs updating — internal tooling inventory was just completed.'
+)
+
+export default function RefinementPanel({
+  onSaveRevision,
+  title             = 'Refinement & Corrections',
+  subtitle          = DEFAULT_SUBTITLE,
+  saveLabel         = 'Save Stage 1 revision',
+  promptLabel       = 'Refinement prompt',
+  promptPlaceholder = DEFAULT_PLACEHOLDER,
+  aiNotice,           // undefined → default badge | null/false → hidden | string → custom
+}) {
   const [prompt,        setPrompt]        = useState('')
   const [impactSummary, setImpactSummary] = useState('')
   const [saved,         setSaved]         = useState(false)
@@ -22,6 +52,10 @@ export default function RefinementPanel({ onSaveRevision }) {
 
   const canSave = prompt.trim().length > 0
 
+  // Determine what notice badge (if any) to show
+  const showDefaultNotice = aiNotice === undefined
+  const noticeText        = showDefaultNotice ? 'AI regeneration not enabled' : (typeof aiNotice === 'string' ? aiNotice : null)
+
   return (
     <div style={{
       background: 'var(--surface)', border: '1px solid var(--border)',
@@ -37,22 +71,22 @@ export default function RefinementPanel({ onSaveRevision }) {
           ↻
         </span>
         <span style={{ fontSize: 11, fontWeight: 600, flex: 1 }}>
-          Refinement &amp; Corrections
+          {title}
         </span>
-        {/* AI notice */}
-        <span style={{
-          fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
-          padding: '1px 6px', borderRadius: 3,
-          background: 'var(--s2)', border: '1px solid var(--border)',
-        }}>
-          AI regeneration not enabled
-        </span>
+        {noticeText && (
+          <span style={{
+            fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+            padding: '1px 6px', borderRadius: 3,
+            background: 'var(--s2)', border: '1px solid var(--border)',
+          }}>
+            {noticeText}
+          </span>
+        )}
       </div>
 
       <div style={{ padding: '13px 15px' }}>
         <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.65, marginBottom: 14, fontFamily: 'var(--fm)' }}>
-          Describe a correction, context addition, or clarification you want to record against the current stage.
-          This creates a revision snapshot you can compare with earlier versions.
+          {subtitle}
         </div>
 
         {/* Prompt field */}
@@ -61,13 +95,13 @@ export default function RefinementPanel({ onSaveRevision }) {
             fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)',
             textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 5,
           }}>
-            Refinement prompt <span style={{ color: '#f87171' }}>*</span>
+            {promptLabel} <span style={{ color: '#f87171' }}>*</span>
           </div>
           <textarea
             value={prompt}
             onChange={e => setPrompt(e.target.value)}
             rows={4}
-            placeholder="e.g. The target customer should also include VP of Finance, not just CFO. The readiness level needs updating — internal tooling inventory was just completed."
+            placeholder={promptPlaceholder}
             style={{
               width: '100%', boxSizing: 'border-box',
               fontSize: 10, fontFamily: 'var(--fm)',
@@ -119,11 +153,11 @@ export default function RefinementPanel({ onSaveRevision }) {
               transition: 'background .15s, color .15s, border-color .15s',
             }}
           >
-            {saved ? '✓ Revision saved' : 'Save Stage 1 revision'}
+            {saved ? '✓ Saved' : saveLabel}
           </button>
           {!canSave && !saved && (
             <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
-              Enter a refinement prompt to save.
+              Enter a prompt to save.
             </span>
           )}
         </div>

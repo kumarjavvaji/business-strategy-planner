@@ -3,7 +3,7 @@
 // Supports: AI generation (VITE_OPENAI_API_KEY) + mock mode (no key required).
 
 import React, { useState, useCallback } from 'react'
-import { hasApiKey, callAI }                  from '../api/aiClient'
+import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import { buildStage2Messages, parseStage2Response, generateMockStage2 } from '../utils/stage2Prompts'
 import { buildStage2RevisionRecord, stage2SnapshotToText }              from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
@@ -155,7 +155,7 @@ export default function Stage2View({
 
   // Compare revision objects for diff viewer
   const compareRevision = compareRevId ? stage2Revisions.find(r => r.id === compareRevId) ?? null : null
-  const apiMode = hasApiKey() ? 'ai' : 'mock'
+  const apiMode = getApiMode()   // 'ai' | 'mock'
 
   // ── Generation ──────────────────────────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
@@ -208,7 +208,7 @@ export default function Stage2View({
       sourceBasisRevisionId: stage1ActiveId,
       source,
       prompt:        '',
-      impactSummary: `Generated from Stage 1 revision v${activeStage1Rev.revisionNumber} via ${source === 'ai' ? 'AI (gpt-4o)' : 'mock generator'}.`,
+      impactSummary: `Generated from Stage 1 revision v${activeStage1Rev.revisionNumber} via ${source === 'ai' ? AI_MODEL_LABEL : 'mock generator'}.`,
     })
 
     onSaveRevision(record)
@@ -292,13 +292,16 @@ export default function Stage2View({
             </div>
           )}
         </div>
-        <GenerateButton
-          apiMode={apiMode}
-          isGenerating={isGenerating}
-          isRegenerate={true}
-          onGenerate={handleGenerate}
-          disabled={!activeStage1Rev}
-        />
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8, flexShrink: 0 }}>
+          <GenerateButton
+            apiMode={apiMode}
+            isGenerating={isGenerating}
+            isRegenerate={true}
+            onGenerate={handleGenerate}
+            disabled={!activeStage1Rev}
+          />
+          <ApiModeStatus apiMode={apiMode} />
+        </div>
       </div>
 
       {/* ── Staleness banner ───────────────────────────────────────────── */}
@@ -415,7 +418,15 @@ export default function Stage2View({
       />
 
       {/* ── Correction note ────────────────────────────────────────────── */}
-      <RefinementPanel onSaveRevision={handleSaveCorrectionNote} />
+      <RefinementPanel
+        onSaveRevision={handleSaveCorrectionNote}
+        title="Correction Note"
+        subtitle="Record a manual correction, context addition, or clarification against this BU mapping. Use 'Regenerate with AI' above to fully re-generate from Stage 1."
+        saveLabel="Save correction note"
+        promptLabel="Correction / context note"
+        promptPlaceholder="e.g. Legal & Compliance should be marked as primary, not supporting — regulatory sign-off is blocking the pilot. Add a Data Engineering unit to own the pipeline build."
+        aiNotice={null}
+      />
 
       {/* ── Stage 3 CTA ────────────────────────────────────────────────── */}
       <div style={{
@@ -489,6 +500,9 @@ function EmptyState({
         disabled={!activeStage1Rev}
         large
       />
+      <div style={{ marginTop: 10 }}>
+        <ApiModeStatus apiMode={apiMode} />
+      </div>
 
       {genError && (
         <div style={{
@@ -525,20 +539,6 @@ function EmptyState({
         </div>
       )}
 
-      {/* API key notice */}
-      {apiMode === 'mock' && (
-        <div style={{
-          marginTop: 20, fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)',
-          padding: '8px 14px', borderRadius: 5,
-          background: 'var(--s2)', border: '1px solid var(--border)',
-          display: 'inline-block', textAlign: 'left', lineHeight: 1.6,
-        }}>
-          Mock mode active. To enable AI generation, create{' '}
-          <code style={{ background: 'var(--bg)', padding: '0 4px', borderRadius: 3 }}>.env.local</code>{' '}
-          with <code style={{ background: 'var(--bg)', padding: '0 4px', borderRadius: 3 }}>VITE_OPENAI_API_KEY=sk-…</code>
-          {' '}and restart the dev server.
-        </div>
-      )}
     </div>
   )
 }
@@ -546,11 +546,14 @@ function EmptyState({
 // ── Generate/Regenerate button ────────────────────────────────────────────────
 
 function GenerateButton({ apiMode, isGenerating, isRegenerate, onGenerate, disabled, large }) {
-  const label = isGenerating
-    ? 'Generating…'
-    : isRegenerate
-      ? `Regenerate (${apiMode === 'ai' ? 'AI' : 'mock'})`
-      : `Generate Business Unit Map${apiMode === 'ai' ? ' (AI)' : ' (mock)'}`
+  let label
+  if (isGenerating) {
+    label = 'Generating…'
+  } else if (apiMode === 'ai') {
+    label = isRegenerate ? 'Regenerate with AI' : 'Generate with AI'
+  } else {
+    label = isRegenerate ? 'Regenerate (mock)' : 'Generate (mock)'
+  }
 
   return (
     <button
@@ -571,5 +574,40 @@ function GenerateButton({ apiMode, isGenerating, isRegenerate, onGenerate, disab
     >
       {label}
     </button>
+  )
+}
+
+// ── API mode status line ──────────────────────────────────────────────────────
+
+function ApiModeStatus({ apiMode }) {
+  if (apiMode === 'ai') {
+    return (
+      <div style={{
+        fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4',
+        display: 'flex', alignItems: 'center', gap: 4,
+      }}>
+        <span style={{
+          display: 'inline-block', width: 5, height: 5, borderRadius: '50%',
+          background: '#00e5b4', flexShrink: 0,
+        }} />
+        API mode: AI enabled ({AI_MODEL_LABEL})
+      </div>
+    )
+  }
+  return (
+    <div style={{
+      fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+      display: 'flex', alignItems: 'center', gap: 4,
+    }}>
+      <span style={{
+        display: 'inline-block', width: 5, height: 5, borderRadius: '50%',
+        background: 'var(--border2)', flexShrink: 0,
+      }} />
+      API mode: Mock only — add{' '}
+      <code style={{ fontSize: 8, background: 'var(--s2)', padding: '0 3px', borderRadius: 2 }}>
+        VITE_ANTHROPIC_API_KEY
+      </code>
+      {' '}to .env.local and restart
+    </div>
   )
 }
