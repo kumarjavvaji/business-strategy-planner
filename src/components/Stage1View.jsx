@@ -376,11 +376,12 @@ export default function Stage1View({
   workspace,
   stageRevisions,
   activeRevisionId,
-  onSaveRevision,       // ({ prompt, impactSummary }) => void — manual correction
-  onSaveRawRevision,    // (record, patchedWorkspace) => void  — AI revision
-  stage2IsStale,        // boolean — true when Stage 2 revisions are behind Stage 1
-  stage2HasRevisions,   // boolean — true when Stage 2 has at least one revision
-  onNavigateToStage2,
+  onSaveRevision,              // ({ prompt, impactSummary }) => void — manual correction
+  onSaveRawRevision,           // (record, patchedWorkspace) => void  — AI revision
+  stage2IsStale,               // boolean — Stage 2 lags behind the active Stage 1 rev
+  stage2HasRevisions,          // boolean — at least one Stage 2 revision exists
+  onNavigateToStage2,          // () => void — navigate only
+  onRegenerateAndGoToStage2,   // () => void — trigger Stage 2 regen + navigate
 }) {
   const [compareRevId, setCompareRevId] = useState(null)
 
@@ -416,20 +417,33 @@ export default function Stage1View({
               Stage 2 is stale
             </div>
             <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.6 }}>
-              Stage 2 was generated from an earlier Stage 1 revision. Regenerate Stage 2 to realign the business unit mapping with the current strategy.
+              Stage 2 was generated from an earlier Stage 1 revision. Regenerate to realign the business unit mapping with the current strategy.
             </div>
           </div>
-          <button
-            onClick={onNavigateToStage2}
-            style={{
-              flexShrink: 0, fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
-              padding: '5px 14px', borderRadius: 5, cursor: 'pointer',
-              background: 'rgba(251,146,60,.15)', border: '1px solid rgba(251,146,60,.4)',
-              color: '#fb923c',
-            }}
-          >
-            Go to Stage 2 →
-          </button>
+          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+            <button
+              onClick={onNavigateToStage2}
+              style={{
+                fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '5px 12px', borderRadius: 5, cursor: 'pointer',
+                background: 'transparent', border: '1px solid rgba(251,146,60,.4)',
+                color: '#fb923c',
+              }}
+            >
+              View Stage 2
+            </button>
+            <button
+              onClick={onRegenerateAndGoToStage2}
+              style={{
+                fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '5px 12px', borderRadius: 5, cursor: 'pointer',
+                background: 'rgba(251,146,60,.2)', border: '1px solid rgba(251,146,60,.5)',
+                color: '#fb923c',
+              }}
+            >
+              ↻ Regenerate Stage 2
+            </button>
+          </div>
         </div>
       )}
 
@@ -669,33 +683,65 @@ export default function Stage1View({
 
       {/* ── Stage 2 CTA ──────────────────────────────────────────────────── */}
       <div style={{
-        background: 'var(--surface)', border: '1px solid rgba(59,130,246,.3)',
+        background: 'var(--surface)',
+        border: `1px solid ${stage2IsStale && stage2HasRevisions ? 'rgba(251,146,60,.35)' : 'rgba(59,130,246,.3)'}`,
         borderRadius: 'var(--r)', padding: '16px 18px', marginBottom: 10,
-        display: 'flex', alignItems: 'center', gap: 16,
+        display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap',
       }}>
-        <div style={{ flex: 1 }}>
+        <div style={{ flex: 1, minWidth: 200 }}>
           <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
-            Continue to Stage 2 — Business Unit Mapping
+            {stage2IsStale && stage2HasRevisions
+              ? 'Stage 2 needs regeneration'
+              : 'Continue to Stage 2 — Business Unit Mapping'
+            }
           </div>
           <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.65 }}>
             {stage2IsStale && stage2HasRevisions
-              ? 'Stage 2 is stale — regenerate the business unit mapping to align with the current strategy.'
+              ? 'The existing business unit mapping was generated from an earlier Stage 1 revision. Regenerate to realign it with the current strategy, or view the existing mapping first.'
               : 'Stage 2 will map this strategy into business-unit responsibilities. Stage 1 import and refinement history are now ready.'
             }
           </div>
         </div>
-        <button
-          onClick={onNavigateToStage2}
-          style={{
-            flexShrink: 0,
-            fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
-            padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
-            background: stage2IsStale && stage2HasRevisions ? '#fb923c' : 'var(--accent)',
-            border: 'none', color: '#000',
-          }}
-        >
-          {stage2IsStale && stage2HasRevisions ? 'Regenerate Stage 2 →' : 'Stage 2 →'}
-        </button>
+
+        {stage2IsStale && stage2HasRevisions ? (
+          /* Stale — two actions */
+          <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+            <button
+              onClick={onNavigateToStage2}
+              style={{
+                fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '7px 16px', borderRadius: 5, cursor: 'pointer',
+                background: 'var(--s2)', border: '1px solid var(--border)',
+                color: 'var(--muted2)',
+              }}
+            >
+              View Stage 2
+            </button>
+            <button
+              onClick={onRegenerateAndGoToStage2}
+              style={{
+                fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '7px 18px', borderRadius: 5, cursor: 'pointer',
+                background: '#fb923c', border: 'none', color: '#000',
+              }}
+            >
+              ↻ Regenerate & View →
+            </button>
+          </div>
+        ) : (
+          /* Not stale — single action */
+          <button
+            onClick={onNavigateToStage2}
+            style={{
+              flexShrink: 0,
+              fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+              padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
+              background: 'var(--accent)', border: 'none', color: '#000',
+            }}
+          >
+            Stage 2 →
+          </button>
+        )}
       </div>
 
     </div>

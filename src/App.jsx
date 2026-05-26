@@ -262,7 +262,16 @@ export default function App() {
     saveStage1AIRevision,
     clearWorkspace,
   } = useWorkspace()
-  const [activeStage, setActiveStage] = useState(1)
+  const [activeStage,          setActiveStage]          = useState(1)
+  const [stage2PendingGenerate, setStage2PendingGenerate] = useState(false)
+
+  // Navigate to Stage 2 AND trigger an immediate full regeneration.
+  // Stage2View consumes the shouldAutoGenerate flag via useEffect on mount/update,
+  // runs its existing handleGenerate(), and saves a new revision into the normal history.
+  function handleRegenerateAndGoToStage2() {
+    setStage2PendingGenerate(true)
+    setActiveStage(2)
+  }
 
   // No workspace — show import screen
   if (!workspace) {
@@ -382,6 +391,7 @@ export default function App() {
             stage2IsStale={stage2IsStale}
             stage2HasRevisions={stage2Revisions.length > 0}
             onNavigateToStage2={() => setActiveStage(2)}
+            onRegenerateAndGoToStage2={handleRegenerateAndGoToStage2}
           />
         )}
         {activeStage === 2 && (
@@ -393,6 +403,8 @@ export default function App() {
             stage2ActiveId={stage2ActiveId}
             onSaveRevision={handleSaveStage2Revision}
             onNavigateToStage3={() => setActiveStage(3)}
+            shouldAutoGenerate={stage2PendingGenerate}
+            onAutoGenerateComplete={() => setStage2PendingGenerate(false)}
           />
         )}
         {activeStage > 2 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}

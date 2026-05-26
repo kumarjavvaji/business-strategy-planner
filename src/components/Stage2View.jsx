@@ -10,7 +10,7 @@
 //
 // Revision history remains strictly stage-level — no nested unit histories.
 
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useEffect } from 'react'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import {
   buildStage2Messages,
@@ -316,8 +316,10 @@ export default function Stage2View({
   stage1ActiveId,
   stage2Revisions,
   stage2ActiveId,
-  onSaveRevision,       // (revisionRecord) => void   — receives pre-built record
+  onSaveRevision,           // (revisionRecord) => void   — receives pre-built record
   onNavigateToStage3,
+  shouldAutoGenerate,       // boolean — set by Stage 1 "Regenerate & View Stage 2" CTA
+  onAutoGenerateComplete,   // () => void — clears the flag after we consume it
 }) {
   const [isGenerating,   setIsGenerating]   = useState(false)
   const [genError,       setGenError]       = useState(null)
@@ -340,6 +342,19 @@ export default function Stage2View({
   // Compare revision objects for diff viewer
   const compareRevision = compareRevId ? stage2Revisions.find(r => r.id === compareRevId) ?? null : null
   const apiMode = getApiMode()   // 'ai' | 'mock'
+
+  // ── Auto-generate when triggered from Stage 1 "Regenerate & View" CTA ───────
+  // Consumes the shouldAutoGenerate flag immediately (to prevent re-triggering)
+  // then fires handleGenerate. The resulting revision lands in the normal revision
+  // history and is diffable just like any manual regeneration.
+  useEffect(() => {
+    if (shouldAutoGenerate && activeStage1Rev) {
+      onAutoGenerateComplete?.()   // clear flag before async work begins
+      handleGenerate()
+    }
+    // handleGenerate is stable (useCallback); only re-run when the flag flips
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shouldAutoGenerate])
 
   // ── Full Stage 2 generation ─────────────────────────────────────────────────
   const handleGenerate = useCallback(async () => {
