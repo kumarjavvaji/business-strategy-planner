@@ -10,7 +10,7 @@
 //
 // Revision history remains strictly stage-level — no nested unit histories.
 
-import React, { useState, useCallback, useEffect } from 'react'
+import React, { useState, useCallback, useEffect, useRef } from 'react'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import {
   buildStage2Messages,
@@ -344,15 +344,26 @@ export default function Stage2View({
   const apiMode = getApiMode()   // 'ai' | 'mock'
 
   // ── Auto-generate when triggered from Stage 1 "Regenerate & View" CTA ───────
-  // Consumes the shouldAutoGenerate flag immediately (to prevent re-triggering)
-  // then fires handleGenerate. The resulting revision lands in the normal revision
-  // history and is diffable just like any manual regeneration.
+  // Guards against React StrictMode's double-invocation of effects in development:
+  // the ref is set on first consumption and only resets when the flag clears,
+  // preventing two concurrent handleGenerate() calls (which would produce two
+  // revisions with the same revisionNumber).
+  const autoGenConsumedRef = useRef(false)
+
   useEffect(() => {
-    if (shouldAutoGenerate && activeStage1Rev) {
-      onAutoGenerateComplete?.()   // clear flag before async work begins
-      handleGenerate()
+    // Flag cleared — reset the guard so the next trigger works
+    if (!shouldAutoGenerate) {
+      autoGenConsumedRef.current = false
+      return
     }
-    // handleGenerate is stable (useCallback); only re-run when the flag flips
+    // Already consumed this trigger (or no Stage 1 revision available)
+    if (!activeStage1Rev || autoGenConsumedRef.current) return
+
+    autoGenConsumedRef.current = true   // mark consumed before async work
+    onAutoGenerateComplete?.()          // clear the prop flag
+    handleGenerate()
+    // handleGenerate is a stable useCallback; eslint would warn about missing dep
+    // but including it would cause infinite loops — intentional omission.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldAutoGenerate])
 
