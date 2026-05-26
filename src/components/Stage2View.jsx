@@ -292,16 +292,13 @@ export default function Stage2View({
             </div>
           )}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8, flexShrink: 0 }}>
-          <GenerateButton
-            apiMode={apiMode}
-            isGenerating={isGenerating}
-            isRegenerate={true}
-            onGenerate={handleGenerate}
-            disabled={!activeStage1Rev}
-          />
-          <ApiModeStatus apiMode={apiMode} />
-        </div>
+        <GenerateButton
+          apiMode={apiMode}
+          isGenerating={isGenerating}
+          isRegenerate={true}
+          onGenerate={handleGenerate}
+          disabled={!activeStage1Rev}
+        />
       </div>
 
       {/* ── Staleness banner ───────────────────────────────────────────── */}
