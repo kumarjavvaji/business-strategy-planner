@@ -217,40 +217,106 @@ function normalisePlan(p) {
  * @param {object[]} allPlans          — full current execution plan array
  * @param {number}   targetIndex       — 0-based index of the plan to regenerate
  * @param {string}   refinementPrompt  — user's refinement instruction
+ * @param {string}   [refinementScope] — user-indicated scope hint
  * @returns {{ messages: Array<{ role, content }>, systemPrompt: string }}
  */
 export function buildStage3UnitRefinementMessages(
-  stage1Snapshot, stage2Snapshot, allPlans, targetIndex, refinementPrompt,
+  stage1Snapshot, stage2Snapshot, allPlans, targetIndex, refinementPrompt, refinementScope,
 ) {
   const s1Context   = stageSnapshotToText(stage1Snapshot)
   const targetPlan  = allPlans[targetIndex]
   const targetBU    = (stage2Snapshot?.businessUnits || []).find(u => u.name === targetPlan?.buName) || {}
 
-  // Summarise other plans for coherence context
   const otherPlansSummary = allPlans
     .filter((_, i) => i !== targetIndex)
     .map(p => `- ${p.buName}: ${p.mission || '—'} [exec risk: ${p.executionRisk}, readiness: ${p.organizationalReadiness}]`)
     .join('\n')
 
+  const scopeHint = (refinementScope && refinementScope !== 'auto')
+    ? `\nUser-indicated refinement scope: ${refinementScope} — weight your changes accordingly.`
+    : ''
+
   const systemPrompt = `You are an execution strategist regenerating ONE specific business unit execution plan within an existing Stage 3 execution planning document.
 
-Preserve organisational coherence with the other plans listed below. Do not create new dependencies or decision rights that conflict with other units.
+STEP 1 — CLASSIFY THE REFINEMENT
+Before making changes, silently classify the user's refinement as one or more of:
+  • wording clarification
+  • ownership / emphasis change (who leads, who is primary, who is accountable)
+  • client-facing role identification (this unit interacts with or introduces the offering to clients)
+  • sequencing change (what happens when, what gates what)
+  • cross-functional dependency change
+  • staffing / capability gap identified
+  • KPI / measurement change
+  • risk, constraint, or unknown change
+  • new initiative or workstream needed
+  • blocked initiative needs resolution path
 
-Follow all execution realism rules:
-- Force prioritisation in the initiative categories (not everything is mission critical)
-- Model constraints explicitly — staffing, budget, maturity, dependencies
-- Distinguish assumption types: fact / inferred / speculative
-- Avoid generic PMO language; use operator language
-- Surface unknowns honestly; do not mask uncertainty
-- Failure signals must be specific early-warning signs, not generic
+STEP 2 — APPLY THE CLASSIFICATION TO PRODUCE CONCRETE CHANGES
 
-Return ONLY a valid JSON object for the single business unit plan — no markdown, no prose, no code fences. Exact schema:
+  • wording clarification only → update only the specific text; preserve all other fields verbatim.
+
+  • ownership / emphasis change → MUST update: mission (reframe to reflect new ownership),
+    initiativesMissionCritical (add initiatives that own the new responsibility),
+    staffingOwnership (name the new owner explicitly), decisionRights (update who decides what),
+    governanceCadence (add checkpoints for the new accountability), and
+    keySuccessMetrics (add metrics for the ownership outcome).
+
+  • client-facing role identification → MUST update ALL of the following:
+      - mission: reframe to include client-facing delivery and adoption explicitly
+      - initiativesMissionCritical: add "consultant/field enablement programme", "field messaging
+        readiness", and "client adoption support track" as mission-critical initiatives
+      - crossFunctionalDependencies: add dependencies on product/marketing for messaging assets,
+        training team for readiness programmes, and feedback infrastructure
+      - staffingOwnership: add enablement lead, training coordinator, field feedback owner
+      - systemsTools: add tools for enablement delivery, training tracking, feedback capture
+      - leadingIndicators: add consultant readiness %, training completion rate, field message
+        consistency score
+      - keySuccessMetrics: add client adoption rate driven through this channel, consultant
+        satisfaction with enablement, feedback loop closure rate
+      - failureSignals: add signals for insufficient consultant readiness before client launch,
+        message inconsistency in client conversations, feedback not captured or acted on
+      - unresolvedUnknowns: add unknowns around current enablement maturity, training capacity,
+        and feedback infrastructure readiness
+      - readinessAssessment: update to reflect enablement readiness as a key gate
+
+  • sequencing change → update sequencingNarrative and keyMilestones; check if anything
+    previously deferred should be promoted to mission critical or vice versa.
+
+  • new initiative → add to initiativesMissionCritical or initiativesOptional based on priority;
+    update dependencies, staffing, and metrics accordingly.
+
+  • staffing / capability gap → update staffingOwnership and requiredCapabilities;
+    add the gap as a constraint or unknown if not yet resolved.
+
+  • KPI change → update leadingIndicators, keySuccessMetrics, failureSignals.
+
+  • risk / constraint / unknown → update risks, constraints, unresolvedUnknowns; check if
+    sequencing or initiatives need adjustment as a result.
+
+CRITICAL RULES — FOLLOW WITHOUT EXCEPTION:
+1. Treat emphasis, ownership, and client-facing role changes as substantive execution changes.
+   Do not treat them as cosmetic. A change in who owns client interaction demands concrete changes
+   to missions, initiatives, metrics, staffing, and failure signals.
+2. If a refinement identifies that this unit is the primary delivery or adoption channel to clients,
+   the plan MUST include explicit workstreams for enablement, field readiness, messaging
+   consistency, and feedback loop capture — these are not optional.
+3. Do NOT return content that is materially unchanged from the current version unless the
+   refinement is purely a wording clarification with zero operational impact.
+4. Avoid generic PMO language. Every added item must be concrete and specific to this unit
+   and strategy context.
+5. Force prioritisation: not everything added should be mission critical. Use the four categories
+   correctly.${scopeHint}
+
+Preserve organisational coherence with the other plans. Do not create dependencies or decision
+rights that conflict with other units.
+
+Return ONLY a valid JSON object — no markdown, no prose, no code fences:
 ${BU_PLAN_SCHEMA}`
 
   const userPrompt = `Stage 1 Strategic Context:
 ${s1Context}
 
-Stage 2 — Business Unit being refined:
+Stage 2 — Business Unit context:
   Name: ${targetBU.name || targetPlan?.buName}
   Purpose: ${targetBU.purpose || '—'}
   Involvement: ${targetBU.involvementLevel || '—'}
@@ -258,10 +324,12 @@ Stage 2 — Business Unit being refined:
   Dependencies: ${(targetBU.dependencies || []).join('; ') || '—'}
   Risks: ${(targetBU.risksAndUnknowns || []).join('; ') || '—'}
 
-Current plan for "${targetPlan?.buName}":
+Current Stage 3 plan for "${targetPlan?.buName}":
   Mission: ${targetPlan?.mission || '—'}
-  Execution risk: ${targetPlan?.executionRisk || '—'}
-  Readiness: ${targetPlan?.organizationalReadiness || '—'}
+  Mission Critical initiatives: ${(targetPlan?.initiativesMissionCritical || []).join('; ') || '—'}
+  Execution risk: ${targetPlan?.executionRisk || '—'} · Readiness: ${targetPlan?.organizationalReadiness || '—'}
+  Current success metrics: ${(targetPlan?.keySuccessMetrics || []).join('; ') || '—'}
+  Current failure signals: ${(targetPlan?.failureSignals || []).join('; ') || '—'}
 
 Other BU plans (for coherence — do not modify):
 ${otherPlansSummary}
@@ -269,7 +337,7 @@ ${otherPlansSummary}
 Refinement instruction:
 ${refinementPrompt}
 
-Return only the updated JSON object for "${targetPlan?.buName}".`
+Apply the refinement classification rules above and return the updated JSON object for "${targetPlan?.buName}". Make concrete changes — this refinement must produce a materially different execution plan.`
 
   return {
     messages: [

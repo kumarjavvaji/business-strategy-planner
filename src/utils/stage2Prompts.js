@@ -137,32 +137,91 @@ export function parseStage2Response(rawText) {
 
 /**
  * Build messages for regenerating a single business unit while preserving the rest.
- * @param {object}   stage1Snapshot   — contentSnapshot from active Stage 1 revision
- * @param {object[]} allBusinessUnits — full current BU array (all units)
- * @param {number}   targetIndex      — 0-based index of the unit to regenerate
- * @param {string}   refinementPrompt — the user's refinement instruction
+ * @param {object}   stage1Snapshot    — contentSnapshot from active Stage 1 revision
+ * @param {object[]} allBusinessUnits  — full current BU array (all units)
+ * @param {number}   targetIndex       — 0-based index of the unit to regenerate
+ * @param {string}   refinementPrompt  — the user's refinement instruction
+ * @param {string}   [refinementScope] — user-indicated scope hint ('auto'|'wording'|'ownership'|'cross-fn'|'execution'|'kpi')
  * @returns {{ messages: Array<{ role, content }>, systemPrompt: string }}
  */
-export function buildStage2UnitRefinementMessages(stage1Snapshot, allBusinessUnits, targetIndex, refinementPrompt) {
+export function buildStage2UnitRefinementMessages(stage1Snapshot, allBusinessUnits, targetIndex, refinementPrompt, refinementScope) {
   const context    = stageSnapshotToText(stage1Snapshot)
   const targetUnit = allBusinessUnits[targetIndex]
 
-  // Summarise the other units for coherence context (name + level + purpose only)
   const otherUnitsSummary = allBusinessUnits
     .filter((_, i) => i !== targetIndex)
     .map(u => `- ${u.name} (${u.involvementLevel}): ${u.purpose || '—'}`)
     .join('\n')
 
+  const scopeHint = (refinementScope && refinementScope !== 'auto')
+    ? `\nUser-indicated refinement scope: ${refinementScope} — weight your changes accordingly.`
+    : ''
+
   const systemPrompt = `You are a strategic business analyst regenerating ONE specific business unit inside an existing Stage 2 business unit mapping.
 
-Preserve organisational coherence with the other units listed below. Do not alter dependencies, roles, or responsibilities that belong to other units.
+STEP 1 — CLASSIFY THE REFINEMENT
+Before making changes, silently classify the user's refinement as one or more of:
+  • wording clarification
+  • ownership / emphasis change (who leads, who is primary, strategic centrality)
+  • client-facing role identification (this unit interacts with or introduces the offering to clients)
+  • cross-functional dependency change (changes who depends on whom)
+  • KPI / measurement change
+  • risk or unknown change
+  • new capability or responsibility added
+  • involvement level change (primary → supporting, or vice versa)
 
-Return ONLY a valid JSON object for the single business unit — no markdown, no prose, no code fences. Exact schema:
+STEP 2 — APPLY THE CLASSIFICATION TO PRODUCE CONCRETE CHANGES
+Apply the classification to determine which fields to update:
+
+  • wording clarification only → update only the specific text; preserve all other fields verbatim.
+
+  • ownership / emphasis change → MUST update: involvementLevel (elevate or reduce as implied),
+    strategicInvolvement (rewrite to reflect new emphasis), purpose (update to match new role),
+    keyResponsibilities (add or reorder to reflect the ownership shift).
+    Also update dependencies and keySuccessMetrics where they are affected.
+
+  • client-facing role identification → MUST update ALL of the following:
+      - involvementLevel: elevate to 'primary' if the unit is the primary delivery/adoption channel
+      - purpose: rewrite to include the client-facing delivery role explicitly
+      - strategicInvolvement: describe the client-facing nature clearly
+      - keyResponsibilities: add responsibilities for client communication, enabling adoption,
+        delivering consistent messaging, and capturing client feedback
+      - dependencies: add dependencies on enabling units (training, product, marketing) that
+        must provide this unit with tools, messaging, and readiness support
+      - risksAndUnknowns: add risks such as inconsistent messaging, insufficient readiness,
+        feedback loop gaps, and adoption stall
+      - keySuccessMetrics: add metrics for adoption rate, client satisfaction, readiness scores,
+        and feedback loop completeness
+
+  • cross-functional dependency change → update dependencies; note implications for responsibilities.
+
+  • KPI change → update keySuccessMetrics; verify responsibilities are aligned.
+
+  • risk change → update risksAndUnknowns; check if responsibilities or dependencies need adjustment.
+
+CRITICAL RULES — FOLLOW WITHOUT EXCEPTION:
+1. Treat emphasis and ownership changes as meaningful strategic changes even if the business unit
+   list remains the same. A change in who is primary, who leads client interaction, or who owns
+   adoption is a substantive strategic change — not cosmetic.
+2. If a refinement identifies a primary client-facing role, update responsibilities, dependencies,
+   risks, unknowns, and success metrics accordingly — do not leave them unchanged.
+3. Do NOT return content that is materially unchanged from the current version unless the
+   refinement is purely a wording clarification with zero operational impact.
+   If you must leave content unchanged, you MUST explain why in the impactSummary (not in this JSON).
+4. If a unit communicates the offering to clients, introduces the capability to clients, owns field
+   feedback, or is the primary adoption channel, it must be treated as a client-facing delivery unit
+   and its responsibilities, dependencies, and metrics must reflect that role explicitly.
+5. Be specific — do not add generic placeholders. Every added item must be concrete.${scopeHint}
+
+Preserve organisational coherence with the other units listed. Do not alter responsibilities or
+dependencies that belong to other units.
+
+Return ONLY a valid JSON object — no markdown, no prose, no code fences:
 
 {
-  "name": "string — business unit or function name",
-  "purpose": "string — this unit's reason for existing in this specific strategic context",
-  "strategicInvolvement": "string — how this unit is involved",
+  "name": "string",
+  "purpose": "string",
+  "strategicInvolvement": "string",
   "involvementLevel": "primary | supporting | informed",
   "keyResponsibilities": ["string", "..."],
   "dependencies": ["string", "..."],
@@ -170,10 +229,7 @@ Return ONLY a valid JSON object for the single business unit — no markdown, no
   "keySuccessMetrics": ["string", "..."]
 }
 
-Rules:
-- keyResponsibilities, dependencies, risksAndUnknowns, keySuccessMetrics: 2–5 items each
-- Be specific to this company, strategy, and unit — no generic lists
-- Respect and preserve role alignment with the other units listed in context`
+Rules: 2–5 items per list. Be specific to this company, strategy, and unit.`
 
   const userPrompt = `Stage 1 Strategic Context:
 ${context}
@@ -186,11 +242,15 @@ Business unit to regenerate:
   Current purpose: ${targetUnit.purpose || '—'}
   Current involvement: ${targetUnit.involvementLevel}
   Current strategic role: ${targetUnit.strategicInvolvement || '—'}
+  Current responsibilities: ${(targetUnit.keyResponsibilities || []).join('; ') || '—'}
+  Current dependencies: ${(targetUnit.dependencies || []).join('; ') || '—'}
+  Current risks: ${(targetUnit.risksAndUnknowns || []).join('; ') || '—'}
+  Current metrics: ${(targetUnit.keySuccessMetrics || []).join('; ') || '—'}
 
 Refinement instruction:
 ${refinementPrompt}
 
-Return only the updated JSON object for "${targetUnit.name}".`
+Apply the refinement classification rules above and return the updated JSON object for "${targetUnit.name}". Make concrete changes — this refinement must produce a materially different result.`
 
   return {
     messages: [

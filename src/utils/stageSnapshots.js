@@ -227,6 +227,7 @@ export function buildStage2RevisionRecord({
   impactSummary,
   refinementType,
   affectedUnit,
+  refinementScope,   // 'auto'|'wording'|'ownership'|'cross-fn'|'execution'|'kpi'|null
 }) {
   const isFirst = revisionNumber === 1
   return {
@@ -236,10 +237,11 @@ export function buildStage2RevisionRecord({
     prompt:               prompt        || '',
     impactSummary:        impactSummary || '',
     createdAt:            new Date().toISOString(),
-    source,                                         // 'ai' | 'mock' | 'manual'
+    source,
     sourceBasisRevisionId: sourceBasisRevisionId || null,
-    refinementType:       refinementType || null,   // 'unit' | 'stage' | null
-    affectedUnit:         affectedUnit   || null,   // BU name for unit refinements
+    refinementType:       refinementType  || null,
+    affectedUnit:         affectedUnit    || null,
+    refinementScope:      (refinementScope && refinementScope !== 'auto') ? refinementScope : null,
     contentSnapshot:      buildStage2Snapshot(businessUnits, summaryNote),
   }
 }
@@ -328,6 +330,7 @@ export function buildStage3RevisionRecord({
   impactSummary,
   refinementType,
   affectedUnit,
+  refinementScope,   // 'auto'|'wording'|'ownership'|'cross-fn'|'execution'|'kpi'|null
 }) {
   const isFirst = revisionNumber === 1
   return {
@@ -342,6 +345,7 @@ export function buildStage3RevisionRecord({
     sourceStage2RevisionId: sourceStage2RevisionId || null,
     refinementType:         refinementType || null,
     affectedUnit:           affectedUnit   || null,
+    refinementScope:        (refinementScope && refinementScope !== 'auto') ? refinementScope : null,
     contentSnapshot:        buildStage3Snapshot(executionPlans, summaryNote),
   }
 }

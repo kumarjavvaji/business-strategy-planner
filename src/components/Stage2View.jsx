@@ -71,19 +71,70 @@ function SubList({ label, items, borderColor }) {
   )
 }
 
+// ── Refinement scope options (shared Stage 2 + Stage 3) ──────────────────────
+
+export const REFINEMENT_SCOPES = [
+  { value: 'auto',      label: 'auto-detect'       },
+  { value: 'wording',   label: 'wording only'       },
+  { value: 'ownership', label: 'ownership / emphasis' },
+  { value: 'cross-fn',  label: 'cross-functional'   },
+  { value: 'execution', label: 'execution plan'     },
+  { value: 'kpi',       label: 'KPIs / metrics'     },
+]
+
+function ScopeSelector({ value, onChange, disabled }) {
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{
+        fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+        textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 5,
+      }}>
+        Refinement scope
+        <span style={{ marginLeft: 5, fontWeight: 400, opacity: .6, textTransform: 'none', letterSpacing: 0 }}>
+          — helps the model focus on the right fields
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+        {REFINEMENT_SCOPES.map(s => {
+          const active = value === s.value
+          return (
+            <button
+              key={s.value}
+              onClick={() => onChange(s.value)}
+              disabled={disabled}
+              style={{
+                fontSize: 8, fontFamily: 'var(--fm)', padding: '2px 8px', borderRadius: 3,
+                cursor: disabled ? 'not-allowed' : 'pointer',
+                background: active ? 'rgba(59,130,246,.18)' : 'var(--surface)',
+                border: `1px solid ${active ? 'rgba(59,130,246,.45)' : 'var(--border)'}`,
+                color: active ? 'var(--accent)' : 'var(--muted)',
+                transition: 'background .1s, color .1s, border-color .1s',
+                opacity: disabled ? 0.5 : 1,
+              }}
+            >
+              {active && '✓ '}{s.label}
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 // ── Business unit card ────────────────────────────────────────────────────────
-// onRefineUnit: async (prompt: string, impact: string) => { error: string|null }
+// onRefineUnit: async (prompt: string, impact: string, scope: string) => { error: string|null }
 // apiMode:      'ai' | 'mock'
 // globalBusy:   true while a parent-level generation is running
 
 function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
-  const [open,         setOpen]         = useState(true)
-  const [refineOpen,   setRefineOpen]   = useState(false)
-  const [refinePrompt, setRefinePrompt] = useState('')
-  const [refineImpact, setRefineImpact] = useState('')
-  const [isRefining,   setIsRefining]   = useState(false)
-  const [refineError,  setRefineError]  = useState(null)
-  const [refineDone,   setRefineDone]   = useState(false)
+  const [open,          setOpen]          = useState(true)
+  const [refineOpen,    setRefineOpen]    = useState(false)
+  const [refinePrompt,  setRefinePrompt]  = useState('')
+  const [refineImpact,  setRefineImpact]  = useState('')
+  const [refineScope,   setRefineScope]   = useState('auto')
+  const [isRefining,    setIsRefining]    = useState(false)
+  const [refineError,   setRefineError]   = useState(null)
+  const [refineDone,    setRefineDone]    = useState(false)
 
   const ls = levelStyle(bu.involvementLevel)
 
@@ -94,7 +145,7 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
     if (!canRefine) return
     setIsRefining(true)
     setRefineError(null)
-    const { error } = await onRefineUnit(refinePrompt.trim(), refineImpact.trim())
+    const { error } = await onRefineUnit(refinePrompt.trim(), refineImpact.trim(), refineScope)
     setIsRefining(false)
     if (error) {
       setRefineError(error)
@@ -102,6 +153,7 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
       setRefineDone(true)
       setRefinePrompt('')
       setRefineImpact('')
+      setRefineScope('auto')
       setRefineOpen(false)
       setTimeout(() => setRefineDone(false), 2500)
     }
@@ -218,7 +270,7 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
                     onChange={e => setRefinePrompt(e.target.value)}
                     rows={3}
                     disabled={aiDisabled || isRefining}
-                    placeholder={`e.g. Mark ${bu.name} as primary, not supporting — they own the compliance sign-off. Add regulatory monitoring as a key responsibility.`}
+                    placeholder={`e.g. ${bu.name} is the primary client-facing channel — they introduce the offering to clients, need enablement and consistent messaging, and own the field feedback loop.`}
                     style={{
                       width: '100%', boxSizing: 'border-box',
                       fontSize: 10, fontFamily: 'var(--fm)',
@@ -229,6 +281,13 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
                     }}
                   />
                 </div>
+
+                {/* Refinement scope */}
+                <ScopeSelector
+                  value={refineScope}
+                  onChange={setRefineScope}
+                  disabled={aiDisabled || isRefining}
+                />
 
                 {/* Impact summary */}
                 <div style={{ marginBottom: 10 }}>
@@ -433,14 +492,14 @@ export default function Stage2View({
   // ── Unit-level AI regeneration ──────────────────────────────────────────────
   // Returns { error: string|null } — does NOT set global isGenerating.
   // Loading state is owned by the BUCard that triggered the call.
-  const handleUnitRegenerate = useCallback(async (buIndex, refinementPrompt, impactSummary) => {
+  const handleUnitRegenerate = useCallback(async (buIndex, refinementPrompt, impactSummary, refinementScope) => {
     if (!activeStage1Rev)  return { error: 'No active Stage 1 revision.' }
     if (!hasApiKey())      return { error: 'API key required for unit regeneration.' }
     if (!activeRev)        return { error: 'No active Stage 2 revision to update.' }
 
     const snapshot = activeStage1Rev.contentSnapshot
     const { messages } = buildStage2UnitRefinementMessages(
-      snapshot, businessUnits, buIndex, refinementPrompt,
+      snapshot, businessUnits, buIndex, refinementPrompt, refinementScope,
     )
 
     const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 2000 })
@@ -449,7 +508,6 @@ export default function Stage2View({
     const parsed = parseStage2UnitResponse(result)
     if (parsed.error || !parsed.unit) return { error: parsed.error || 'Response parse failed.' }
 
-    // Splice the regenerated unit back into the full BU array
     const updatedBUs = businessUnits.map((bu, i) => (i === buIndex ? parsed.unit : bu))
     const unitName   = businessUnits[buIndex]?.name || `Unit ${buIndex + 1}`
 
@@ -464,6 +522,7 @@ export default function Stage2View({
       impactSummary:         impactSummary || `Regenerated "${unitName}": ${refinementPrompt.slice(0, 80)}${refinementPrompt.length > 80 ? '…' : ''}`,
       refinementType:        'unit',
       affectedUnit:          unitName,
+      refinementScope,
     })
 
     onSaveRevision(record)
@@ -664,7 +723,7 @@ export default function Stage2View({
               index={i}
               apiMode={apiMode}
               globalBusy={isGenerating}
-              onRefineUnit={(prompt, impact) => handleUnitRegenerate(i, prompt, impact)}
+              onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
             />
           ))}
         </div>

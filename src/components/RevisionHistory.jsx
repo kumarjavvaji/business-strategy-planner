@@ -21,6 +21,18 @@ function refinementLabel(refinementType) {
   return null
 }
 
+const SCOPE_LABELS = {
+  'wording':   { text: 'wording',   color: '#94a3b8' },
+  'ownership': { text: 'ownership', color: '#f59e0b' },
+  'cross-fn':  { text: 'cross-fn',  color: '#8b5cf6' },
+  'execution': { text: 'execution', color: '#ec4899' },
+  'kpi':       { text: 'KPIs',      color: '#00e5b4' },
+}
+
+function scopeLabel(scope) {
+  return SCOPE_LABELS[scope] || null
+}
+
 export default function RevisionHistory({ revisions, activeRevisionId, onCompare, compareRevId }) {
   if (!revisions?.length) {
     return (
@@ -69,6 +81,7 @@ export default function RevisionHistory({ revisions, activeRevisionId, onCompare
           const isComparing = rev.id === compareRevId
           const sl          = sourceLabel(rev.source)
           const rl          = refinementLabel(rev.refinementType)
+          const scl         = scopeLabel(rev.refinementScope)
           const isFirst     = idx === 0  // newest
 
           return (
@@ -136,6 +149,15 @@ export default function RevisionHistory({ revisions, activeRevisionId, onCompare
                         title={rev.affectedUnit}
                       >
                         {rev.affectedUnit}
+                      </span>
+                    )}
+                    {scl && (
+                      <span style={{
+                        fontSize: 7, fontFamily: 'var(--fm)', padding: '1px 5px', borderRadius: 2,
+                        background: `${scl.color}14`, border: `1px solid ${scl.color}30`,
+                        color: scl.color, whiteSpace: 'nowrap',
+                      }}>
+                        {scl.text}
                       </span>
                     )}
                   </div>

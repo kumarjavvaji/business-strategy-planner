@@ -23,7 +23,8 @@ import {
 import { buildStage3RevisionRecord, stage3SnapshotToText } from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
-import RefinementPanel    from './RefinementPanel'
+import RefinementPanel                    from './RefinementPanel'
+import { REFINEMENT_SCOPES }             from './Stage2View'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -40,6 +41,47 @@ const READINESS_COLORS = {
 
 function riskColor(level)      { return RISK_COLORS[level]     || '#fb923c' }
 function readyColor(level)     { return READINESS_COLORS[level] || '#fb923c' }
+
+// ── Scope selector (reuses Stage2View's REFINEMENT_SCOPES list) ──────────────
+
+function ScopeSelector({ value, onChange, disabled }) {
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{
+        fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+        textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 5,
+      }}>
+        Refinement scope
+        <span style={{ marginLeft: 5, fontWeight: 400, opacity: .6, textTransform: 'none', letterSpacing: 0 }}>
+          — helps the model focus on the right fields
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+        {REFINEMENT_SCOPES.map(s => {
+          const active = value === s.value
+          return (
+            <button
+              key={s.value}
+              onClick={() => onChange(s.value)}
+              disabled={disabled}
+              style={{
+                fontSize: 8, fontFamily: 'var(--fm)', padding: '2px 8px', borderRadius: 3,
+                cursor: disabled ? 'not-allowed' : 'pointer',
+                background: active ? 'rgba(59,130,246,.18)' : 'var(--surface)',
+                border: `1px solid ${active ? 'rgba(59,130,246,.45)' : 'var(--border)'}`,
+                color: active ? 'var(--accent)' : 'var(--muted)',
+                transition: 'background .1s, color .1s, border-color .1s',
+                opacity: disabled ? 0.5 : 1,
+              }}
+            >
+              {active && '✓ '}{s.label}
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
 // ── Shared small primitives ───────────────────────────────────────────────────
 
@@ -205,6 +247,7 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
   const [refineOpen,   setRefineOpen]   = useState(false)
   const [refinePrompt, setRefinePrompt] = useState('')
   const [refineImpact, setRefineImpact] = useState('')
+  const [refineScope,  setRefineScope]  = useState('auto')
   const [isRefining,   setIsRefining]   = useState(false)
   const [refineError,  setRefineError]  = useState(null)
   const [refineDone,   setRefineDone]   = useState(false)
@@ -216,7 +259,7 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
     if (!canRefine) return
     setIsRefining(true)
     setRefineError(null)
-    const { error } = await onRefineUnit(refinePrompt.trim(), refineImpact.trim())
+    const { error } = await onRefineUnit(refinePrompt.trim(), refineImpact.trim(), refineScope)
     setIsRefining(false)
     if (error) {
       setRefineError(error)
@@ -224,6 +267,7 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
       setRefineDone(true)
       setRefinePrompt('')
       setRefineImpact('')
+      setRefineScope('auto')
       setRefineOpen(false)
       setTimeout(() => setRefineDone(false), 2500)
     }
@@ -473,7 +517,7 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
                     onChange={e => setRefinePrompt(e.target.value)}
                     rows={3}
                     disabled={aiDisabled || isRefining}
-                    placeholder={`e.g. ${plan.buName} is blocked by Legal sign-off — mark that as a blocker, defer the pilot launch milestone to week 14, and add SME dependency risk.`}
+                    placeholder={`e.g. ${plan.buName} is the primary client-facing channel — they need enablement, training, messaging consistency, adoption support, and feedback loops back to product and strategy.`}
                     style={{
                       width: '100%', boxSizing: 'border-box',
                       fontSize: 10, fontFamily: 'var(--fm)',
@@ -484,6 +528,11 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
                     }}
                   />
                 </div>
+                <ScopeSelector
+                  value={refineScope}
+                  onChange={setRefineScope}
+                  disabled={aiDisabled || isRefining}
+                />
                 <div style={{ marginBottom: 10 }}>
                   <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 4 }}>
                     Impact summary <span style={{ opacity: .5 }}>(optional)</span>
@@ -729,7 +778,7 @@ export default function Stage3View({
   }, [activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage1Revisions, stage2Revisions, stage3Revisions.length, onSaveRevision])
 
   // ── Unit-level refinement ───────────────────────────────────────────────────
-  const handleUnitRegenerate = useCallback(async (planIndex, refinementPrompt, impactSummary) => {
+  const handleUnitRegenerate = useCallback(async (planIndex, refinementPrompt, impactSummary, refinementScope) => {
     if (!activeStage1Rev)  return { error: 'No active Stage 1 revision.' }
     if (!activeStage2Rev)  return { error: 'No active Stage 2 revision.' }
     if (!hasApiKey())      return { error: 'API key required for unit regeneration.' }
@@ -739,7 +788,7 @@ export default function Stage3View({
     const s2Snap = activeStage2Rev.contentSnapshot
 
     const { messages } = buildStage3UnitRefinementMessages(
-      s1Snap, s2Snap, executionPlans, planIndex, refinementPrompt,
+      s1Snap, s2Snap, executionPlans, planIndex, refinementPrompt, refinementScope,
     )
     const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 3000 })
     if (error) return { error }
@@ -762,6 +811,7 @@ export default function Stage3View({
       impactSummary:          impactSummary || `Regenerated "${unitName}": ${refinementPrompt.slice(0, 80)}${refinementPrompt.length > 80 ? '…' : ''}`,
       refinementType:         'unit',
       affectedUnit:           unitName,
+      refinementScope,
     })
 
     onSaveRevision(record)
@@ -1019,7 +1069,7 @@ export default function Stage3View({
               index={i}
               apiMode={apiMode}
               globalBusy={isGenerating}
-              onRefineUnit={(prompt, impact) => handleUnitRegenerate(i, prompt, impact)}
+              onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
             />
           ))}
         </div>
