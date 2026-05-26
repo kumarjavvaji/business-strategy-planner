@@ -44,19 +44,34 @@ function emptyActiveIds() {
 /**
  * Removes duplicate revisions that share the same revisionNumber within a stage.
  * Keeps the first occurrence (lowest index = earliest created).
- * Fixes data corrupted by React StrictMode double-invoking effects.
+ * Also repairs activeStageRevisionIds: if the active ID was pointing to a removed
+ * duplicate, it is updated to the last revision remaining in that stage.
+ *
+ * Returns { stageRevisions, activeStageRevisionIds } — both corrected.
  */
-function dedupeStageRevisions(stageRevisions) {
-  const result = {}
+function dedupeAndRepairIds(stageRevisions, activeStageRevisionIds) {
+  const dedupedRevisions = {}
+  const repairedIds      = { ...(activeStageRevisionIds || emptyActiveIds()) }
+
   for (const [stage, revs] of Object.entries(stageRevisions || {})) {
-    const seen = new Set()
-    result[stage] = (revs || []).filter(r => {
+    const seen    = new Set()
+    const deduped = (revs || []).filter(r => {
       if (seen.has(r.revisionNumber)) return false
       seen.add(r.revisionNumber)
       return true
     })
+    dedupedRevisions[stage] = deduped
+
+    // If the active ID no longer exists after dedup, point to the highest-numbered rev
+    const activeId    = repairedIds[stage]
+    const stillExists = activeId && deduped.some(r => r.id === activeId)
+    if (!stillExists && deduped.length > 0) {
+      const sorted = [...deduped].sort((a, b) => b.revisionNumber - a.revisionNumber)
+      repairedIds[stage] = sorted[0].id
+    }
   }
-  return result
+
+  return { stageRevisions: dedupedRevisions, activeStageRevisionIds: repairedIds }
 }
 
 // ── Migration ─────────────────────────────────────────────────────────────────
@@ -103,14 +118,21 @@ function loadFromStorage() {
     if (stored.workspace && !stored.normalizedWorkspace) {
       const migrated = migrateOldShape(stored)
       if (migrated) {
-        migrated.stageRevisions = dedupeStageRevisions(migrated.stageRevisions)
+        const fixed = dedupeAndRepairIds(migrated.stageRevisions, migrated.activeStageRevisionIds)
+        migrated.stageRevisions         = fixed.stageRevisions
+        migrated.activeStageRevisionIds = fixed.activeStageRevisionIds
       }
       return migrated   // will be saved on next effect cycle
     }
 
-    // New shape — verify minimal required fields; dedupe on load
+    // New shape — verify minimal required fields; dedupe + repair active IDs on load
     if (stored.id && stored.normalizedWorkspace) {
-      stored.stageRevisions = dedupeStageRevisions(stored.stageRevisions || emptyStageRevisions())
+      const fixed = dedupeAndRepairIds(
+        stored.stageRevisions         || emptyStageRevisions(),
+        stored.activeStageRevisionIds || emptyActiveIds(),
+      )
+      stored.stageRevisions         = fixed.stageRevisions
+      stored.activeStageRevisionIds = fixed.activeStageRevisionIds
       return stored
     }
   } catch {}
