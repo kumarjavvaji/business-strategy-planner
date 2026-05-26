@@ -1,23 +1,26 @@
 // RevisionDiffViewer — compares two revision snapshots word-by-word.
 // Props:
-//   revA  — older revision object (with .contentSnapshot)
-//   revB  — newer revision object (with .contentSnapshot)
+//   revA   — older revision object (with .contentSnapshot)
+//   revB   — newer revision object (with .contentSnapshot)
 //   onClose — () => void
+//   toText  — optional (snapshot) => string  — defaults to stageSnapshotToText (Stage 1)
+//             Pass stage2SnapshotToText for Stage 2 diffs.
 
 import React, { useMemo, useState } from 'react'
 import { stageSnapshotToText }      from '../utils/stageSnapshots'
 import { diffWords, diffSummary }   from '../utils/diffText'
 
-export default function RevisionDiffViewer({ revA, revB, onClose }) {
+export default function RevisionDiffViewer({ revA, revB, onClose, toText }) {
   const [highlights, setHighlights] = useState(true)
+  const textFn = toText || stageSnapshotToText
 
   const { ops, summary } = useMemo(() => {
-    const textA = stageSnapshotToText(revA.contentSnapshot)
-    const textB = stageSnapshotToText(revB.contentSnapshot)
+    const textA = textFn(revA.contentSnapshot)
+    const textB = textFn(revB.contentSnapshot)
     const ops     = diffWords(textA, textB)
     const summary = diffSummary(ops)
     return { ops, summary }
-  }, [revA, revB])
+  }, [revA, revB, textFn])
 
   return (
     <div style={{

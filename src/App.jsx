@@ -3,6 +3,7 @@ import './App.css'
 import { useWorkspace }              from './hooks/useWorkspace'
 import { DEMO_STRATEGY_BASIS_PACKAGE } from './data/demoPackage'
 import Stage1View                    from './components/Stage1View'
+import Stage2View                    from './components/Stage2View'
 
 // ── Stage definitions ─────────────────────────────────────────────────────────
 const STAGES = [
@@ -15,7 +16,6 @@ const STAGES = [
 
 // ── Stage placeholder ─────────────────────────────────────────────────────────
 function StagePlaceholder({ stage }) {
-  const isStage2 = stage.id === 2
   return (
     <div style={{ padding: '70px 20px', textAlign: 'center' }}>
       <div style={{ fontSize: 26, marginBottom: 14, opacity: .2, lineHeight: 1 }}>◯</div>
@@ -23,9 +23,7 @@ function StagePlaceholder({ stage }) {
         {stage.label} — {stage.sub}
       </div>
       <div style={{ fontSize: 10, fontFamily: 'var(--fm)', color: 'var(--muted)', maxWidth: 360, margin: '0 auto', lineHeight: 1.7 }}>
-        {isStage2
-          ? 'Stage 2 will map this strategy into business-unit responsibilities. Stage 1 import and refinement history are now ready.'
-          : 'Not yet implemented.'}
+        Not yet implemented.
       </div>
     </div>
   )
@@ -260,6 +258,7 @@ export default function App() {
     importedAt,
     importPackage,
     saveStageRevision,
+    saveRawRevision,
     clearWorkspace,
   } = useWorkspace()
   const [activeStage, setActiveStage] = useState(1)
@@ -284,11 +283,19 @@ export default function App() {
     workspace.entity.name     || ''
 
   // Stage 1 revision data
-  const stage1Revisions     = fullWorkspace?.stageRevisions?.stage1 ?? []
-  const stage1ActiveId      = fullWorkspace?.activeStageRevisionIds?.stage1 ?? null
+  const stage1Revisions = fullWorkspace?.stageRevisions?.stage1 ?? []
+  const stage1ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage1 ?? null
 
   function handleSaveStage1Revision({ prompt, impactSummary }) {
     saveStageRevision('stage1', { prompt, impactSummary })
+  }
+
+  // Stage 2 revision data
+  const stage2Revisions = fullWorkspace?.stageRevisions?.stage2 ?? []
+  const stage2ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage2 ?? null
+
+  function handleSaveStage2Revision(revisionRecord) {
+    saveRawRevision('stage2', revisionRecord)
   }
 
   return (
@@ -346,7 +353,18 @@ export default function App() {
             onNavigateToStage2={() => setActiveStage(2)}
           />
         )}
-        {activeStage > 1 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
+        {activeStage === 2 && (
+          <Stage2View
+            workspace={workspace}
+            stage1Revisions={stage1Revisions}
+            stage1ActiveId={stage1ActiveId}
+            stage2Revisions={stage2Revisions}
+            stage2ActiveId={stage2ActiveId}
+            onSaveRevision={handleSaveStage2Revision}
+            onNavigateToStage3={() => setActiveStage(3)}
+          />
+        )}
+        {activeStage > 2 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
       </main>
 
     </div>

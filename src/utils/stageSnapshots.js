@@ -111,6 +111,42 @@ export function stageSnapshotToText(snapshot) {
   return lines.join('\n')
 }
 
+// ── Stage 2 snapshot ──────────────────────────────────────────────────────────
+
+/**
+ * Captures Stage 2 business-unit content as a plain serialisable object.
+ */
+export function buildStage2Snapshot(businessUnits, summaryNote) {
+  return {
+    businessUnits: (businessUnits || []).map(u => ({ ...u })),
+    summaryNote:   summaryNote || '',
+  }
+}
+
+/**
+ * Flattens a Stage 2 snapshot into a single text string for word-level diff.
+ */
+export function stage2SnapshotToText(snapshot) {
+  const lines = []
+  if (snapshot?.summaryNote) lines.push(`[Summary] ${snapshot.summaryNote}`)
+  ;(snapshot?.businessUnits || []).forEach((bu, i) => {
+    lines.push(`\n[BU ${i + 1}: ${bu.name}]`)
+    if (bu.purpose)              lines.push(`  Purpose: ${bu.purpose}`)
+    if (bu.strategicInvolvement) lines.push(`  Involvement: ${bu.strategicInvolvement}`)
+    const list = (label, arr) => {
+      if (arr?.length) {
+        lines.push(`  ${label}:`)
+        arr.forEach(item => lines.push(`    - ${item}`))
+      }
+    }
+    list('Responsibilities', bu.keyResponsibilities)
+    list('Dependencies',     bu.dependencies)
+    list('Risks',            bu.risksAndUnknowns)
+    list('Metrics',          bu.keySuccessMetrics)
+  })
+  return lines.join('\n')
+}
+
 // ── Revision builders ─────────────────────────────────────────────────────────
 
 function revisionId() {
@@ -148,5 +184,33 @@ export function buildManualRevision(normalizedWorkspace, revisionNumber, prompt,
     createdAt:      new Date().toISOString(),
     source:         'manual',
     contentSnapshot: snapshot,
+  }
+}
+
+/**
+ * Creates a Stage 2 revision record.
+ * source: 'ai' | 'mock' | 'manual'
+ * sourceBasisRevisionId: the Stage 1 revision ID active when this was generated.
+ */
+export function buildStage2RevisionRecord({
+  businessUnits,
+  summaryNote,
+  revisionNumber,
+  sourceBasisRevisionId,
+  source,
+  prompt,
+  impactSummary,
+}) {
+  const isFirst = revisionNumber === 1
+  return {
+    id:                   revisionId(),
+    revisionNumber,
+    label:                isFirst ? 'Initial generation' : `Revision ${revisionNumber}`,
+    prompt:               prompt        || '',
+    impactSummary:        impactSummary || '',
+    createdAt:            new Date().toISOString(),
+    source,                                         // 'ai' | 'mock' | 'manual'
+    sourceBasisRevisionId: sourceBasisRevisionId || null,
+    contentSnapshot:      buildStage2Snapshot(businessUnits, summaryNote),
   }
 }

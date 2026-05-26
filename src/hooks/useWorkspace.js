@@ -164,6 +164,29 @@ export function useWorkspace() {
     })
   }
 
+  // ── saveRawRevision ──────────────────────────────────────────────────────────
+  // Accepts a pre-built revision object (Stage 2+ revisions build their own records).
+  // stage: 'stage2' | 'stage3' | ...
+  // revisionRecord: fully-formed record (see buildStage2RevisionRecord)
+  function saveRawRevision(stage, revisionRecord) {
+    setFullWorkspace(prev => {
+      if (!prev) return prev
+      const existing = prev.stageRevisions[stage] || []
+      return {
+        ...prev,
+        updatedAt: new Date().toISOString(),
+        stageRevisions: {
+          ...prev.stageRevisions,
+          [stage]: [...existing, revisionRecord],
+        },
+        activeStageRevisionIds: {
+          ...prev.activeStageRevisionIds,
+          [stage]: revisionRecord.id,
+        },
+      }
+    })
+  }
+
   // ── clearWorkspace ───────────────────────────────────────────────────────────
   function clearWorkspace() {
     setFullWorkspace(null)
@@ -180,6 +203,7 @@ export function useWorkspace() {
     importedAt,
     importPackage,
     saveStageRevision,
+    saveRawRevision,
     clearWorkspace,
   }
 }
