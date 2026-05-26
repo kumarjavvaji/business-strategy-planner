@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useRef } from 'react'
 import './App.css'
 import { useWorkspace }              from './hooks/useWorkspace'
 import { DEMO_STRATEGY_BASIS_PACKAGE } from './data/demoPackage'
@@ -30,15 +30,48 @@ function StagePlaceholder({ stage }) {
 
 // ── Import panel ──────────────────────────────────────────────────────────────
 function ImportPanel({ onImport }) {
-  const [json,  setJson]  = useState('')
-  const [error, setError] = useState(null)
+  const [json,       setJson]       = useState('')
+  const [error,      setError]      = useState(null)
+  const [fileStatus, setFileStatus] = useState(null)  // null | 'reading' | filename string
+  const fileInputRef = useRef(null)
 
-  function handleLoadDemo() {
+  // ── 1. Primary: file picker via FileReader ─────────────────────────────────
+  function handleFileChange(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
     setError(null)
-    const result = onImport(DEMO_STRATEGY_BASIS_PACKAGE)
-    if (result.error) setError(result.error)
+    setFileStatus('reading')
+
+    const reader = new FileReader()
+    reader.onload = (evt) => {
+      let parsed
+      try {
+        parsed = JSON.parse(evt.target.result)
+      } catch {
+        setFileStatus(null)
+        setError(`Could not parse "${file.name}" — file does not contain valid JSON.`)
+        // Reset input so the same file can be re-selected after fixing an error
+        if (fileInputRef.current) fileInputRef.current.value = ''
+        return
+      }
+      const result = onImport(parsed)
+      if (result.error) {
+        setFileStatus(null)
+        setError(result.error)
+        if (fileInputRef.current) fileInputRef.current.value = ''
+      } else {
+        setFileStatus(file.name)
+      }
+    }
+    reader.onerror = () => {
+      setFileStatus(null)
+      setError(`Could not read "${file.name}". Please try again.`)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+    reader.readAsText(file)
   }
 
+  // ── 2. Secondary: paste JSON ───────────────────────────────────────────────
   function handleImportJson() {
     setError(null)
     let parsed
@@ -49,6 +82,13 @@ function ImportPanel({ onImport }) {
       return
     }
     const result = onImport(parsed)
+    if (result.error) setError(result.error)
+  }
+
+  // ── 3. Tertiary: demo fixture ──────────────────────────────────────────────
+  function handleLoadDemo() {
+    setError(null)
+    const result = onImport(DEMO_STRATEGY_BASIS_PACKAGE)
     if (result.error) setError(result.error)
   }
 
@@ -69,43 +109,84 @@ function ImportPanel({ onImport }) {
           </div>
         </div>
 
-        {/* Demo card */}
+        {/* ── 1. File import (primary) ─────────────────────────────────────── */}
+        <div style={{
+          background: 'var(--surface)', border: '1px solid rgba(59,130,246,.35)',
+          borderRadius: 'var(--r)', padding: '16px 18px', marginBottom: 10,
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
+            Import JSON file
+            <span style={{ marginLeft: 8, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--accent)', padding: '1px 6px', borderRadius: 3, background: 'rgba(59,130,246,.12)', border: '1px solid rgba(59,130,246,.3)' }}>
+              Primary
+            </span>
+          </div>
+          <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 12, lineHeight: 1.6 }}>
+            Select a <code style={{ background: 'var(--s2)', padding: '1px 4px', borderRadius: 3, fontSize: 9 }}>.json</code> file exported from DomainIQ Stage 4 "Export Strategy Basis Package."
+          </div>
+
+          {/* Hidden real file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,application/json"
+            onChange={handleFileChange}
+            style={{ display: 'none' }}
+          />
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={fileStatus === 'reading'}
+              style={{
+                fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '7px 18px', borderRadius: 5,
+                cursor: fileStatus === 'reading' ? 'wait' : 'pointer',
+                background: 'var(--accent)', border: 'none', color: '#000',
+                opacity: fileStatus === 'reading' ? 0.65 : 1,
+              }}
+            >
+              {fileStatus === 'reading' ? 'Reading…' : 'Choose file'}
+            </button>
+            {fileStatus && fileStatus !== 'reading' && (
+              <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                ✓ {fileStatus}
+              </span>
+            )}
+            {!fileStatus && (
+              <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+                No file selected
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Error display — shared across all three paths */}
+        {error && (
+          <div style={{
+            fontSize: 10, color: '#f87171', marginBottom: 10, padding: '8px 12px',
+            background: 'rgba(248,113,113,.06)', border: '1px solid rgba(248,113,113,.25)',
+            borderRadius: 5, fontFamily: 'var(--fm)',
+            display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6,
+          }}>
+            <span style={{ flexShrink: 0 }}>⚠</span> {error}
+          </div>
+        )}
+
+        {/* ── 2. Paste JSON (secondary) ────────────────────────────────────── */}
         <div style={{
           background: 'var(--surface)', border: '1px solid var(--border)',
           borderRadius: 'var(--r)', padding: '14px 16px', marginBottom: 10,
-          display: 'flex', alignItems: 'center', gap: 12,
-        }}>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 3 }}>Load demo package</div>
-            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.6 }}>
-              Finlytica · Banking-Domain LLM as Regulatory Moat · v2
-            </div>
-          </div>
-          <button
-            onClick={handleLoadDemo}
-            style={{
-              fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
-              padding: '6px 16px', borderRadius: 5, cursor: 'pointer',
-              background: 'var(--accent)', border: 'none', color: '#000',
-              flexShrink: 0,
-            }}
-          >
-            Load demo
-          </button>
-        </div>
-
-        {/* JSON paste card */}
-        <div style={{
-          background: 'var(--surface)', border: '1px solid var(--border)',
-          borderRadius: 'var(--r)', padding: '14px 16px',
         }}>
           <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>
-            Paste package JSON
+            Paste JSON
+            <span style={{ marginLeft: 8, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', padding: '1px 6px', borderRadius: 3, background: 'var(--s2)', border: '1px solid var(--border)' }}>
+              Secondary
+            </span>
           </div>
           <textarea
             value={json}
             onChange={e => { setJson(e.target.value); setError(null) }}
-            rows={9}
+            rows={7}
             placeholder={'{\n  "packageType": "domainiq_strategy_basis_package",\n  "packageVersion": "1.0",\n  ...\n}'}
             style={{
               width: '100%', boxSizing: 'border-box',
@@ -116,15 +197,6 @@ function ImportPanel({ onImport }) {
               lineHeight: 1.6, marginBottom: 10,
             }}
           />
-          {error && (
-            <div style={{
-              fontSize: 10, color: '#f87171', marginBottom: 10,
-              fontFamily: 'var(--fm)', display: 'flex', alignItems: 'flex-start', gap: 5,
-              lineHeight: 1.5,
-            }}>
-              <span style={{ flexShrink: 0, marginTop: 1 }}>⚠</span> {error}
-            </div>
-          )}
           <button
             onClick={handleImportJson}
             disabled={!json.trim()}
@@ -138,7 +210,38 @@ function ImportPanel({ onImport }) {
               opacity: json.trim() ? 1 : 0.65,
             }}
           >
-            Import package
+            Import pasted JSON
+          </button>
+        </div>
+
+        {/* ── 3. Demo fixture (tertiary) ───────────────────────────────────── */}
+        <div style={{
+          background: 'var(--surface)', border: '1px solid var(--border)',
+          borderRadius: 'var(--r)', padding: '12px 16px',
+          display: 'flex', alignItems: 'center', gap: 12,
+          opacity: 0.8,
+        }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 10, fontWeight: 600, marginBottom: 2 }}>
+              Load demo package
+              <span style={{ marginLeft: 8, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', padding: '1px 6px', borderRadius: 3, background: 'var(--s2)', border: '1px solid var(--border)' }}>
+                Demo only
+              </span>
+            </div>
+            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.5 }}>
+              Finlytica · Banking-Domain LLM as Regulatory Moat · v2
+            </div>
+          </div>
+          <button
+            onClick={handleLoadDemo}
+            style={{
+              fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+              padding: '5px 14px', borderRadius: 5, cursor: 'pointer',
+              background: 'var(--s2)', border: '1px solid var(--border)',
+              color: 'var(--muted2)', flexShrink: 0,
+            }}
+          >
+            Load demo
           </button>
         </div>
 
