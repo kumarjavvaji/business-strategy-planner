@@ -259,6 +259,7 @@ export default function App() {
     importPackage,
     saveStageRevision,
     saveRawRevision,
+    saveStage1AIRevision,
     clearWorkspace,
   } = useWorkspace()
   const [activeStage, setActiveStage] = useState(1)
@@ -286,13 +287,25 @@ export default function App() {
   const stage1Revisions = fullWorkspace?.stageRevisions?.stage1 ?? []
   const stage1ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage1 ?? null
 
+  // Manual correction note — snapshot of existing workspace
   function handleSaveStage1Revision({ prompt, impactSummary }) {
     saveStageRevision('stage1', { prompt, impactSummary })
+  }
+
+  // AI-generated revision — updates normalizedWorkspace + appends revision atomically
+  function handleSaveStage1RawRevision(revisionRecord, patchedWorkspace) {
+    saveStage1AIRevision(revisionRecord, patchedWorkspace)
   }
 
   // Stage 2 revision data
   const stage2Revisions = fullWorkspace?.stageRevisions?.stage2 ?? []
   const stage2ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage2 ?? null
+
+  // Stage 2 is stale when its latest revision was generated from a different Stage 1 rev
+  const latestStage2Rev = stage2Revisions.length > 0
+    ? [...stage2Revisions].sort((a, b) => b.revisionNumber - a.revisionNumber)[0]
+    : null
+  const stage2IsStale = !!(latestStage2Rev && latestStage2Rev.sourceBasisRevisionId !== stage1ActiveId)
 
   function handleSaveStage2Revision(revisionRecord) {
     saveRawRevision('stage2', revisionRecord)
@@ -327,19 +340,34 @@ export default function App() {
 
       {/* Stage tab nav — all tabs clickable */}
       <nav className="stage-nav">
-        {STAGES.map(s => (
-          <button
-            key={s.id}
-            onClick={() => setActiveStage(s.id)}
-            className={[
-              'stage-tab',
-              activeStage === s.id ? 'active' : '',
-            ].filter(Boolean).join(' ')}
-          >
-            <span className="stage-tab-label">{s.label}</span>
-            <span className="stage-tab-sub">{s.sub}</span>
-          </button>
-        ))}
+        {STAGES.map(s => {
+          const isStale2 = s.id === 2 && stage2IsStale && stage2Revisions.length > 0
+          return (
+            <button
+              key={s.id}
+              onClick={() => setActiveStage(s.id)}
+              className={[
+                'stage-tab',
+                activeStage === s.id ? 'active' : '',
+              ].filter(Boolean).join(' ')}
+            >
+              <span className="stage-tab-label" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                {s.label}
+                {isStale2 && (
+                  <span
+                    title="Stage 2 is stale — regenerate from the updated Stage 1"
+                    style={{
+                      display: 'inline-block', width: 6, height: 6,
+                      borderRadius: '50%', background: '#fb923c',
+                      flexShrink: 0, marginTop: 1,
+                    }}
+                  />
+                )}
+              </span>
+              <span className="stage-tab-sub">{s.sub}</span>
+            </button>
+          )
+        })}
       </nav>
 
       {/* Content */}
@@ -350,6 +378,9 @@ export default function App() {
             stageRevisions={stage1Revisions}
             activeRevisionId={stage1ActiveId}
             onSaveRevision={handleSaveStage1Revision}
+            onSaveRawRevision={handleSaveStage1RawRevision}
+            stage2IsStale={stage2IsStale}
+            stage2HasRevisions={stage2Revisions.length > 0}
             onNavigateToStage2={() => setActiveStage(2)}
           />
         )}

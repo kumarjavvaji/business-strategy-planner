@@ -1,10 +1,22 @@
 // Stage 1 — Strategy Basis Review
 // Reads from the normalized workspace model. Never accesses the raw package.
+//
+// AI regeneration:
+//   When VITE_ANTHROPIC_API_KEY is configured, the refinement panel offers
+//   "Regenerate with AI" — applies a refinement prompt to the current document,
+//   updates the normalized workspace, and saves a new Stage 1 revision.
+//   This invalidates any existing Stage 2 revisions (they track sourceBasisRevisionId).
+//
+// Manual correction notes:
+//   Preserved in full when API key is absent. Creates a revision snapshot for
+//   diff/history purposes but does not modify the displayed content.
 
-import React, { useState } from 'react'
-import RefinementPanel     from './RefinementPanel'
-import RevisionHistory     from './RevisionHistory'
-import RevisionDiffViewer  from './RevisionDiffViewer'
+import React, { useState, useCallback } from 'react'
+import RevisionHistory    from './RevisionHistory'
+import RevisionDiffViewer from './RevisionDiffViewer'
+import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
+import { buildStage1Messages, parseStage1Response, applyStage1PatchToWorkspace } from '../utils/stage1Prompts'
+import { buildStage1Snapshot, buildStage1AIRevision } from '../utils/stageSnapshots'
 
 // ── Posture colour map ────────────────────────────────────────────────────────
 const POSTURE_COLORS = {
@@ -92,16 +104,287 @@ function Section({ title, label, children, defaultOpen = true }) {
   )
 }
 
+// ── Stage 1 Refinement Panel ──────────────────────────────────────────────────
+// Handles both AI-assisted regeneration (when key is present) and manual
+// correction notes (when no key). Owned by Stage1View to keep AI state local.
+
+function Stage1RefinementPanel({
+  apiMode,
+  workspace,
+  currentSnapshot,
+  stageRevisions,
+  onSaveRevision,      // ({ prompt, impactSummary }) => void  — manual path
+  onSaveRawRevision,   // (record, patchedWorkspace) => void   — AI path
+}) {
+  const [prompt,      setPrompt]      = useState('')
+  const [impact,      setImpact]      = useState('')
+  const [isRegen,     setIsRegen]     = useState(false)
+  const [regenError,  setRegenError]  = useState(null)
+  const [rawResponse, setRawResponse] = useState(null)
+  const [showRaw,     setShowRaw]     = useState(false)
+  const [savedCount,  setSavedCount]  = useState(0)   // bump to show "✓" briefly
+
+  const isAI    = apiMode === 'ai'
+  const canSave = prompt.trim().length > 0 && !isRegen
+
+  async function handleSubmit() {
+    if (!canSave) return
+    const p = prompt.trim()
+    const i = impact.trim()
+
+    if (isAI) {
+      setIsRegen(true)
+      setRegenError(null)
+      setRawResponse(null)
+      setShowRaw(false)
+
+      const snapshot = currentSnapshot
+      if (!snapshot) {
+        setRegenError('No active Stage 1 revision snapshot found.')
+        setIsRegen(false)
+        return
+      }
+
+      const { messages } = buildStage1Messages(snapshot, p)
+      const { result, error } = await callAI(messages, { temperature: 0.2, maxTokens: 5000 })
+
+      if (error) {
+        setRegenError(error)
+        setIsRegen(false)
+        return
+      }
+
+      setRawResponse(result)
+      const { patch, error: parseError } = parseStage1Response(result)
+
+      if (parseError || !patch) {
+        setRegenError(parseError || 'Failed to parse AI response.')
+        setIsRegen(false)
+        return
+      }
+
+      const patchedWorkspace = applyStage1PatchToWorkspace(workspace, patch)
+      const newSnapshot      = buildStage1Snapshot(patchedWorkspace)
+      const nextRevNum       = (stageRevisions?.length || 0) + 1
+      const autoImpact       = i || `AI refinement: ${p.slice(0, 100)}${p.length > 100 ? '…' : ''}`
+      const record           = buildStage1AIRevision(newSnapshot, nextRevNum, p, autoImpact)
+
+      onSaveRawRevision(record, patchedWorkspace)
+
+      setPrompt('')
+      setImpact('')
+      setIsRegen(false)
+      setSavedCount(c => c + 1)
+      setTimeout(() => setSavedCount(c => Math.max(0, c - 1)), 2500)
+
+    } else {
+      // Manual correction note — saves snapshot of current workspace
+      onSaveRevision({ prompt: p, impactSummary: i })
+      setPrompt('')
+      setImpact('')
+      setSavedCount(c => c + 1)
+      setTimeout(() => setSavedCount(c => Math.max(0, c - 1)), 1800)
+    }
+  }
+
+  const justSaved = savedCount > 0
+
+  return (
+    <div style={{
+      background: 'var(--surface)', border: '1px solid var(--border)',
+      borderRadius: 'var(--r)', overflow: 'hidden', marginBottom: 10,
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: '10px 15px',
+        display: 'flex', alignItems: 'center', gap: 8,
+        borderBottom: '1px solid var(--border)',
+      }}>
+        <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--accent)', flexShrink: 0 }}>
+          ↻
+        </span>
+        <span style={{ fontSize: 11, fontWeight: 600, flex: 1 }}>
+          {isAI ? 'Refine with AI' : 'Correction Note'}
+        </span>
+        {isAI ? (
+          <span style={{
+            fontSize: 8, fontFamily: 'var(--fm)',
+            display: 'flex', alignItems: 'center', gap: 4, color: '#00e5b4',
+          }}>
+            <span style={{
+              display: 'inline-block', width: 5, height: 5, borderRadius: '50%',
+              background: '#00e5b4', flexShrink: 0,
+            }} />
+            {AI_MODEL_LABEL}
+          </span>
+        ) : (
+          <span style={{
+            fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+            padding: '1px 6px', borderRadius: 3,
+            background: 'var(--s2)', border: '1px solid var(--border)',
+          }}>
+            manual note
+          </span>
+        )}
+      </div>
+
+      <div style={{ padding: '13px 15px' }}>
+        <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.65, marginBottom: 14, fontFamily: 'var(--fm)' }}>
+          {isAI
+            ? `Describe what to refine — the model will update only the impacted fields while preserving unchanged content. Creates a new Stage 1 revision and marks Stage 2 as stale.`
+            : `Record a correction or context note against the current document. Creates a revision snapshot for diff/compare without modifying the displayed content.`
+          }
+        </div>
+
+        {/* Prompt textarea */}
+        <div style={{ marginBottom: 12 }}>
+          <div style={{
+            fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)',
+            textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 5,
+          }}>
+            {isAI ? 'Refinement instruction' : 'Correction / context note'}{' '}
+            <span style={{ color: '#f87171' }}>*</span>
+          </div>
+          <textarea
+            value={prompt}
+            onChange={e => setPrompt(e.target.value)}
+            rows={4}
+            disabled={isRegen}
+            placeholder={isAI
+              ? 'e.g. Update the strategic thesis to reflect the new OCC effective date (May 2026). Add a readiness warning about the missing gap audit. Elevate confidence to High given the validation evidence gathered in Sprint 1.'
+              : 'e.g. The target customer should also include VP of Finance, not just CFO. The readiness level needs updating — internal tooling inventory was just completed.'
+            }
+            style={{
+              width: '100%', boxSizing: 'border-box',
+              fontSize: 10, fontFamily: 'var(--fm)',
+              color: 'var(--text)', background: 'var(--s2)',
+              border: '1px solid var(--border)', borderRadius: 5,
+              padding: '8px 10px', resize: 'vertical', outline: 'none',
+              lineHeight: 1.65, opacity: isRegen ? 0.6 : 1,
+            }}
+          />
+        </div>
+
+        {/* Impact summary */}
+        <div style={{ marginBottom: 14 }}>
+          <div style={{
+            fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)',
+            textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 5,
+          }}>
+            Impact summary <span style={{ opacity: .5 }}>(optional)</span>
+          </div>
+          <textarea
+            value={impact}
+            onChange={e => setImpact(e.target.value)}
+            rows={2}
+            disabled={isRegen}
+            placeholder="e.g. Widens the compliance timeline — Stage 2 BU mapping for Legal & Compliance should be regenerated."
+            style={{
+              width: '100%', boxSizing: 'border-box',
+              fontSize: 10, fontFamily: 'var(--fm)',
+              color: 'var(--text)', background: 'var(--s2)',
+              border: '1px solid var(--border)', borderRadius: 5,
+              padding: '8px 10px', resize: 'vertical', outline: 'none',
+              lineHeight: 1.65, opacity: isRegen ? 0.6 : 1,
+            }}
+          />
+        </div>
+
+        {/* CTA row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <button
+            onClick={handleSubmit}
+            disabled={!canSave || justSaved}
+            style={{
+              fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+              padding: '6px 18px', borderRadius: 5,
+              cursor: canSave && !justSaved ? 'pointer' : 'not-allowed',
+              background: canSave && !justSaved ? 'var(--accent)' : 'var(--s2)',
+              border: `1px solid ${canSave && !justSaved ? 'var(--accent)' : 'var(--border)'}`,
+              color: canSave && !justSaved ? '#000' : 'var(--muted)',
+              opacity: (canSave || justSaved) ? 1 : 0.55,
+              transition: 'background .15s, color .15s',
+            }}
+          >
+            {justSaved
+              ? '✓ Saved'
+              : isRegen
+              ? 'Regenerating…'
+              : isAI
+              ? 'Regenerate with AI'
+              : 'Save correction note'
+            }
+          </button>
+          {!canSave && !isRegen && !justSaved && (
+            <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+              Enter {isAI ? 'a refinement instruction' : 'a note'} to continue.
+            </span>
+          )}
+          {isRegen && (
+            <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+              Applying refinement — preserving unchanged fields…
+            </span>
+          )}
+        </div>
+
+        {/* Error */}
+        {regenError && (
+          <div style={{
+            marginTop: 10, fontSize: 9, fontFamily: 'var(--fm)',
+            color: '#f87171', lineHeight: 1.6,
+            padding: '8px 10px', borderRadius: 4,
+            background: 'rgba(248,113,113,.07)', border: '1px solid rgba(248,113,113,.25)',
+            display: 'flex', flexDirection: 'column', gap: 5,
+          }}>
+            <div style={{ display: 'flex', gap: 5 }}>
+              <span style={{ flexShrink: 0 }}>⚠</span>
+              <span>{regenError}</span>
+            </div>
+            {rawResponse && (
+              <button
+                onClick={() => setShowRaw(s => !s)}
+                style={{
+                  alignSelf: 'flex-start',
+                  fontSize: 8, fontFamily: 'var(--fm)', padding: '2px 8px', borderRadius: 3,
+                  cursor: 'pointer', background: 'var(--s2)',
+                  border: '1px solid var(--border)', color: 'var(--muted)',
+                }}
+              >
+                {showRaw ? 'Hide raw response' : 'Show raw response'}
+              </button>
+            )}
+            {showRaw && rawResponse && (
+              <pre style={{
+                fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                background: 'var(--s2)', borderRadius: 4, padding: '8px 10px',
+                overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                maxHeight: 200, overflowY: 'auto', margin: 0,
+              }}>
+                {rawResponse}
+              </pre>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Main Stage 1 view ─────────────────────────────────────────────────────────
 
 export default function Stage1View({
   workspace,
   stageRevisions,
   activeRevisionId,
-  onSaveRevision,
+  onSaveRevision,       // ({ prompt, impactSummary }) => void — manual correction
+  onSaveRawRevision,    // (record, patchedWorkspace) => void  — AI revision
+  stage2IsStale,        // boolean — true when Stage 2 revisions are behind Stage 1
+  stage2HasRevisions,   // boolean — true when Stage 2 has at least one revision
   onNavigateToStage2,
 }) {
   const [compareRevId, setCompareRevId] = useState(null)
+
+  const apiMode = getApiMode()   // 'ai' | 'mock'
 
   const { entity, artifact, strategy, evidence, lineage } = workspace
   const data     = artifact?.data    || {}
@@ -115,9 +398,40 @@ export default function Stage1View({
   // Derive current and compare-target revisions for diff viewer
   const currentRevision = stageRevisions?.find(r => r.id === activeRevisionId) ?? null
   const compareRevision = compareRevId ? stageRevisions?.find(r => r.id === compareRevId) ?? null : null
+  const currentSnapshot = currentRevision?.contentSnapshot ?? null
 
   return (
     <div style={{ maxWidth: 840, padding: '0 16px 40px' }}>
+
+      {/* ── Downstream staleness notice ──────────────────────────────────── */}
+      {stage2IsStale && stage2HasRevisions && (
+        <div style={{
+          background: 'rgba(251,146,60,.06)', border: '1px solid rgba(251,146,60,.35)',
+          borderRadius: 'var(--r)', padding: '10px 16px', marginBottom: 12,
+          display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+        }}>
+          <span style={{ fontSize: 10, color: '#fb923c', flexShrink: 0 }}>⚠</span>
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#fb923c', marginBottom: 2 }}>
+              Stage 2 is stale
+            </div>
+            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.6 }}>
+              Stage 2 was generated from an earlier Stage 1 revision. Regenerate Stage 2 to realign the business unit mapping with the current strategy.
+            </div>
+          </div>
+          <button
+            onClick={onNavigateToStage2}
+            style={{
+              flexShrink: 0, fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+              padding: '5px 14px', borderRadius: 5, cursor: 'pointer',
+              background: 'rgba(251,146,60,.15)', border: '1px solid rgba(251,146,60,.4)',
+              color: '#fb923c',
+            }}
+          >
+            Go to Stage 2 →
+          </button>
+        </div>
+      )}
 
       {/* ── Artifact identity header ─────────────────────────────────────── */}
       <div style={{
@@ -293,7 +607,7 @@ export default function Stage1View({
       {/* ── Upstream Evidence Chain ──────────────────────────────────────── */}
       <Section title="Upstream Evidence Chain" label="11" defaultOpen={false}>
         <Field label="Stage 1 — Initial orientation" value={evidence.stage1Intent} />
-        <Field label="Stage 2 — Evidence retrieval" value={evidence.stage2Summary} />
+        <Field label="Stage 2 — Evidence retrieval"  value={evidence.stage2Summary} />
         <Field label="Stage 3 — Strategic synthesis" value={evidence.stage3Synthesis} />
         {evidence.userContextAdditions.length > 0 && (
           <div style={{ marginTop: 8 }}>
@@ -308,9 +622,9 @@ export default function Stage1View({
       {/* ── Lineage & Traceability ───────────────────────────────────────── */}
       <Section title="Lineage & Traceability" label="12" defaultOpen={false}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 20px', marginBottom: 10 }}>
-          <Field label="Source Stage" value={lineage.sourceStage} />
-          <Field label="Artifact Version" value={lineage.sourceArtifactVersion} />
-          <Field label="User Edited" value={lineage.userEdited ? 'Yes' : 'No'} />
+          <Field label="Source Stage"        value={lineage.sourceStage} />
+          <Field label="Artifact Version"    value={lineage.sourceArtifactVersion} />
+          <Field label="User Edited"         value={lineage.userEdited ? 'Yes' : 'No'} />
           <Field label="Citations Preserved" value={lineage.citationsPreserved ? 'Yes' : 'No'} />
         </div>
         {lineage.basedOnStages?.length > 0 && (
@@ -344,7 +658,14 @@ export default function Stage1View({
       />
 
       {/* ── Refinement Panel ─────────────────────────────────────────────── */}
-      <RefinementPanel onSaveRevision={onSaveRevision} />
+      <Stage1RefinementPanel
+        apiMode={apiMode}
+        workspace={workspace}
+        currentSnapshot={currentSnapshot}
+        stageRevisions={stageRevisions}
+        onSaveRevision={onSaveRevision}
+        onSaveRawRevision={onSaveRawRevision}
+      />
 
       {/* ── Stage 2 CTA ──────────────────────────────────────────────────── */}
       <div style={{
@@ -357,8 +678,10 @@ export default function Stage1View({
             Continue to Stage 2 — Business Unit Mapping
           </div>
           <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.65 }}>
-            Stage 2 will map this strategy into business-unit responsibilities.
-            Stage 1 import and refinement history are now ready.
+            {stage2IsStale && stage2HasRevisions
+              ? 'Stage 2 is stale — regenerate the business unit mapping to align with the current strategy.'
+              : 'Stage 2 will map this strategy into business-unit responsibilities. Stage 1 import and refinement history are now ready.'
+            }
           </div>
         </div>
         <button
@@ -367,10 +690,11 @@ export default function Stage1View({
             flexShrink: 0,
             fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
             padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
-            background: 'var(--accent)', border: 'none', color: '#000',
+            background: stage2IsStale && stage2HasRevisions ? '#fb923c' : 'var(--accent)',
+            border: 'none', color: '#000',
           }}
         >
-          Stage 2 →
+          {stage2IsStale && stage2HasRevisions ? 'Regenerate Stage 2 →' : 'Stage 2 →'}
         </button>
       </div>
 

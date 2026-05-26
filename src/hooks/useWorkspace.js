@@ -21,9 +21,9 @@
 //
 // Migration: detects old { workspace, sourcePackage } shape and upgrades on load.
 
-import { useState, useEffect }                          from 'react'
-import { normalizeStrategyBasisPackage }                from '../utils/packageImport'
-import { buildInitialRevision, buildManualRevision }    from '../utils/stageSnapshots'
+import { useState, useEffect }                                           from 'react'
+import { normalizeStrategyBasisPackage }                                 from '../utils/packageImport'
+import { buildInitialRevision, buildManualRevision }                     from '../utils/stageSnapshots'
 
 const STORAGE_KEY = 'bsp_v1_workspace'
 
@@ -187,6 +187,34 @@ export function useWorkspace() {
     })
   }
 
+  // ── saveStage1AIRevision ─────────────────────────────────────────────────────
+  // Atomically updates the normalized workspace (so Stage1View re-renders with
+  // AI-refined content) and appends the pre-built revision record to stage1.
+  //
+  //   revisionRecord  — built by buildStage1AIRevision()
+  //   patchedWorkspace — from applyStage1PatchToWorkspace(); becomes the new source of truth
+  //
+  // After this call, stage1ActiveId changes → Stage 2 becomes stale automatically.
+  function saveStage1AIRevision(revisionRecord, patchedWorkspace) {
+    setFullWorkspace(prev => {
+      if (!prev) return prev
+      const existing = prev.stageRevisions.stage1 || []
+      return {
+        ...prev,
+        updatedAt:           new Date().toISOString(),
+        normalizedWorkspace: patchedWorkspace,
+        stageRevisions: {
+          ...prev.stageRevisions,
+          stage1: [...existing, revisionRecord],
+        },
+        activeStageRevisionIds: {
+          ...prev.activeStageRevisionIds,
+          stage1: revisionRecord.id,
+        },
+      }
+    })
+  }
+
   // ── clearWorkspace ───────────────────────────────────────────────────────────
   function clearWorkspace() {
     setFullWorkspace(null)
@@ -204,6 +232,7 @@ export function useWorkspace() {
     importPackage,
     saveStageRevision,
     saveRawRevision,
+    saveStage1AIRevision,
     clearWorkspace,
   }
 }

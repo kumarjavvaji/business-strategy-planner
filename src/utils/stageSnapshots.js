@@ -154,6 +154,26 @@ function revisionId() {
 }
 
 /**
+ * Creates a Stage 1 AI-generated revision record.
+ * Takes an already-normalised snapshot (from buildStage1Snapshot applied to a patched workspace).
+ * source: 'ai'
+ * refinementType: 'stage' (full-document refinement)
+ */
+export function buildStage1AIRevision(snapshot, revisionNumber, prompt, impactSummary) {
+  return {
+    id:             revisionId(),
+    revisionNumber,
+    label:          `Revision ${revisionNumber}`,
+    prompt:         prompt        || '',
+    impactSummary:  impactSummary || '',
+    createdAt:      new Date().toISOString(),
+    source:         'ai',
+    refinementType: 'stage',
+    contentSnapshot: snapshot,
+  }
+}
+
+/**
  * Creates the first (import) revision for a stage.
  */
 export function buildInitialRevision(normalizedWorkspace) {
