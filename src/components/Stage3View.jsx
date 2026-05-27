@@ -320,11 +320,20 @@ function summarizeHandoffReadiness(bu, draft) {
   const usableCount = Object.values(cells).filter(c => ['ready', 'partial'].includes(c.status)).length
   const staleCount = Object.values(cells).filter(c => c.status === 'stale').length
   const failedCount = itemStates.filter(item => item.status === 'failed' || item.parserError).length
+  const completedItemCount = itemStates.filter(item => (
+    item.status === 'complete' ||
+    item.status === 'partial' ||
+    item.parsedValue ||
+    Object.keys(item.childAtoms || {}).length
+  )).length
+  const totalItemCount = structureItems.length || itemStates.length
   const completion = !exists
     ? 'none'
     : staleCount || failedCount
       ? 'partial'
-      : readyCount >= 5
+      : totalItemCount > 0 && completedItemCount >= totalItemCount && domainOfWork && smeLens
+        ? 'full'
+        : readyCount >= 5
         ? 'full'
         : usableCount >= 2
           ? 'partial'
@@ -336,6 +345,8 @@ function summarizeHandoffReadiness(bu, draft) {
     usableCount,
     staleCount,
     failedCount,
+    completedItemCount,
+    totalItemCount,
     completion,
     planMode: completion === 'full' ? 'full' : completion === 'none' ? 'stage1_2_only' : 'limited',
     planningContext: buildPlanningContextFromDraft(bu, draft),
@@ -479,6 +490,23 @@ function PlanSection({ label, children, marginBottom = 12 }) {
 }
 
 // ── Assumption badge ──────────────────────────────────────────────────────────
+
+function Field({ label, value }) {
+  if (value === null || value === undefined || value === '') return null
+  return (
+    <div style={{ marginBottom: 7 }}>
+      <div style={{
+        fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+        textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 2,
+      }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.55 }}>
+        {Array.isArray(value) ? value.join(', ') : String(value)}
+      </div>
+    </div>
+  )
+}
 
 const ASSUMPTION_COLORS = {
   fact:        '#3b82f6',
@@ -938,6 +966,312 @@ function Stage3ReadinessMatrix({
       </div>
     </div>
   )
+}
+
+function HandoffItemRow({ item, unitName, onStage2Action }) {
+  const status = item.isStale ? 'stale' : item.status || 'not_started'
+  const color = {
+    complete: '#00e5b4',
+    partial: '#fb923c',
+    failed: '#f87171',
+    stale: '#f87171',
+    running: '#fb923c',
+    not_started: 'var(--muted)',
+  }[status] || 'var(--muted)'
+  const detail = item.parsedValue
+    ? listFromValue(item.parsedValue).slice(0, 2).join('; ')
+    : item.parserError || item.text || 'No generated detail yet'
+
+  return (
+    <div style={{
+      border: '1px solid var(--border)',
+      borderRadius: 5,
+      padding: '8px 9px',
+      background: 'var(--s2)',
+    }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 4 }}>
+            <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)' }}>
+              {item.label || item.key}
+            </span>
+            <Badge color={color} small>{status.replace('_', ' ')}</Badge>
+          </div>
+          <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.5 }}>
+            {detail}
+          </div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 92 }}>
+          {['Review', 'Refine', 'Regenerate'].map(action => (
+            <button
+              key={action}
+              onClick={() => onStage2Action(unitName, item.key, action.toLowerCase())}
+              style={{
+                fontSize: 8,
+                fontFamily: 'var(--fm)',
+                padding: '3px 6px',
+                borderRadius: 4,
+                cursor: 'pointer',
+                background: 'transparent',
+                border: '1px solid var(--border)',
+                color: 'var(--muted)',
+              }}
+            >
+              {action} in Stage 2
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Stage3ReadinessPanels({
+  rows,
+  planDrafts,
+  planGeneration,
+  draftOptIns,
+  onOptIntoStage12Draft,
+  onGenerateBUPlan,
+  onStage2Action,
+  apiMode,
+  disabled,
+  generationEnabled = false,
+}) {
+  const [open, setOpen] = useState({})
+  const completedCount = rows.filter(row => planDrafts[row.unit.name]?.plan).length
+
+  const modeFor = (readiness, optIn) => {
+    if (readiness.completion === 'full') {
+      return { label: 'Full exec plan', cta: 'Generate full exec plan', color: '#00e5b4', enabled: generationEnabled }
+    }
+    if (readiness.completion === 'partial' || readiness.completion === 'limited') {
+      return { label: 'Limited draft', cta: 'Generate limited draft', color: '#fb923c', enabled: generationEnabled }
+    }
+    if (optIn) {
+      return { label: 'Stage 1/2-only draft', cta: 'Generate from Stage 1/2 only', color: '#fb923c', enabled: generationEnabled }
+    }
+    return { label: 'Pending', cta: 'Review/build handoff in Stage 2', color: 'var(--muted)', enabled: false }
+  }
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{
+        background: 'var(--surface)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--r)',
+        padding: '13px 14px',
+        marginBottom: 8,
+      }}>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>BU Execution Readiness</div>
+            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55 }}>
+              Readiness now follows the Stage 2 domain-specific handoff model. Expand a BU to inspect its handoff state, Stage 2 linkbacks, and generation mode.
+            </div>
+          </div>
+          <Badge color={completedCount === rows.length && rows.length ? '#00e5b4' : '#fb923c'} small>
+            {completedCount}/{rows.length} plans
+          </Badge>
+        </div>
+      </div>
+
+      {rows.map((row, idx) => {
+        const unit = row.unit
+        const readiness = row.readiness
+        const draft = planDrafts[unit.name]
+        const gen = planGeneration[unit.name]
+        const isOpen = open[unit.name] ?? idx === 0
+        const hasPlan = !!draft?.plan
+        const executionStatus = gen?.error
+          ? 'failed'
+          : hasPlan
+            ? (draft.planGenerationMode === 'full' ? 'generated' : 'draft')
+            : 'not started'
+        const handoffStatus = readiness.completion === 'none'
+          ? 'missing'
+          : readiness.staleCount
+            ? 'stale'
+            : readiness.completion === 'full'
+              ? 'ready'
+              : 'partial'
+        const mode = modeFor(readiness, !!draftOptIns[unit.name])
+        const handoffItems = readiness.structureItems.map(item => {
+          const match = readiness.itemStates.find(state => state.key === item.key || state.key === String(readiness.structureItems.indexOf(item)))
+          return { ...item, ...(match || {}) }
+        })
+        const failedItems = readiness.itemStates.filter(item => item.status === 'failed' || item.parserError)
+        const staleItems = readiness.itemStates.filter(item => item.isStale)
+        const missingItems = handoffItems.filter(item => !item.parsedValue && !Object.keys(item.childAtoms || {}).length && item.status !== 'complete')
+
+        return (
+          <div key={unit.name || idx} style={{
+            background: 'var(--surface)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--r)',
+            marginBottom: 8,
+            overflow: 'hidden',
+          }}>
+            <div
+              onClick={() => setOpen(prev => ({ ...prev, [unit.name]: !isOpen }))}
+              style={{
+                padding: '11px 13px',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                borderBottom: isOpen ? '1px solid var(--border)' : 'none',
+              }}
+            >
+              <span style={{
+                width: 22,
+                height: 22,
+                borderRadius: '50%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: 9,
+                fontFamily: 'var(--fm)',
+                fontWeight: 700,
+                background: 'var(--s2)',
+                border: '1px solid var(--border)',
+                color: 'var(--muted2)',
+              }}>
+                {idx + 1}
+              </span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>
+                  {unit.name}
+                </div>
+                <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+                  {unit.involvementLevel || 'involvement n/a'} {unit.strategicInvolvement ? `· ${unit.strategicInvolvement}` : ''}
+                </div>
+              </div>
+              <Badge color={handoffStatus === 'ready' ? '#00e5b4' : handoffStatus === 'missing' ? 'var(--muted)' : '#fb923c'} small>
+                handoff {handoffStatus}
+              </Badge>
+              <Badge color={executionStatus === 'generated' ? '#00e5b4' : executionStatus === 'failed' ? '#f87171' : executionStatus === 'draft' ? '#fb923c' : 'var(--muted)'} small>
+                plan {executionStatus}
+              </Badge>
+              <span style={{ fontSize: 9, color: 'var(--muted)' }}>{isOpen ? '▲' : '▼'}</span>
+            </div>
+
+            {isOpen && (
+              <div style={{ padding: '12px 13px 13px' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1.2fr .8fr', gap: 12, marginBottom: 12 }}>
+                  <div style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '10px 11px', background: 'var(--s2)' }}>
+                    <SectionLabel>Handoff Readiness</SectionLabel>
+                    <Field label="domainOfWork" value={readiness.domainOfWork || 'Not generated'} />
+                    <Field
+                      label="SMEReviewLens"
+                      value={typeof readiness.smeLens === 'string'
+                        ? readiness.smeLens
+                        : readiness.smeLens?.summary || readiness.smeLens?.reviewerProfile || 'Not generated'}
+                    />
+                    <Field label="handoffStatus" value={handoffStatus} />
+                    <Field
+                      label="assembled items"
+                      value={`${readiness.completedItemCount}/${readiness.totalItemCount || readiness.structureItems.length || 0} assembled`}
+                    />
+                    {missingItems.length > 0 && <Field label="missing items" value={missingItems.map(item => item.label).join(', ')} />}
+                    {failedItems.length > 0 && <Field label="failed items" value={failedItems.map(item => item.label || item.key).join(', ')} />}
+                    {staleItems.length > 0 && <Field label="stale items" value={staleItems.map(item => item.label || item.key).join(', ')} />}
+                  </div>
+
+                  <div style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '10px 11px', background: 'var(--s2)' }}>
+                    <SectionLabel>Generate</SectionLabel>
+                    <div style={{ marginBottom: 8 }}>
+                      <Badge color={mode.color}>{mode.label}</Badge>
+                    </div>
+                    <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55, marginBottom: 9 }}>
+                      {readiness.completion === 'full'
+                        ? 'Complete handoff exists; full BU execution plan generation is available.'
+                        : readiness.completion === 'none'
+                          ? 'No handoff exists. Use Stage 2 to build the handoff, or explicitly opt into a Stage 1/2-only draft.'
+                          : 'Partial or stale handoff exists; limited draft generation should carry warnings.'}
+                    </div>
+                    {readiness.completion === 'none' && !draftOptIns[unit.name] && (
+                      <button
+                        onClick={() => onOptIntoStage12Draft(unit.name)}
+                        disabled={disabled}
+                        style={secondaryButtonStyle}
+                      >
+                        Enable Stage 1/2-only draft
+                      </button>
+                    )}
+                    <button
+                      onClick={() => mode.enabled ? onGenerateBUPlan(unit, readiness) : onStage2Action(unit.name, null, 'review')}
+                      disabled={disabled || gen?.running || (readiness.completion === 'none' && !draftOptIns[unit.name] && mode.label !== 'Pending')}
+                      style={{
+                        ...primaryButtonStyle,
+                        marginTop: 6,
+                        background: mode.enabled ? 'var(--accent)' : 'var(--s2)',
+                        borderColor: mode.enabled ? 'var(--accent)' : 'var(--border)',
+                        color: mode.enabled ? '#000' : 'var(--muted)',
+                      }}
+                    >
+                      {gen?.running ? 'Generating...' : mode.cta}
+                    </button>
+                    {gen?.error && (
+                      <div style={{ marginTop: 7, fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.45 }}>
+                        {gen.error}
+                      </div>
+                    )}
+                    {apiMode !== 'ai' && (
+                      <div style={{ marginTop: 7, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+                        Mock mode active.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <SectionLabel>Assembled Handoff Items</SectionLabel>
+                {handoffItems.length > 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {handoffItems.map((item, itemIdx) => (
+                      <HandoffItemRow
+                        key={`${item.key}-${itemIdx}`}
+                        item={item}
+                        unitName={unit.name}
+                        onStage2Action={onStage2Action}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic' }}>
+                    No Stage 2 handoff items generated yet.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+const primaryButtonStyle = {
+  width: '100%',
+  fontSize: 9,
+  fontFamily: 'var(--fm)',
+  fontWeight: 700,
+  padding: '6px 9px',
+  borderRadius: 4,
+  cursor: 'pointer',
+  border: '1px solid var(--accent)',
+}
+
+const secondaryButtonStyle = {
+  width: '100%',
+  fontSize: 8,
+  fontFamily: 'var(--fm)',
+  padding: '4px 8px',
+  borderRadius: 4,
+  cursor: 'pointer',
+  background: 'transparent',
+  border: '1px solid var(--border)',
+  color: 'var(--muted)',
 }
 
 function IndicatorStrip({ plan }) {
@@ -1421,6 +1755,7 @@ export default function Stage3View({
   stage3Revisions,
   stage3ActiveId,
   onSaveRevision,         // (revisionRecord) => void
+  onNavigateToStage2,
   onNavigateToStage4,
   shouldAutoGenerate,     // boolean — set by Stage 2 "Regenerate & View Stage 3" CTA
   onAutoGenerateComplete, // () => void
@@ -1491,6 +1826,18 @@ export default function Stage3View({
     }
     setStage3DraftPlans(hydrated)
   }, [effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, activeStage2Rev?.id])
+
+  function handleStage2HandoffAction(buName, itemKey, action) {
+    writeJsonStorage('bsp_v1_stage2_handoff_focus', {
+      workspaceId: effectiveWorkspaceId,
+      businessUnitName: buName,
+      itemKey,
+      action,
+      requestedAt: new Date().toISOString(),
+      source: 'stage3',
+    })
+    onNavigateToStage2?.()
+  }
 
   // ── Source rev labels ───────────────────────────────────────────────────────
   function sourceLabel(src) {
@@ -2061,15 +2408,17 @@ export default function Stage3View({
   if (stage3Revisions.length === 0) {
     return (
       <div style={{ maxWidth: 840, padding: '0 16px 40px' }}>
-        <Stage3ReadinessMatrix
+        <Stage3ReadinessPanels
           rows={readinessRows}
           planDrafts={stage3DraftPlans}
           planGeneration={buPlanGeneration}
           draftOptIns={stage12DraftOptIns}
           onOptIntoStage12Draft={buName => setStage12DraftOptIns(prev => ({ ...prev, [buName]: true }))}
           onGenerateBUPlan={handleGenerateBUPlan}
+          onStage2Action={handleStage2HandoffAction}
           apiMode={apiMode}
           disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
+          generationEnabled={false}
         />
         <div style={{
           background: 'var(--surface)', border: '1px solid var(--border)',
@@ -2199,15 +2548,17 @@ export default function Stage3View({
         </div>
       </div>
 
-      <Stage3ReadinessMatrix
+      <Stage3ReadinessPanels
         rows={readinessRows}
         planDrafts={stage3DraftPlans}
         planGeneration={buPlanGeneration}
         draftOptIns={stage12DraftOptIns}
         onOptIntoStage12Draft={buName => setStage12DraftOptIns(prev => ({ ...prev, [buName]: true }))}
         onGenerateBUPlan={handleGenerateBUPlan}
+        onStage2Action={handleStage2HandoffAction}
         apiMode={apiMode}
         disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
+        generationEnabled={false}
       />
 
       {/* ── Staleness banner ──────────────────────────────────────────────── */}

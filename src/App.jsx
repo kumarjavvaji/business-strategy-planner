@@ -459,6 +459,7 @@ export default function App() {
             stage3Revisions={stage3Revisions}
             stage3ActiveId={stage3ActiveId}
             onSaveRevision={handleSaveStage3Revision}
+            onNavigateToStage2={() => setActiveStage(2)}
             onNavigateToStage4={() => setActiveStage(4)}
             shouldAutoGenerate={stage3PendingGenerate}
             onAutoGenerateComplete={() => setStage3PendingGenerate(false)}
