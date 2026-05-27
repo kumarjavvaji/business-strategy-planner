@@ -475,3 +475,137 @@ Return only the JSON object with key "${childKey}".`
     ],
   }
 }
+
+// ── SME Review Lens ───────────────────────────────────────────────────────────
+
+/**
+ * Build messages to generate the SMEReviewLens for one BU.
+ * @param {object}       stage1Snapshot
+ * @param {object}       bu
+ * @param {string|null}  domainOfWork      — already-generated domain label (or null)
+ * @param {string[]|null} handoffStructure — already-generated structure themes (or null)
+ * @param {string[]|null} completedThemes  — subset of handoffStructure with completed items
+ * @param {string[]}     otherBuNames
+ */
+export function buildSmeLensMessages(stage1Snapshot, bu, domainOfWork, handoffStructure, completedThemes, otherBuNames) {
+  const stage1Context = stageSnapshotToText(stage1Snapshot)
+  const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
+
+  const domainLine = domainOfWork ? `\nDomain of Work: ${domainOfWork}` : ''
+  const structureSection = handoffStructure?.length
+    ? `\nHandoff Structure Themes:\n${handoffStructure.map(s => `  - ${s}`).join('\n')}`
+    : ''
+  const completedSection = completedThemes?.length
+    ? `\nHandoff Items Generated (themes): ${completedThemes.join(', ')}`
+    : ''
+
+  const systemPrompt = `You are a strategic planning analyst preparing a Stage 3 execution planning handoff.
+
+Identify the SME Review Lens for this business unit — the specific area of subject-matter expertise that Stage 3 execution planning should draw on for validation, calibration, and risk assessment.
+
+Return ONLY valid JSON — no markdown, no prose, no code fences:
+
+{ "SMEReviewLens": "string" }
+
+Rules:
+- SMEReviewLens: one concise phrase (3–10 words) naming the expert review lens
+- Be specific to this BU, its domain of work, and the strategy — no generic labels
+- Examples: "Legal & regulatory sign-off", "Supply chain resilience", "Customer segment economics"`
+
+  const userPrompt = `Stage 1 Strategy Basis:
+${stage1Context}
+
+Business Unit:
+${buildBuDetails(bu)}${domainLine}${structureSection}${completedSection}
+
+Other Business Units: ${otherBuList}
+
+Generate the SME Review Lens for ${bu.name}. Return only the JSON object.`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt   },
+    ],
+  }
+}
+
+/**
+ * Parse an SME lens response.
+ * Accepts: { "SMEReviewLens": "..." } | { "smeReviewLens": "..." } | { "value": "..." }
+ * @returns {{ parsedValue: string|null, error: string|null }}
+ */
+export function parseSmeLensResponse(rawText) {
+  if (!rawText?.trim()) return { parsedValue: null, error: 'Empty response from API.' }
+
+  let jsonStr = rawText.trim()
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (fenceMatch) jsonStr = fenceMatch[1].trim()
+
+  const firstBrace = jsonStr.indexOf('{')
+  const lastBrace  = jsonStr.lastIndexOf('}')
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    jsonStr = jsonStr.slice(firstBrace, lastBrace + 1)
+  }
+
+  let parsed
+  try { parsed = JSON.parse(jsonStr) }
+  catch { return { parsedValue: null, error: 'Could not parse JSON from response.' } }
+
+  const value =
+    typeof parsed?.SMEReviewLens === 'string' ? parsed.SMEReviewLens.trim() :
+    typeof parsed?.smeReviewLens === 'string' ? parsed.smeReviewLens.trim() :
+    typeof parsed?.value         === 'string' ? parsed.value.trim()         :
+    null
+
+  if (!value) return { parsedValue: null, error: 'Response missing SMEReviewLens value.' }
+  return { parsedValue: value, error: null }
+}
+
+/**
+ * Build messages to refine an existing SME Review Lens.
+ * Response is parsed with parseSmeLensResponse.
+ */
+export function buildSmeLensRefinementMessages(stage1Snapshot, bu, domainOfWork, handoffStructure, currentSmeLens, userPrompt, otherBuNames) {
+  const stage1Context = stageSnapshotToText(stage1Snapshot)
+  const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
+
+  const domainLine = domainOfWork ? `\nDomain of Work: ${domainOfWork}` : ''
+  const structureSection = handoffStructure?.length
+    ? `\nHandoff Structure Themes:\n${handoffStructure.map(s => `  - ${s}`).join('\n')}`
+    : ''
+
+  const systemPrompt = `You are a strategic planning analyst refining the SME Review Lens for a Stage 3 execution planning handoff.
+
+Update the SMEReviewLens according to the refinement instruction. Return ONLY valid JSON — no markdown, no prose, no code fences:
+
+{ "SMEReviewLens": "string" }
+
+Rules:
+- SMEReviewLens: one concise phrase (3–10 words)
+- Be specific to this BU, its domain, and the strategy
+- Apply targeted changes only — do not rewrite the lens if the instruction does not require it`
+
+  const userMsg = `Stage 1 Strategy Basis:
+${stage1Context}
+
+Business Unit:
+${buildBuDetails(bu)}${domainLine}${structureSection}
+
+Other Business Units: ${otherBuList}
+
+Current SME Review Lens:
+"${currentSmeLens}"
+
+Refinement Instruction:
+${userPrompt}
+
+Return only the updated JSON object.`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userMsg       },
+    ],
+  }
+}

@@ -28,6 +28,8 @@ import {
   buildHandoffChildAtomMessages, parseHandoffChildAtomResponse,
   buildHandoffItemRefinementMessages,
   buildHandoffChildAtomRefinementMessages,
+  buildSmeLensMessages, parseSmeLensResponse,
+  buildSmeLensRefinementMessages,
   CHILD_ATOM_KEYS,
 } from '../utils/handoffPrompts'
 import RevisionHistory    from './RevisionHistory'
@@ -89,17 +91,20 @@ const ITEM_STATE_DEFAULT = {
   missingChildren: [], failedChildren: [],
 }
 const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
+const SME_LENS_STATE_DEFAULT   = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 
 function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, workspaceId }) {
-  const [open,           setOpen]           = useState(false)
-  const [isGenerating,   setIsGenerating]   = useState(false)
-  const [structureRaw,   setStructureRaw]   = useState(null)
-  const [parsed,         setParsed]         = useState(null)    // { domainOfWork, handoffStructure }
-  const [genError,       setGenError]       = useState(null)
-  const [itemStates,     setItemStates]     = useState({})      // { [index]: ITEM_STATE_DEFAULT }
-  const [itemRefineUi,   setItemRefineUi]   = useState({})      // { [i]: { open, prompt, busy, error } }
-  const [childRefineUi,  setChildRefineUi]  = useState({})      // { ['i/key']: { open, prompt, busy, error } }
-  const [decompositionOpen, setDecompositionOpen] = useState({}) // { [i]: bool }
+  const [open,             setOpen]             = useState(false)
+  const [isGenerating,     setIsGenerating]     = useState(false)
+  const [structureRaw,     setStructureRaw]     = useState(null)
+  const [parsed,           setParsed]           = useState(null)    // { domainOfWork, handoffStructure }
+  const [genError,         setGenError]         = useState(null)
+  const [itemStates,       setItemStates]       = useState({})      // { [index]: ITEM_STATE_DEFAULT }
+  const [smeLensState,     setSmeLensState]     = useState(SME_LENS_STATE_DEFAULT)
+  const [smeLensRefineUi,  setSmeLensRefineUi]  = useState({ open: false, prompt: '', busy: false, error: null })
+  const [itemRefineUi,     setItemRefineUi]     = useState({})      // { [i]: { open, prompt, busy, error } }
+  const [childRefineUi,    setChildRefineUi]    = useState({})      // { ['i/key']: { open, prompt, busy, error } }
+  const [decompositionOpen, setDecompositionOpen] = useState({})    // { [i]: bool }
 
   // ── Draft persistence ───────────────────────────────────────────────────────
   const hasHydrated = useRef(false)
@@ -111,22 +116,23 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     try {
       const raw = localStorage.getItem(storageKey)
       if (raw) {
-        const { parsed: p, itemStates: is } = JSON.parse(raw)
-        if (p)  setParsed(p)
-        if (is) setItemStates(is)
+        const { parsed: p, itemStates: is, smeLensState: sls } = JSON.parse(raw)
+        if (p)   setParsed(p)
+        if (is)  setItemStates(is)
+        if (sls) setSmeLensState(sls)
       }
     } catch { /* ignore corrupt data */ }
     hasHydrated.current = true
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Persist whenever parsed or itemStates change (skip initial empty save)
+  // Persist whenever persisted state changes (skip initial empty save)
   useEffect(() => {
     if (!hasHydrated.current || !storageKey) return
     try {
-      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates }))
+      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates, smeLensState }))
     } catch { /* quota errors are non-fatal */ }
-  }, [parsed, itemStates, storageKey])
+  }, [parsed, itemStates, smeLensState, storageKey])
 
   // ── Structure generation ────────────────────────────────────────────────────
 
@@ -161,6 +167,74 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     setParsed({ domainOfWork: p.domainOfWork, handoffStructure: p.handoffStructure })
     setItemStates({})   // reset all item state when structure changes
     setIsGenerating(false)
+  }
+
+  // ── SME lens generation ─────────────────────────────────────────────────────
+
+  async function handleGenerateSmeLens() {
+    if (!activeStage1Rev || smeLensState.status === 'generating') return
+    setSmeLensState({ status: 'generating', rawResponse: null, parsedValue: null, parserError: null })
+
+    const completedThemes = parsed?.handoffStructure?.filter((_, idx) => {
+      const s = itemStates[idx]?.status
+      return s === 'complete' || s === 'partial'
+    }) || []
+
+    const { messages } = buildSmeLensMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed?.domainOfWork || null,
+      parsed?.handoffStructure || null,
+      completedThemes,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 400 })
+
+    if (error) {
+      setSmeLensState(prev => ({ ...prev, status: 'failed', rawResponse: result ?? null, parserError: error }))
+      return
+    }
+
+    const p = parseSmeLensResponse(result)
+    if (p.error) {
+      setSmeLensState(prev => ({ ...prev, status: 'failed', rawResponse: result, parserError: p.error }))
+      return
+    }
+
+    setSmeLensState({ status: 'complete', rawResponse: result, parsedValue: p.parsedValue, parserError: null })
+  }
+
+  async function handleRefineSmeLens() {
+    if (!smeLensState.parsedValue || !activeStage1Rev) return
+    const prompt = smeLensRefineUi.prompt?.trim()
+    if (!prompt) return
+
+    setSmeLensRefineUi(p => ({ ...p, busy: true, error: null }))
+
+    const { messages } = buildSmeLensRefinementMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed?.domainOfWork || null,
+      parsed?.handoffStructure || null,
+      smeLensState.parsedValue,
+      prompt,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 400 })
+
+    if (error) {
+      setSmeLensRefineUi(p => ({ ...p, busy: false, error }))
+      return
+    }
+
+    const p = parseSmeLensResponse(result)
+    if (p.error) {
+      setSmeLensRefineUi(prev => ({ ...prev, busy: false, error: p.error }))
+      return
+    }
+
+    setSmeLensState(prev => ({ ...prev, rawResponse: result, parsedValue: p.parsedValue, parserError: null }))
+    setSmeLensRefineUi({ open: false, prompt: '', busy: false, error: null })
   }
 
   // ── Per-item generation ─────────────────────────────────────────────────────
@@ -198,7 +272,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
         activeStage1Rev.contentSnapshot,
         bu,
         parsed.domainOfWork,
-        parsed.smeLens || null,
+        smeLensState.parsedValue || null,
         structureItem,
         childKey,
         otherBuNames,
@@ -298,7 +372,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       activeStage1Rev.contentSnapshot,
       bu,
       parsed.domainOfWork,
-      parsed.smeLens || null,
+      smeLensState.parsedValue || null,
       structureItem,
       childKey,
       otherBuNames,
@@ -391,7 +465,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       activeStage1Rev.contentSnapshot,
       bu,
       parsed.domainOfWork,
-      parsed.smeLens || null,
+      smeLensState.parsedValue || null,
       structureItem,
       iState.parsedValue.value,
       prompt,
@@ -429,7 +503,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       activeStage1Rev.contentSnapshot,
       bu,
       parsed.domainOfWork,
-      parsed.smeLens || null,
+      smeLensState.parsedValue || null,
       structureItem,
       childKey,
       cs.parsedValue,
@@ -560,7 +634,107 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
           {/* ── Top metadata row ─────────────────────────────────── */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 9 }}>
             <Field label="domainOfWork" value={parsed?.domainOfWork} />
-            <Field label="SMEReviewLens" />
+
+            {/* SME lens field with inline refine */}
+            <div style={{
+              padding: '7px 9px', border: `1px solid ${smeLensState.status === 'failed' ? 'rgba(248,113,113,.35)' : 'var(--border)'}`,
+              borderRadius: 4, background: 'rgba(255,255,255,.015)',
+            }}>
+              <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
+                SMEReviewLens
+              </div>
+
+              {smeLensState.status === 'complete' && (
+                <div style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+                  {smeLensState.parsedValue}
+                </div>
+              )}
+              {smeLensState.status === 'generating' && (
+                <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)' }}>Generating…</div>
+              )}
+              {smeLensState.status === 'failed' && (
+                <div>
+                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4, display: 'flex', gap: 4 }}>
+                    <span style={{ flexShrink: 0 }}>⚠</span>
+                    <span>{smeLensState.parserError}</span>
+                  </div>
+                  {smeLensState.rawResponse && (
+                    <pre style={{
+                      fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                      background: 'var(--s2)', borderRadius: 3, padding: '4px 6px',
+                      overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                      maxHeight: 80, overflowY: 'auto', margin: '3px 0 0',
+                    }}>
+                      {smeLensState.rawResponse}
+                    </pre>
+                  )}
+                </div>
+              )}
+              {smeLensState.status === 'not_started' && (
+                <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)' }}>Not generated yet</div>
+              )}
+
+              {/* Inline refine for SME lens */}
+              {smeLensState.status === 'complete' && apiMode === 'ai' && (
+                <div style={{ marginTop: 6 }}>
+                  <button
+                    onClick={() => setSmeLensRefineUi(p => ({ ...p, open: !p.open }))}
+                    disabled={smeLensRefineUi.busy}
+                    style={{
+                      fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                      padding: '1px 6px', borderRadius: 3,
+                      cursor: smeLensRefineUi.busy ? 'not-allowed' : 'pointer',
+                      background: smeLensRefineUi.open ? 'rgba(59,130,246,.1)' : 'transparent',
+                      border: `1px solid ${smeLensRefineUi.open ? 'rgba(59,130,246,.3)' : 'var(--border)'}`,
+                      color: smeLensRefineUi.open ? 'var(--accent)' : 'var(--muted)',
+                      opacity: smeLensRefineUi.busy ? 0.5 : 1,
+                    }}
+                  >
+                    ↻ Refine {smeLensRefineUi.open ? '▲' : '▼'}
+                  </button>
+                  {smeLensRefineUi.open && (
+                    <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                      <textarea
+                        value={smeLensRefineUi.prompt}
+                        onChange={e => setSmeLensRefineUi(p => ({ ...p, prompt: e.target.value }))}
+                        rows={2}
+                        disabled={smeLensRefineUi.busy}
+                        placeholder="Refinement instruction…"
+                        style={{
+                          width: '100%', boxSizing: 'border-box',
+                          fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--text)',
+                          background: 'var(--surface)', border: '1px solid var(--border)',
+                          borderRadius: 3, padding: '4px 6px', resize: 'vertical', outline: 'none',
+                          lineHeight: 1.5, opacity: smeLensRefineUi.busy ? 0.5 : 1,
+                        }}
+                      />
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <button
+                          onClick={handleRefineSmeLens}
+                          disabled={smeLensRefineUi.busy || !smeLensRefineUi.prompt.trim()}
+                          style={{
+                            fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                            padding: '2px 7px', borderRadius: 3,
+                            cursor: (smeLensRefineUi.busy || !smeLensRefineUi.prompt.trim()) ? 'not-allowed' : 'pointer',
+                            background: 'rgba(59,130,246,.12)',
+                            border: '1px solid rgba(59,130,246,.3)',
+                            color: 'var(--accent)',
+                            opacity: (smeLensRefineUi.busy || !smeLensRefineUi.prompt.trim()) ? 0.5 : 1,
+                          }}
+                        >
+                          {smeLensRefineUi.busy ? 'Refining…' : 'Apply'}
+                        </button>
+                        {smeLensRefineUi.error && (
+                          <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                            ⚠ {smeLensRefineUi.error}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
 
           {/* ── handoffStructure + per-item generation ───────────── */}
@@ -1017,7 +1191,40 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
             >
               {isGenerating ? 'Generating…' : parsed ? '↻ Regenerate handoff structure' : 'Generate handoff structure'}
             </button>
-            <button disabled style={disabledButtonStyle}>Generate SME lens</button>
+            {(() => {
+              const isGenLens = smeLensState.status === 'generating'
+              const canGenLens = apiMode === 'ai' && !!activeStage1Rev && !isGenLens
+              const lensLabel =
+                isGenLens                            ? 'Generating…'          :
+                smeLensState.status === 'complete'   ? '↻ Regenerate SME lens' :
+                smeLensState.status === 'failed'     ? 'Retry SME lens'        :
+                                                       'Generate SME lens'
+              return (
+                <button
+                  onClick={handleGenerateSmeLens}
+                  disabled={!canGenLens}
+                  style={{
+                    fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                    padding: '4px 8px', borderRadius: 4,
+                    cursor: canGenLens ? 'pointer' : 'not-allowed',
+                    background: smeLensState.status === 'failed'   ? 'rgba(248,113,113,.1)' :
+                                smeLensState.status === 'complete' ? 'rgba(0,229,180,.08)'  :
+                                canGenLens                         ? 'rgba(59,130,246,.12)' : 'var(--surface)',
+                    border: `1px solid ${
+                      smeLensState.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                      smeLensState.status === 'complete' ? 'rgba(0,229,180,.3)'    :
+                      canGenLens                         ? 'rgba(59,130,246,.35)'  : 'var(--border)'
+                    }`,
+                    color: smeLensState.status === 'failed'   ? '#f87171'       :
+                           smeLensState.status === 'complete' ? '#00e5b4'       :
+                           canGenLens                         ? 'var(--accent)' : 'var(--muted)',
+                    opacity: canGenLens ? 1 : 0.58,
+                  }}
+                >
+                  {lensLabel}
+                </button>
+              )
+            })()}
             <button disabled style={disabledButtonStyle}>Assemble BU handoff</button>
           </div>
         </div>
