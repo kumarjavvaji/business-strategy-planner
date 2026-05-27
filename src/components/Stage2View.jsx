@@ -22,6 +22,7 @@ import {
   orderBusinessUnits,
 } from '../utils/stage2Prompts'
 import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageSnapshots'
+import { buildHandoffStructureMessages, parseHandoffStructureResponse } from '../utils/handoffPrompts'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
 import RefinementPanel    from './RefinementPanel'
@@ -75,8 +76,47 @@ function SubList({ label, items, borderColor }) {
   )
 }
 
-function Stage3HandoffShell() {
-  const [open, setOpen] = useState(false)
+function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
+  const [open,         setOpen]         = useState(false)
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [rawResponse,  setRawResponse]  = useState(null)
+  const [parsed,       setParsed]       = useState(null)  // { domainOfWork, handoffStructure }
+  const [genError,     setGenError]     = useState(null)
+
+  const canGenerate = apiMode === 'ai' && !!activeStage1Rev && !isGenerating
+
+  async function handleGenerateHandoffStructure() {
+    if (!canGenerate) return
+    setIsGenerating(true)
+    setGenError(null)
+    setRawResponse(null)
+
+    const { messages } = buildHandoffStructureMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1500 })
+
+    if (error) {
+      setGenError(error)
+      setIsGenerating(false)
+      return
+    }
+
+    setRawResponse(result)
+    const p = parseHandoffStructureResponse(result)
+
+    if (p.error) {
+      setGenError(p.error)
+      setIsGenerating(false)
+      return
+    }
+
+    setParsed({ domainOfWork: p.domainOfWork, handoffStructure: p.handoffStructure })
+    setIsGenerating(false)
+  }
+
   const disabledButtonStyle = {
     fontSize: 8,
     fontFamily: 'var(--fm)',
@@ -89,7 +129,7 @@ function Stage3HandoffShell() {
     color: 'var(--muted)',
     opacity: 0.58,
   }
-  const placeholder = 'Not generated yet'
+
   const Field = ({ label, value }) => (
     <div style={{
       padding: '7px 9px',
@@ -103,8 +143,8 @@ function Stage3HandoffShell() {
       }}>
         {label}
       </div>
-      <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
-        {value || placeholder}
+      <div style={{ fontSize: 10, color: value ? 'var(--text)' : 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+        {value || 'Not generated yet'}
       </div>
     </div>
   )
@@ -152,14 +192,88 @@ function Stage3HandoffShell() {
             gap: 8,
             marginBottom: 9,
           }}>
-            <Field label="domainOfWork" />
+            <Field label="domainOfWork" value={parsed?.domainOfWork} />
             <Field label="SMEReviewLens" />
-            <Field label="handoffStructure" />
+            <div style={{ gridColumn: '1 / -1' }}>
+              <div style={{
+                padding: '7px 9px',
+                border: '1px solid var(--border)',
+                borderRadius: 4,
+                background: 'rgba(255,255,255,.015)',
+              }}>
+                <div style={{
+                  fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+                  textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3,
+                }}>
+                  handoffStructure
+                </div>
+                {parsed?.handoffStructure ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    {parsed.handoffStructure.map((item, i) => (
+                      <div key={i} style={{
+                        fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)',
+                        lineHeight: 1.55, paddingLeft: 8,
+                        borderLeft: '2px solid rgba(59,130,246,.35)',
+                      }}>
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+                    Not generated yet
+                  </div>
+                )}
+              </div>
+            </div>
             <Field label="handoffItems" />
-            <Field label="handoffStatus" value="Not started" />
+            <Field label="handoffStatus" value={parsed ? 'Structure ready' : 'Not started'} />
           </div>
+
+          {genError && (
+            <div style={{
+              marginBottom: 8, fontSize: 9, fontFamily: 'var(--fm)',
+              color: '#f87171', lineHeight: 1.6,
+              padding: '6px 9px', borderRadius: 4,
+              background: 'rgba(248,113,113,.07)',
+              border: '1px solid rgba(248,113,113,.25)',
+            }}>
+              <div style={{ display: 'flex', gap: 5, marginBottom: rawResponse ? 5 : 0 }}>
+                <span style={{ flexShrink: 0 }}>⚠</span>
+                <span>{genError}</span>
+              </div>
+              {rawResponse && (
+                <pre style={{
+                  fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                  background: 'var(--s2)', borderRadius: 4, padding: '8px 10px',
+                  overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                  maxHeight: 160, overflowY: 'auto', margin: 0,
+                }}>
+                  {rawResponse}
+                </pre>
+              )}
+            </div>
+          )}
+
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            <button disabled style={disabledButtonStyle}>Generate handoff structure</button>
+            <button
+              onClick={handleGenerateHandoffStructure}
+              disabled={!canGenerate}
+              style={{
+                fontSize: 8,
+                fontFamily: 'var(--fm)',
+                fontWeight: 600,
+                padding: '4px 8px',
+                borderRadius: 4,
+                cursor: canGenerate ? 'pointer' : 'not-allowed',
+                background: canGenerate ? 'rgba(59,130,246,.12)' : 'var(--surface)',
+                border: `1px solid ${canGenerate ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
+                color: canGenerate ? 'var(--accent)' : 'var(--muted)',
+                opacity: canGenerate ? 1 : 0.58,
+              }}
+            >
+              {isGenerating ? 'Generating…' : parsed ? '↻ Regenerate handoff structure' : 'Generate handoff structure'}
+            </button>
             <button disabled style={disabledButtonStyle}>Generate SME lens</button>
             <button disabled style={disabledButtonStyle}>Generate handoff item</button>
             <button disabled style={disabledButtonStyle}>Assemble BU handoff</button>
@@ -233,7 +347,7 @@ function ScopeSelector({ value, onChange, disabled }) {
 // apiMode:      'ai' | 'mock'
 // globalBusy:   true while a parent-level generation is running
 
-function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
+function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy, activeStage1Rev, otherBuNames }) {
   const [open,          setOpen]          = useState(true)
   const [refineOpen,    setRefineOpen]    = useState(false)
   const [refinePrompt,  setRefinePrompt]  = useState('')
@@ -327,7 +441,7 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
             <SubList label="Key Success Metrics"  items={bu.keySuccessMetrics}   borderColor="rgba(0,229,180,.4)"   />
           </div>
 
-          <Stage3HandoffShell />
+          <Stage3HandoffShell bu={bu} otherBuNames={otherBuNames} activeStage1Rev={activeStage1Rev} apiMode={apiMode} />
 
           {/* ── Unit-level refinement panel ───────────────────────────────── */}
           <div style={{
@@ -928,6 +1042,8 @@ export default function Stage2View({
               index={i}
               apiMode={apiMode}
               globalBusy={isGenerating}
+              activeStage1Rev={activeStage1Rev}
+              otherBuNames={businessUnits.filter((_, j) => j !== i).map(b => b.name)}
               onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
             />
           ))}
