@@ -84,6 +84,7 @@ function SubList({ label, items, borderColor }) {
 const ITEM_STATE_DEFAULT = {
   status: 'not_started', rawResponse: null, parsedValue: null, parserError: null,
   isDecomposed: false, assembledFromChildren: false, childAtoms: null,
+  missingChildren: [], failedChildren: [],
 }
 const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 
@@ -232,13 +233,23 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
     if (!iState?.childAtoms) return
 
     const assembledValue = {}
+    const missingChildren = []
+    const failedChildren  = []
+
     CHILD_ATOM_KEYS.forEach(key => {
       const cs = iState.childAtoms[key]
       if (cs?.status === 'complete' && cs.parsedValue !== null) {
         assembledValue[key] = cs.parsedValue
+      } else if (cs?.status === 'failed') {
+        failedChildren.push(key)
+      } else {
+        missingChildren.push(key)
       }
     })
+
     if (!Object.keys(assembledValue).length) return
+
+    const isPartial = missingChildren.length > 0 || failedChildren.length > 0
 
     const existingKey = iState.parsedValue?.key
     const derivedKey = existingKey || theme
@@ -248,16 +259,18 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
       .join('')
 
     patchItem(i, {
-      status: 'complete',
+      status: isPartial ? 'partial' : 'complete',
       assembledFromChildren: true,
       parsedValue: { key: derivedKey, value: assembledValue },
+      missingChildren,
+      failedChildren,
     })
   }
 
   // ── Derived status label ────────────────────────────────────────────────────
 
   const itemCount = parsed?.handoffStructure?.length ?? 0
-  const doneCount = Object.values(itemStates).filter(s => s?.status === 'complete').length
+  const doneCount = Object.values(itemStates).filter(s => s?.status === 'complete' || s?.status === 'partial').length
 
   function handoffStatusLabel() {
     if (!parsed) return 'Not started'
@@ -385,10 +398,13 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                     const isGenItem = iState.status === 'generating'
                     const canGenItem = canGenItemBase && !isGenItem
 
-                    const assembled = iState.status === 'complete' && iState.assembledFromChildren
+                    const assembled = iState.assembledFromChildren &&
+                      (iState.status === 'complete' || iState.status === 'partial')
+                    const isPartial = iState.status === 'partial'
 
                     const borderColor =
-                      assembled                       ? 'rgba(139,92,246,.45)'  :
+                      assembled && isPartial         ? 'rgba(251,146,60,.45)'  :
+                      assembled                      ? 'rgba(139,92,246,.45)'  :
                       iState.status === 'complete'   ? 'rgba(0,229,180,.45)'   :
                       iState.status === 'failed'     ? 'rgba(248,113,113,.45)' :
                       isGenItem                      ? 'rgba(59,130,246,.55)'  :
@@ -396,27 +412,30 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
 
                     const btnBg =
                       iState.status === 'failed'   ? 'rgba(248,113,113,.1)'  :
+                      assembled && isPartial       ? 'rgba(251,146,60,.1)'   :
                       assembled                    ? 'rgba(139,92,246,.1)'   :
                       iState.status === 'complete' ? 'rgba(0,229,180,.08)'   :
                       canGenItem                   ? 'rgba(59,130,246,.1)'   : 'var(--surface)'
 
                     const btnBorder =
                       iState.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                      assembled && isPartial       ? 'rgba(251,146,60,.35)'  :
                       assembled                    ? 'rgba(139,92,246,.3)'   :
                       iState.status === 'complete' ? 'rgba(0,229,180,.3)'    :
                       canGenItem                   ? 'rgba(59,130,246,.3)'   : 'var(--border)'
 
                     const btnColor =
                       iState.status === 'failed'   ? '#f87171'        :
+                      assembled && isPartial       ? '#fb923c'        :
                       assembled                    ? '#a78bfa'        :
                       iState.status === 'complete' ? '#00e5b4'        :
                       canGenItem                   ? 'var(--accent)'  : 'var(--muted)'
 
                     const btnLabel =
-                      isGenItem                    ? 'Generating…'       :
-                      iState.status === 'complete' ? '↻ Regenerate item' :
-                      iState.status === 'failed'   ? 'Retry item'        :
-                                                     'Generate item'
+                      isGenItem                                        ? 'Generating…'       :
+                      iState.status === 'complete' || isPartial       ? '↻ Regenerate item' :
+                      iState.status === 'failed'                       ? 'Retry item'        :
+                                                                         'Generate item'
 
                     const canAssemble = !!(iState.childAtoms &&
                       Object.values(iState.childAtoms).some(cs => cs?.status === 'complete'))
@@ -427,7 +446,12 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
                           <div style={{ flex: 1, fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
                             {theme}
-                            {assembled && (
+                            {assembled && isPartial && (
+                              <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', opacity: .85 }}>
+                                partial
+                              </span>
+                            )}
+                            {assembled && !isPartial && (
                               <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#a78bfa', opacity: .8 }}>
                                 assembled
                               </span>
@@ -448,9 +472,22 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                           </button>
                         </div>
 
-                        {/* Generated value */}
-                        {iState.status === 'complete' && iState.parsedValue && (
+                        {/* Generated value — direct or assembled (complete/partial) */}
+                        {(iState.status === 'complete' || iState.status === 'partial') && iState.parsedValue && (
                           <div style={{ paddingLeft: 4 }}>
+                            {isPartial && (
+                              <div style={{ marginBottom: 5 }}>
+                                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.55 }}>
+                                  ⚠ Partial assembly
+                                  {iState.missingChildren?.length > 0 && (
+                                    <span> · not generated: {iState.missingChildren.join(', ')}</span>
+                                  )}
+                                  {iState.failedChildren?.length > 0 && (
+                                    <span> · failed: {iState.failedChildren.join(', ')}</span>
+                                  )}
+                                </div>
+                              </div>
+                            )}
                             {renderItemValue(iState.parsedValue.value)}
                           </div>
                         )}
