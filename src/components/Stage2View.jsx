@@ -218,7 +218,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
       return
     }
 
-    const p = parseHandoffChildAtomResponse(result)
+    const p = parseHandoffChildAtomResponse(result, childKey)
     if (p.error) {
       patchChildAtom(i, childKey, { status: 'failed', rawResponse: result, parserError: p.error })
       return

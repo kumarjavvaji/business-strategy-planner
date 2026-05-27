@@ -290,10 +290,49 @@ Return only the JSON object with key "${childKey}".`
 }
 
 /**
- * Parse a child atom response — extracts value only (key is already known).
+ * Parse a child atom response. Accepts three shapes:
+ *   1. Direct keyed  — { "<expectedKey>": value }
+ *   2. Generic value — { "value": value }
+ *   3. Explicit wrap — { "key": "...", "value": value }
+ *
+ * Shape 1 is tried first so the model can return the natural field name without
+ * wrapping it in a key/value envelope.
+ *
+ * @param {string}      rawText
+ * @param {string|null} expectedKey  — the child atom key (e.g. "validationNeeds")
  * @returns {{ value: any, error: string|null }}
  */
-export function parseHandoffChildAtomResponse(rawText) {
-  const { value, error } = parseHandoffItemResponse(rawText)
-  return { value, error }
+export function parseHandoffChildAtomResponse(rawText, expectedKey) {
+  if (!rawText?.trim()) {
+    return { value: null, error: 'Empty response from API.' }
+  }
+
+  let jsonStr = rawText.trim()
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (fenceMatch) jsonStr = fenceMatch[1].trim()
+
+  const firstBrace = jsonStr.indexOf('{')
+  const lastBrace  = jsonStr.lastIndexOf('}')
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    jsonStr = jsonStr.slice(firstBrace, lastBrace + 1)
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(jsonStr)
+  } catch {
+    return { value: null, error: 'Could not parse JSON from response.' }
+  }
+
+  // Shape 1: { "<expectedKey>": value }
+  if (expectedKey && parsed?.[expectedKey] !== undefined) {
+    return { value: parsed[expectedKey], error: null }
+  }
+
+  // Shape 2 & 3: { "value": ... } or { "key": "...", "value": ... }
+  if (parsed?.value !== undefined) {
+    return { value: parsed.value, error: null }
+  }
+
+  return { value: null, error: 'Response missing required fields.' }
 }
