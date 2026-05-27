@@ -336,3 +336,142 @@ export function parseHandoffChildAtomResponse(rawText, expectedKey) {
 
   return { value: null, error: 'Response missing required fields.' }
 }
+
+// ── Refinement prompt builders ────────────────────────────────────────────────
+
+function buildBuDetails(bu) {
+  return [
+    `Name: ${bu.name}`,
+    bu.purpose              ? `Purpose: ${bu.purpose}` : null,
+    bu.strategicInvolvement ? `Strategic Involvement: ${bu.strategicInvolvement}` : null,
+    bu.involvementLevel     ? `Involvement Level: ${bu.involvementLevel}` : null,
+    bu.keyResponsibilities?.length
+      ? `Key Responsibilities:\n${bu.keyResponsibilities.map(r => `  - ${r}`).join('\n')}`
+      : null,
+    bu.dependencies?.length
+      ? `Dependencies:\n${bu.dependencies.map(d => `  - ${d}`).join('\n')}`
+      : null,
+    bu.risksAndUnknowns?.length
+      ? `Risks & Unknowns:\n${bu.risksAndUnknowns.map(r => `  - ${r}`).join('\n')}`
+      : null,
+  ].filter(Boolean).join('\n')
+}
+
+/**
+ * Build messages to refine an existing complete/partial handoff item.
+ * The model receives the current value and a user refinement instruction.
+ * Response is parsed with parseHandoffItemResponse.
+ */
+export function buildHandoffItemRefinementMessages(stage1Snapshot, bu, domainOfWork, smeLens, structureItem, currentValue, userPrompt, otherBuNames) {
+  const stage1Context = stageSnapshotToText(stage1Snapshot)
+  const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
+  const smeLensLine = smeLens ? `\nSME Review Lens: ${smeLens}` : ''
+
+  const systemPrompt = `You are a strategic planning analyst refining a Stage 3 execution planning handoff item.
+
+You will be given the current value of a handoff item and a refinement instruction. Update the item according to the instruction while preserving the overall structure and depth.
+
+Return ONLY valid JSON — no markdown, no prose, no code fences. Exact schema:
+
+{
+  "key": "string — camelCase identifier, same as or derived from the planning theme",
+  "value": <string | string[] | object>
+}
+
+Rules:
+- Preserve the value type/structure unless the instruction explicitly changes it
+- Make targeted changes — do not rewrite content that the instruction does not address
+- Be specific to this company, BU, domain, and planning theme`
+
+  const currentValueStr = typeof currentValue === 'string'
+    ? currentValue
+    : JSON.stringify(currentValue, null, 2)
+
+  const userMsg = `Stage 1 Strategy Basis:
+${stage1Context}
+
+Business Unit:
+${buildBuDetails(bu)}
+
+Domain of Work: ${domainOfWork}${smeLensLine}
+
+Planning Theme:
+"${structureItem}"
+
+Other Business Units: ${otherBuList}
+
+Current Value:
+${currentValueStr}
+
+Refinement Instruction:
+${userPrompt}
+
+Return only the updated JSON object.`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userMsg       },
+    ],
+  }
+}
+
+/**
+ * Build messages to refine one child atom of a decomposed handoff item.
+ * Response is parsed with parseHandoffChildAtomResponse(rawText, childKey).
+ */
+export function buildHandoffChildAtomRefinementMessages(stage1Snapshot, bu, domainOfWork, smeLens, structureItem, childKey, currentValue, userPrompt, otherBuNames) {
+  const stage1Context = stageSnapshotToText(stage1Snapshot)
+  const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
+  const smeLensLine = smeLens ? `\nSME Review Lens: ${smeLens}` : ''
+
+  const systemPrompt = `You are a strategic planning analyst refining one sub-field of a Stage 3 execution planning handoff item.
+
+You will be given the current value of the sub-field and a refinement instruction. Update it according to the instruction.
+
+Return ONLY valid JSON — no markdown, no prose, no code fences:
+
+{ "key": "<exact field name>", "value": <string | string[] | object> }
+
+${CHILD_FIELD_GUIDANCE}
+
+Rules:
+- key: must exactly match the requested field name
+- Preserve value type unless instruction explicitly changes it
+- Make targeted changes only — do not rewrite content the instruction does not address
+- Be specific to this company, BU, domain, and parent planning theme`
+
+  const currentValueStr = typeof currentValue === 'string'
+    ? currentValue
+    : JSON.stringify(currentValue, null, 2)
+
+  const userMsg = `Stage 1 Strategy Basis:
+${stage1Context}
+
+Business Unit:
+${buildBuDetails(bu)}
+
+Domain of Work: ${domainOfWork}${smeLensLine}
+
+Parent Planning Theme:
+"${structureItem}"
+
+Other Business Units: ${otherBuList}
+
+Sub-field to refine: ${childKey}
+
+Current Value:
+${currentValueStr}
+
+Refinement Instruction:
+${userPrompt}
+
+Return only the JSON object with key "${childKey}".`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userMsg       },
+    ],
+  }
+}

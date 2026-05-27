@@ -26,6 +26,8 @@ import {
   buildHandoffStructureMessages, parseHandoffStructureResponse,
   buildHandoffItemMessages, parseHandoffItemResponse,
   buildHandoffChildAtomMessages, parseHandoffChildAtomResponse,
+  buildHandoffItemRefinementMessages,
+  buildHandoffChildAtomRefinementMessages,
   CHILD_ATOM_KEYS,
 } from '../utils/handoffPrompts'
 import RevisionHistory    from './RevisionHistory'
@@ -88,13 +90,43 @@ const ITEM_STATE_DEFAULT = {
 }
 const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 
-function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
-  const [open,         setOpen]         = useState(false)
-  const [isGenerating, setIsGenerating] = useState(false)   // structure-level generation
-  const [structureRaw, setStructureRaw] = useState(null)
-  const [parsed,       setParsed]       = useState(null)    // { domainOfWork, handoffStructure }
-  const [genError,     setGenError]     = useState(null)
-  const [itemStates,   setItemStates]   = useState({})      // { [index]: ITEM_STATE_DEFAULT }
+function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, workspaceId }) {
+  const [open,           setOpen]           = useState(false)
+  const [isGenerating,   setIsGenerating]   = useState(false)
+  const [structureRaw,   setStructureRaw]   = useState(null)
+  const [parsed,         setParsed]         = useState(null)    // { domainOfWork, handoffStructure }
+  const [genError,       setGenError]       = useState(null)
+  const [itemStates,     setItemStates]     = useState({})      // { [index]: ITEM_STATE_DEFAULT }
+  const [itemRefineUi,   setItemRefineUi]   = useState({})      // { [i]: { open, prompt, busy, error } }
+  const [childRefineUi,  setChildRefineUi]  = useState({})      // { ['i/key']: { open, prompt, busy, error } }
+  const [decompositionOpen, setDecompositionOpen] = useState({}) // { [i]: bool }
+
+  // ── Draft persistence ───────────────────────────────────────────────────────
+  const hasHydrated = useRef(false)
+  const storageKey  = workspaceId ? `bsp_v1_handoff_${workspaceId}_${bu.name}` : null
+
+  // Hydrate once on mount
+  useEffect(() => {
+    if (!storageKey) { hasHydrated.current = true; return }
+    try {
+      const raw = localStorage.getItem(storageKey)
+      if (raw) {
+        const { parsed: p, itemStates: is } = JSON.parse(raw)
+        if (p)  setParsed(p)
+        if (is) setItemStates(is)
+      }
+    } catch { /* ignore corrupt data */ }
+    hasHydrated.current = true
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Persist whenever parsed or itemStates change (skip initial empty save)
+  useEffect(() => {
+    if (!hasHydrated.current || !storageKey) return
+    try {
+      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates }))
+    } catch { /* quota errors are non-fatal */ }
+  }, [parsed, itemStates, storageKey])
 
   // ── Structure generation ────────────────────────────────────────────────────
 
@@ -265,6 +297,101 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
       missingChildren,
       failedChildren,
     })
+    // Auto-collapse decomposition on full assembly
+    if (!isPartial) {
+      setDecompositionOpen(prev => ({ ...prev, [i]: false }))
+    }
+  }
+
+  // ── Refine item helpers ─────────────────────────────────────────────────────
+
+  function patchItemRefineUi(i, patch) {
+    setItemRefineUi(prev => ({
+      ...prev,
+      [i]: { open: false, prompt: '', busy: false, error: null, ...(prev[i] || {}), ...patch },
+    }))
+  }
+
+  function patchChildRefineUi(key, patch) {
+    setChildRefineUi(prev => ({
+      ...prev,
+      [key]: { open: false, prompt: '', busy: false, error: null, ...(prev[key] || {}), ...patch },
+    }))
+  }
+
+  async function handleRefineItem(i, structureItem) {
+    const iState = itemStates[i]
+    if (!iState?.parsedValue || !activeStage1Rev || !parsed) return
+    const ui = itemRefineUi[i] || {}
+    const prompt = ui.prompt?.trim()
+    if (!prompt) return
+
+    patchItemRefineUi(i, { busy: true, error: null })
+
+    const { messages } = buildHandoffItemRefinementMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed.domainOfWork,
+      parsed.smeLens || null,
+      structureItem,
+      iState.parsedValue.value,
+      prompt,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1500 })
+
+    if (error) {
+      patchItemRefineUi(i, { busy: false, error })
+      return
+    }
+
+    const p = parseHandoffItemResponse(result)
+    if (p.error) {
+      patchItemRefineUi(i, { busy: false, error: p.error })
+      return
+    }
+
+    patchItem(i, { rawResponse: result, parsedValue: { key: p.key, value: p.value }, parserError: null })
+    patchItemRefineUi(i, { busy: false, error: null, open: false, prompt: '' })
+  }
+
+  async function handleRefineChildAtom(i, structureItem, childKey) {
+    const iState = itemStates[i]
+    const cs = iState?.childAtoms?.[childKey]
+    if (!cs?.parsedValue || !activeStage1Rev || !parsed) return
+    const uiKey = `${i}/${childKey}`
+    const ui = childRefineUi[uiKey] || {}
+    const prompt = ui.prompt?.trim()
+    if (!prompt) return
+
+    patchChildRefineUi(uiKey, { busy: true, error: null })
+
+    const { messages } = buildHandoffChildAtomRefinementMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed.domainOfWork,
+      parsed.smeLens || null,
+      structureItem,
+      childKey,
+      cs.parsedValue,
+      prompt,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+
+    if (error) {
+      patchChildRefineUi(uiKey, { busy: false, error })
+      return
+    }
+
+    const p = parseHandoffChildAtomResponse(result, childKey)
+    if (p.error) {
+      patchChildRefineUi(uiKey, { busy: false, error: p.error })
+      return
+    }
+
+    patchChildAtom(i, childKey, { rawResponse: result, parsedValue: p.value, parserError: null })
+    patchChildRefineUi(uiKey, { busy: false, error: null, open: false, prompt: '' })
   }
 
   // ── Derived status label ────────────────────────────────────────────────────
@@ -489,6 +616,70 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                               </div>
                             )}
                             {renderItemValue(iState.parsedValue.value)}
+
+                            {/* UX Fix B — Refine handoff item */}
+                            {apiMode === 'ai' && (() => {
+                              const rui = itemRefineUi[i] || {}
+                              return (
+                                <div style={{ marginTop: 6 }}>
+                                  <button
+                                    onClick={() => patchItemRefineUi(i, { open: !rui.open })}
+                                    disabled={rui.busy}
+                                    style={{
+                                      fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                      padding: '2px 7px', borderRadius: 3,
+                                      cursor: rui.busy ? 'not-allowed' : 'pointer',
+                                      background: rui.open ? 'rgba(59,130,246,.1)' : 'transparent',
+                                      border: `1px solid ${rui.open ? 'rgba(59,130,246,.3)' : 'var(--border)'}`,
+                                      color: rui.open ? 'var(--accent)' : 'var(--muted)',
+                                      opacity: rui.busy ? 0.5 : 1,
+                                    }}
+                                  >
+                                    ↻ Refine item {rui.open ? '▲' : '▼'}
+                                  </button>
+                                  {rui.open && (
+                                    <div style={{ marginTop: 5, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                      <textarea
+                                        value={rui.prompt || ''}
+                                        onChange={e => patchItemRefineUi(i, { prompt: e.target.value })}
+                                        rows={2}
+                                        disabled={rui.busy}
+                                        placeholder="Refinement instruction…"
+                                        style={{
+                                          width: '100%', boxSizing: 'border-box',
+                                          fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--text)',
+                                          background: 'var(--surface)', border: '1px solid var(--border)',
+                                          borderRadius: 3, padding: '5px 7px', resize: 'vertical', outline: 'none',
+                                          lineHeight: 1.5, opacity: rui.busy ? 0.5 : 1,
+                                        }}
+                                      />
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                        <button
+                                          onClick={() => handleRefineItem(i, theme)}
+                                          disabled={rui.busy || !(rui.prompt?.trim())}
+                                          style={{
+                                            fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                            padding: '2px 8px', borderRadius: 3,
+                                            cursor: (rui.busy || !(rui.prompt?.trim())) ? 'not-allowed' : 'pointer',
+                                            background: 'rgba(59,130,246,.12)',
+                                            border: '1px solid rgba(59,130,246,.3)',
+                                            color: 'var(--accent)',
+                                            opacity: (rui.busy || !(rui.prompt?.trim())) ? 0.5 : 1,
+                                          }}
+                                        >
+                                          {rui.busy ? 'Refining…' : 'Apply refinement'}
+                                        </button>
+                                        {rui.error && (
+                                          <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                                            ⚠ {rui.error}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )
+                            })()}
                           </div>
                         )}
 
@@ -528,8 +719,24 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                           </div>
                         )}
 
-                        {/* Child atoms — shown whenever isDecomposed */}
-                        {iState.isDecomposed && iState.childAtoms && (
+                        {/* UX Fix C — toggle for decomposition after full assembly */}
+                        {assembled && !isPartial && iState.isDecomposed && (
+                          <button
+                            onClick={() => setDecompositionOpen(prev => ({ ...prev, [i]: !prev[i] }))}
+                            style={{
+                              marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                              padding: '2px 7px', borderRadius: 3, cursor: 'pointer',
+                              background: 'transparent',
+                              border: '1px solid var(--border)',
+                              color: 'var(--muted)',
+                            }}
+                          >
+                            {decompositionOpen[i] ? '▲ Hide decomposition details' : '▼ Show decomposition details'}
+                          </button>
+                        )}
+
+                        {/* Child atoms — shown if isDecomposed AND (partial/not-assembled OR toggle open) */}
+                        {iState.isDecomposed && iState.childAtoms && (assembled && !isPartial ? decompositionOpen[i] : true) && (
                           <div style={{
                             marginTop: 7, padding: '8px 9px',
                             background: 'rgba(139,92,246,.04)',
@@ -565,6 +772,9 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                                   cs.status === 'complete' ? 'rgba(0,229,180,.3)'    :
                                   canGenChild              ? 'rgba(139,92,246,.35)'  : 'var(--border)'
 
+                                const cuiKey = `${i}/${childKey}`
+                                const crui = childRefineUi[cuiKey] || {}
+
                                 return (
                                   <div key={childKey}>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
@@ -597,6 +807,67 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                                     {cs.status === 'complete' && cs.parsedValue !== null && (
                                       <div style={{ paddingLeft: 10, marginTop: 2 }}>
                                         {renderItemValue(cs.parsedValue)}
+
+                                        {/* UX Fix A — Refine child atom */}
+                                        {apiMode === 'ai' && (
+                                          <div style={{ marginTop: 4 }}>
+                                            <button
+                                              onClick={() => patchChildRefineUi(cuiKey, { open: !crui.open })}
+                                              disabled={crui.busy}
+                                              style={{
+                                                fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                                                padding: '1px 6px', borderRadius: 3,
+                                                cursor: crui.busy ? 'not-allowed' : 'pointer',
+                                                background: crui.open ? 'rgba(0,229,180,.07)' : 'transparent',
+                                                border: `1px solid ${crui.open ? 'rgba(0,229,180,.25)' : 'var(--border)'}`,
+                                                color: crui.open ? '#00e5b4' : 'var(--muted)',
+                                                opacity: crui.busy ? 0.5 : 1,
+                                              }}
+                                            >
+                                              ↻ Refine {crui.open ? '▲' : '▼'}
+                                            </button>
+                                            {crui.open && (
+                                              <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                                                <textarea
+                                                  value={crui.prompt || ''}
+                                                  onChange={e => patchChildRefineUi(cuiKey, { prompt: e.target.value })}
+                                                  rows={2}
+                                                  disabled={crui.busy}
+                                                  placeholder="Refinement instruction…"
+                                                  style={{
+                                                    width: '100%', boxSizing: 'border-box',
+                                                    fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--text)',
+                                                    background: 'var(--surface)', border: '1px solid var(--border)',
+                                                    borderRadius: 3, padding: '4px 6px', resize: 'vertical', outline: 'none',
+                                                    lineHeight: 1.5, opacity: crui.busy ? 0.5 : 1,
+                                                  }}
+                                                />
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                                  <button
+                                                    onClick={() => handleRefineChildAtom(i, theme, childKey)}
+                                                    disabled={crui.busy || !(crui.prompt?.trim())}
+                                                    style={{
+                                                      fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                                                      padding: '2px 7px', borderRadius: 3,
+                                                      cursor: (crui.busy || !(crui.prompt?.trim())) ? 'not-allowed' : 'pointer',
+                                                      background: 'rgba(0,229,180,.08)',
+                                                      border: '1px solid rgba(0,229,180,.25)',
+                                                      color: '#00e5b4',
+                                                      opacity: (crui.busy || !(crui.prompt?.trim())) ? 0.5 : 1,
+                                                    }}
+                                                  >
+                                                    {crui.busy ? 'Refining…' : 'Apply'}
+                                                  </button>
+                                                  {crui.error && (
+                                                    <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                                                      ⚠ {crui.error}
+                                                    </span>
+                                                  )}
+                                                </div>
+                                              </div>
+                                            )}
+                                          </div>
+                                        )}
                                       </div>
                                     )}
 
@@ -768,7 +1039,7 @@ function ScopeSelector({ value, onChange, disabled }) {
 // apiMode:      'ai' | 'mock'
 // globalBusy:   true while a parent-level generation is running
 
-function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy, activeStage1Rev, otherBuNames }) {
+function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy, activeStage1Rev, otherBuNames, workspaceId }) {
   const [open,          setOpen]          = useState(true)
   const [refineOpen,    setRefineOpen]    = useState(false)
   const [refinePrompt,  setRefinePrompt]  = useState('')
@@ -862,7 +1133,7 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy, activeStage1Rev,
             <SubList label="Key Success Metrics"  items={bu.keySuccessMetrics}   borderColor="rgba(0,229,180,.4)"   />
           </div>
 
-          <Stage3HandoffShell bu={bu} otherBuNames={otherBuNames} activeStage1Rev={activeStage1Rev} apiMode={apiMode} />
+          <Stage3HandoffShell bu={bu} otherBuNames={otherBuNames} activeStage1Rev={activeStage1Rev} apiMode={apiMode} workspaceId={workspaceId} />
 
           {/* ── Unit-level refinement panel ───────────────────────────────── */}
           <div style={{
@@ -1466,6 +1737,7 @@ export default function Stage2View({
               activeStage1Rev={activeStage1Rev}
               otherBuNames={businessUnits.filter((_, j) => j !== i).map(b => b.name)}
               onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
+              workspaceId={workspace?.id}
             />
           ))}
         </div>
