@@ -116,6 +116,117 @@ function getThemeKey(theme) {
 const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 const SME_LENS_STATE_DEFAULT   = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 
+function normalizeHandoffDraftPayload(payload = {}) {
+  const legacyParsed = payload.parsed || null
+  const parsed = legacyParsed || (
+    payload.domainOfWork || payload.handoffStructure
+      ? { domainOfWork: payload.domainOfWork || null, handoffStructure: payload.handoffStructure || null }
+      : null
+  )
+  const smeLensState = {
+    ...SME_LENS_STATE_DEFAULT,
+    ...(payload.smeLensState || payload.SMEReviewLensAtom || {}),
+  }
+  if (!smeLensState.parsedValue && payload.SMEReviewLens) {
+    smeLensState.status = 'complete'
+    smeLensState.parsedValue = payload.SMEReviewLens
+  }
+
+  return {
+    version: 2,
+    parsed,
+    itemStates: payload.itemStates || payload.handoffItems || {},
+    smeLensState,
+    structureIsStale: !!payload.structureIsStale,
+    buHandoff: payload.buHandoff || payload.assembledBuHandoff || null,
+    structureRaw: payload.structureRaw || payload.rawResponses?.handoffStructure || null,
+    savedAt: payload.savedAt || payload.lastSavedAt || null,
+  }
+}
+
+function buildHandoffDraftPayload({ buName, parsed, itemStates, smeLensState, structureIsStale, buHandoff, structureRaw }) {
+  const handoffItems = itemStates || {}
+  const childAtoms = Object.fromEntries(
+    Object.entries(handoffItems)
+      .filter(([, state]) => state?.childAtoms)
+      .map(([key, state]) => [key, state.childAtoms]),
+  )
+  const itemRawResponses = Object.fromEntries(
+    Object.entries(handoffItems).map(([key, state]) => [key, {
+      rawResponse: state?.rawResponse || null,
+      childRawResponses: Object.fromEntries(
+        Object.entries(state?.childAtoms || {}).map(([childKey, child]) => [childKey, child?.rawResponse || null]),
+      ),
+    }]),
+  )
+  const itemParserErrors = Object.fromEntries(
+    Object.entries(handoffItems).map(([key, state]) => [key, {
+      parserError: state?.parserError || null,
+      childParserErrors: Object.fromEntries(
+        Object.entries(state?.childAtoms || {}).map(([childKey, child]) => [childKey, child?.parserError || null]),
+      ),
+    }]),
+  )
+  const itemStatuses = Object.fromEntries(
+    Object.entries(handoffItems).map(([key, state]) => [key, {
+      status: state?.status || 'not_started',
+      childStatuses: Object.fromEntries(
+        Object.entries(state?.childAtoms || {}).map(([childKey, child]) => [childKey, child?.status || 'not_started']),
+      ),
+      isStale: !!state?.isStale,
+    }]),
+  )
+  const savedAt = new Date().toISOString()
+
+  return {
+    version: 2,
+    businessUnitName: buName,
+    domainOfWork: parsed?.domainOfWork || null,
+    SMEReviewLens: smeLensState?.parsedValue || null,
+    SMEReviewLensAtom: smeLensState || SME_LENS_STATE_DEFAULT,
+    smeLensState: smeLensState || SME_LENS_STATE_DEFAULT,
+    handoffStructure: parsed?.handoffStructure || null,
+    handoffItems,
+    itemStates: handoffItems,
+    generatedItems: handoffItems,
+    assembledBuHandoff: buHandoff || null,
+    buHandoff: buHandoff || null,
+    childAtoms,
+    rawResponses: {
+      handoffStructure: structureRaw || null,
+      SMEReviewLens: smeLensState?.rawResponse || null,
+      handoffItems: itemRawResponses,
+    },
+    parsedValues: {
+      SMEReviewLens: smeLensState?.parsedValue || null,
+      handoffItems: Object.fromEntries(Object.entries(handoffItems).map(([key, state]) => [key, state?.parsedValue || null])),
+    },
+    parserErrors: {
+      SMEReviewLens: smeLensState?.parserError || null,
+      handoffItems: itemParserErrors,
+    },
+    statuses: {
+      SMEReviewLens: smeLensState?.status || 'not_started',
+      handoffItems: itemStatuses,
+      structureIsStale: !!structureIsStale,
+    },
+    refinementPrompts: {
+      SMEReviewLens: null,
+      handoffItems: {},
+      childAtoms: {},
+    },
+    staleFlags: {
+      structureIsStale: !!structureIsStale,
+      handoffItems: Object.fromEntries(Object.entries(handoffItems).map(([key, state]) => [key, !!state?.isStale])),
+    },
+    handoffStatus: buHandoff
+      ? (buHandoff.completedCount === buHandoff.totalCount ? 'assembled' : 'partial')
+      : parsed?.handoffStructure ? 'structure_ready' : 'not_started',
+    lastSavedAt: savedAt,
+    savedAt,
+  }
+}
+
 // Renders a string or structured-object SME lens value
 function SmeLensValue({ value }) {
   if (!value) return null
@@ -189,6 +300,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
 
   // ── Draft persistence ───────────────────────────────────────────────────────
   const hasHydrated = useRef(false)
+  const skipInitialPersist = useRef(true)
   const storageKey  = workspaceId ? `bsp_v1_handoff_${workspaceId}_${bu.name}` : null
   const [lastSavedAt, setLastSavedAt] = useState(null)
 
@@ -202,14 +314,17 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     try {
       const raw = localStorage.getItem(storageKey)
       if (raw) {
-        const { parsed: p, itemStates: is, smeLensState: sls, structureIsStale: sis, buHandoff: bh, savedAt } = JSON.parse(raw)
-        if (p)   setParsed(p)
-        if (is)  setItemStates(is)
-        if (sls) setSmeLensState(sls)
-        if (sis) setStructureIsStale(sis)
-        if (bh)  setBuHandoff(bh)
-        if (savedAt) setLastSavedAt(savedAt)
-        console.log('[Stage2 Handoff Draft] hydrated', bu.name, { hasParsed: !!p, itemCount: Object.keys(is || {}).length, savedAt })
+        const draft = normalizeHandoffDraftPayload(JSON.parse(raw))
+        if (draft.parsed) setParsed(draft.parsed)
+        setItemStates(draft.itemStates || {})
+        setSmeLensState(draft.smeLensState || SME_LENS_STATE_DEFAULT)
+        setStructureIsStale(!!draft.structureIsStale)
+        if (draft.buHandoff) setBuHandoff(draft.buHandoff)
+        if (draft.structureRaw) setStructureRaw(draft.structureRaw)
+        if (draft.savedAt) setLastSavedAt(draft.savedAt)
+        console.log('[Stage2 Handoff Draft] hydrated BU', bu.name, 'keys:', Object.keys(JSON.parse(raw)))
+        console.log('[Stage2 Handoff Draft] SME lens persisted:', !!draft.smeLensState?.parsedValue)
+        console.log('[Stage2 Handoff Draft] handoff items persisted count:', Object.keys(draft.itemStates || {}).length)
       } else {
         console.log('[Stage2 Handoff Draft] no draft found for', bu.name)
       }
@@ -223,16 +338,30 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   // Persist whenever persisted state changes (skip initial empty save)
   useEffect(() => {
     if (!hasHydrated.current || !storageKey) return
+    if (skipInitialPersist.current) {
+      skipInitialPersist.current = false
+      return
+    }
     try {
-      const savedAt = new Date().toISOString()
-      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates, smeLensState, structureIsStale, buHandoff, savedAt }))
-      setLastSavedAt(savedAt)
-      console.log('[Stage2 Handoff Draft] saved', bu.name)
+      const draft = buildHandoffDraftPayload({
+        buName: bu.name,
+        parsed,
+        itemStates,
+        smeLensState,
+        structureIsStale,
+        buHandoff,
+        structureRaw,
+      })
+      localStorage.setItem(storageKey, JSON.stringify(draft))
+      setLastSavedAt(draft.savedAt)
+      console.log('[Stage2 Handoff Draft] saving BU', bu.name, 'keys:', Object.keys(draft))
+      console.log('[Stage2 Handoff Draft] SME lens persisted:', !!draft.SMEReviewLens)
+      console.log('[Stage2 Handoff Draft] handoff items persisted count:', Object.keys(draft.handoffItems || {}).length)
     } catch (e) {
       console.error('[Stage2 Handoff Draft] save failed for', bu.name, e)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [parsed, itemStates, smeLensState, structureIsStale, buHandoff, storageKey])
+  }, [parsed, itemStates, smeLensState, structureIsStale, buHandoff, structureRaw, storageKey])
 
   // ── Structure generation ────────────────────────────────────────────────────
 
