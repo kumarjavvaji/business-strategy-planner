@@ -15,11 +15,16 @@ import React, { useState, useCallback, useEffect, useRef } from 'react'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import {
   generateMockStage3,
-  buildStage3BusinessUnitMessages,
+  buildBUStructureMessages,
+  parseBUStructureResponse,
+  buildBUSectionMessages,
+  parseBUSectionResponse,
+  assembleBUPlan,
   buildStage3CoordinationSynthesisMessages,
   parseStage3CoordinationSynthesisResponse,
   buildStage3UnitRefinementMessages,
   parseStage3UnitResponse,
+  SECTION_LABELS,
 } from '../utils/stage3Prompts'
 import { buildStage3RevisionRecord, stage3SnapshotToText } from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
@@ -310,13 +315,12 @@ function CoordinationLayer({ layer }) {
 
 function GenerationProgress({ generation, onRetry }) {
   if (!generation?.active && !generation?.failedStep) return null
-  const units        = generation.units        || []
-  const plans        = generation.plans        || []
-  const currentBatch = generation.currentBatch || []
-  const failedIdxs   = generation.failedIndices || []
-  const phase        = generation.phase        || 'bu_generation'
+  const units    = generation.units    || []
+  const buStates = generation.buStates || []
+  const phase    = generation.phase    || 'bu_phases'
 
   const mark = s => ({ complete: '✓', generating: '~', failed: '!', pending: '○' }[s] || '○')
+  const col  = s => ({ complete: '#00e5b4', failed: '#f87171', generating: '#fb923c', pending: 'var(--muted)' }[s] || 'var(--muted)')
   const retryLabel = generation.failedStep === 'coordination' ? 'Retry coordination' : 'Retry failed units'
 
   return (
@@ -341,16 +345,43 @@ function GenerationProgress({ generation, onRetry }) {
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         {units.map((unit, i) => {
-          const plan = plans[i]
-          let status
-          if (plan && !plan._error)           status = 'complete'
-          else if (plan?._error || failedIdxs.includes(i)) status = 'failed'
-          else if (currentBatch.includes(i))  status = 'generating'
-          else                                status = 'pending'
-          const color = { complete: '#00e5b4', failed: '#f87171', generating: '#fb923c', pending: 'var(--muted)' }[status]
+          const bs = buStates[i] || {}
+          const plan = bs.plan
+
+          // Determine overall BU status
+          let buStatus
+          if (plan && !plan._error)                         buStatus = 'complete'
+          else if (bs.structureStatus === 'failed')         buStatus = 'failed'
+          else if (bs.structureStatus === 'generating')     buStatus = 'generating'
+          else if (bs.structureStatus === 'complete') {
+            const sv = Object.values(bs.sectionStatuses || {})
+            if (sv.some(s => s === 'failed'))               buStatus = 'failed'
+            else if (sv.some(s => s === 'generating'))      buStatus = 'generating'
+            else if (sv.length && sv.every(s => s === 'complete')) buStatus = 'assembling'
+            else                                            buStatus = 'generating'
+          } else                                            buStatus = 'pending'
+
+          const displayStatus = buStatus === 'assembling' ? 'generating' : buStatus
+          const sectionEntries = Object.entries(bs.sectionStatuses || {})
+          const showSections = bs.structureStatus === 'complete' && buStatus !== 'complete'
+
           return (
-            <div key={`${unit.name}-${i}`} style={{ fontSize: 9, fontFamily: 'var(--fm)', color }}>
-              {mark(status)} {unit.name} {status}
+            <div key={`${unit.name}-${i}`} style={{ marginBottom: 2 }}>
+              <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: col(displayStatus) }}>
+                {mark(displayStatus)} {unit.name}
+                {bs.structure?.domain && buStatus !== 'pending' && (
+                  <span style={{ opacity: .55, marginLeft: 5 }}>· {bs.structure.domain}</span>
+                )}
+              </div>
+              {showSections && sectionEntries.length > 0 && (
+                <div style={{ paddingLeft: 14, marginTop: 2, display: 'flex', flexDirection: 'column', gap: 1 }}>
+                  {sectionEntries.map(([key, status]) => (
+                    <div key={key} style={{ fontSize: 8, fontFamily: 'var(--fm)', color: col(status) }}>
+                      {mark(status)} {SECTION_LABELS[key] || key}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )
         })}
@@ -849,7 +880,7 @@ export default function Stage3View({
   const savedSummaryNote    = activeRev?.contentSnapshot?.summaryNote    || ''
   const savedCoordinationLayer = activeRev?.contentSnapshot?.coordinationLayer || null
   const executionPlans = generation
-    ? (generation.plans || []).filter(p => p && !p._error)
+    ? (generation.buStates || []).map(bs => bs?.plan).filter(p => p && !p._error)
     : savedExecutionPlans
   const summaryNote    = generation?.summaryNote || savedSummaryNote
   const coordinationLayer = generation?.coordinationLayer || savedCoordinationLayer
@@ -904,7 +935,7 @@ export default function Stage3View({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldAutoGenerate])
 
-  // ── Full Stage 3 generation — BU-first, bounded-parallel, then coordination ──
+  // ── Full Stage 3 generation — hierarchical: structure → sections → assembly → coordination ──
   const CONCURRENCY = 3
 
   async function runChunkedStage3({ refinementPrompt = '', impactSummary = '', resume = false } = {}) {
@@ -922,32 +953,20 @@ export default function Stage3View({
     if (!hasApiKey()) {
       const mock = generateMockStage3(s1Snap, s2Snap)
       const learningSignals = deriveLearningSignals({
-        stage: 'Stage 3',
-        source: 'mock',
-        prompt: refinementPrompt,
+        stage: 'Stage 3', source: 'mock', prompt: refinementPrompt,
         impactSummary: impactSummary || 'Generated Stage 3 with mock generator',
-        refinementType: refinementPrompt ? 'stage' : null,
-        structuralImpact: 'none',
-        stalenessEvents: [],
+        refinementType: refinementPrompt ? 'stage' : null, structuralImpact: 'none', stalenessEvents: [],
       })
       const nextNum = stage3Revisions.length + 1
-      const record  = buildStage3RevisionRecord({
-        executionPlans:        mock.executionPlans,
-        summaryNote:           mock.summaryNote,
-        coordinationLayer:     mock.coordinationLayer,
-        revisionNumber:        nextNum,
-        sourceBasisRevisionId:  stage1ActiveId,
-        sourceStage2RevisionId: stage2ActiveId,
-        source:                'mock',
-        prompt:                refinementPrompt,
-        impactSummary:         impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via mock generator.`,
-        refinementType:        refinementPrompt ? 'stage' : null,
-        affectedUnit:          null,
-        structuralImpact:      'none',
-        refinementClassification: null,
-        learningSignals,
-      })
-      onSaveRevision(record)
+      onSaveRevision(buildStage3RevisionRecord({
+        executionPlans: mock.executionPlans, summaryNote: mock.summaryNote,
+        coordinationLayer: mock.coordinationLayer, revisionNumber: nextNum,
+        sourceBasisRevisionId: stage1ActiveId, sourceStage2RevisionId: stage2ActiveId,
+        source: 'mock', prompt: refinementPrompt,
+        impactSummary: impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via mock generator.`,
+        refinementType: refinementPrompt ? 'stage' : null, affectedUnit: null,
+        structuralImpact: 'none', refinementClassification: null, learningSignals,
+      }))
       setGeneration(null)
       setIsGenerating(false)
       return { error: null }
@@ -955,116 +974,145 @@ export default function Stage3View({
 
     // ── AI path ──────────────────────────────────────────────────────────────
     const units = s2Snap.businessUnits || []
-    if (units.length === 0) {
-      setIsGenerating(false)
-      return { error: 'No business units in Stage 2. Cannot generate Stage 3.' }
-    }
+    if (units.length === 0) { setIsGenerating(false); return { error: 'No business units in Stage 2.' } }
 
-    // Resume: preserve completed plans from a previous attempt
-    let plans = resume
-      ? [...(generation?.plans || new Array(units.length).fill(null))]
-      : new Array(units.length).fill(null)
-    if (plans.length !== units.length) plans = new Array(units.length).fill(null)
+    const emptyBUState = () => ({ structureStatus: 'pending', structure: null, sectionStatuses: {}, sections: {}, plan: null })
+
+    // Resume: keep completed buStates, reset failed ones
+    let buStates = (resume && generation?.buStates?.length === units.length)
+      ? generation.buStates.map(bs => bs?.plan && !bs.plan._error ? bs : emptyBUState())
+      : units.map(() => emptyBUState())
 
     setGeneration({
-      phase:          'bu_generation',
-      active:         true,
-      units,
-      plans:          [...plans],
-      currentBatch:   [],
-      failedIndices:  [],
-      coordinationLayer: null,
-      summaryNote:    '',
-      failedStep:     null,
-      error:          null,
-      refinementPrompt,
-      impactSummary,
+      phase: 'bu_phases', active: true, units, buStates: [...buStates],
+      coordinationLayer: null, summaryNote: '',
+      failedStep: null, failedIndices: [], error: null, refinementPrompt, impactSummary,
     })
 
-    // Determine which BU slots still need generating (skip completed, retry _error)
-    const pendingIndices = units
-      .map((_, i) => i)
-      .filter(i => !plans[i] || plans[i]._error)
+    const otherNames = (idx) => units.filter((_, i) => i !== idx).map(u => u.name).join(', ')
+    const refinement = { prompt: refinementPrompt, impactSummary }
+    const failedBUIndices = []
 
-    const failedIndices = []
+    // Process one BU fully: structure → sections (parallel) → assembly
+    async function processBU(idx) {
+      const unit = units[idx]
 
-    // Run BU API calls with bounded concurrency
-    for (let batchStart = 0; batchStart < pendingIndices.length; batchStart += CONCURRENCY) {
-      const batch = pendingIndices.slice(batchStart, batchStart + CONCURRENCY)
-      setGeneration(g => ({ ...(g || {}), currentBatch: batch }))
+      // ── Structure call ──────────────────────────────────────────────────
+      console.log(`[Stage3 API] BU structure start: ${unit.name}`)
+      buStates[idx] = { ...emptyBUState(), structureStatus: 'generating' }
+      setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
 
-      await Promise.all(batch.map(async (idx) => {
-        const unit = units[idx]
-        console.log(`[Stage3 API] BU start: ${unit.name}`)
-        const { messages } = buildStage3BusinessUnitMessages(s1Snap, s2Snap, unit, {
-          prompt: refinementPrompt,
-          impactSummary,
-        })
-        const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 4000 })
-        if (error) {
-          console.log(`[Stage3 API] BU failed: ${unit.name}`)
-          plans[idx] = { _error: error }
-          failedIndices.push(idx)
-          setGeneration(g => ({ ...(g || {}), plans: [...plans] }))
+      const { messages: strMsgs } = buildBUStructureMessages(s1Snap, unit, otherNames(idx), refinement)
+      const { result: strResult, error: strError } = await callAI(strMsgs, { temperature: 0.3, maxTokens: 900 })
+
+      if (strError) {
+        console.log(`[Stage3 API] BU structure failed: ${unit.name}`)
+        buStates[idx] = { ...buStates[idx], structureStatus: 'failed', structure: { _error: strError } }
+        setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+        return false
+      }
+
+      const parsedStr = parseBUStructureResponse(strResult)
+      if (parsedStr.error || !parsedStr.structure) {
+        const err = parsedStr.error || 'Structure parse failed.'
+        console.log(`[Stage3 API] BU structure failed: ${unit.name}`)
+        buStates[idx] = { ...buStates[idx], structureStatus: 'failed', structure: { _error: err } }
+        setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+        return false
+      }
+
+      console.log(`[Stage3 API] BU structure complete: ${unit.name} → sections: [${parsedStr.structure.sections.join(', ')}]`)
+      const structure = parsedStr.structure
+      const sectionStatuses = Object.fromEntries(structure.sections.map(k => [k, 'pending']))
+      buStates[idx] = { ...buStates[idx], structureStatus: 'complete', structure, sectionStatuses, sections: {} }
+      setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+
+      // ── Section calls (parallel within BU) ─────────────────────────────
+      const sectionTokens = { workstreams: 1400, lenses: 1200, risk: 1000 }
+      await Promise.all(structure.sections.map(async (sectionKey) => {
+        console.log(`[Stage3 API] BU section start: ${unit.name} / ${sectionKey}`)
+        buStates[idx] = {
+          ...buStates[idx],
+          sectionStatuses: { ...buStates[idx].sectionStatuses, [sectionKey]: 'generating' },
+        }
+        setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+
+        const maxTok = sectionTokens[sectionKey] || 900
+        const { messages: secMsgs } = buildBUSectionMessages(s1Snap, unit, structure, sectionKey, otherNames(idx), refinement)
+        const { result: secResult, error: secError } = await callAI(secMsgs, { temperature: 0.3, maxTokens: maxTok })
+
+        if (secError) {
+          console.log(`[Stage3 API] BU section failed: ${unit.name} / ${sectionKey}`)
+          buStates[idx] = {
+            ...buStates[idx],
+            sectionStatuses: { ...buStates[idx].sectionStatuses, [sectionKey]: 'failed' },
+            sections: { ...buStates[idx].sections, [sectionKey]: { _error: secError } },
+          }
+          setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
           return
         }
-        const parsed = parseStage3UnitResponse(result)
-        if (parsed.error || !parsed.plan) {
-          const parseError = parsed.error || 'Unit response parse failed.'
-          console.log(`[Stage3 API] BU failed: ${unit.name}`)
-          plans[idx] = { _error: parseError }
-          failedIndices.push(idx)
-          setGeneration(g => ({ ...(g || {}), plans: [...plans] }))
+
+        const parsedSec = parseBUSectionResponse(sectionKey, secResult)
+        if (parsedSec.error || !parsedSec.section) {
+          const err = parsedSec.error || 'Section parse failed.'
+          console.log(`[Stage3 API] BU section failed: ${unit.name} / ${sectionKey}`)
+          buStates[idx] = {
+            ...buStates[idx],
+            sectionStatuses: { ...buStates[idx].sectionStatuses, [sectionKey]: 'failed' },
+            sections: { ...buStates[idx].sections, [sectionKey]: { _error: err } },
+          }
+          setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
           return
         }
-        console.log(`[Stage3 API] BU complete: ${unit.name}`)
-        plans[idx] = parsed.plan
-        setGeneration(g => ({ ...(g || {}), plans: [...plans] }))
+
+        console.log(`[Stage3 API] BU section complete: ${unit.name} / ${sectionKey}`)
+        buStates[idx] = {
+          ...buStates[idx],
+          sectionStatuses: { ...buStates[idx].sectionStatuses, [sectionKey]: 'complete' },
+          sections: { ...buStates[idx].sections, [sectionKey]: parsedSec.section },
+        }
+        setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
       }))
+
+      // Check for section failures
+      if (structure.sections.some(k => buStates[idx].sections[k]?._error)) return false
+
+      // ── Client-side assembly ────────────────────────────────────────────
+      const plan = assembleBUPlan(structure, buStates[idx].sections)
+      console.log(`[Stage3 API] BU complete: ${unit.name}`)
+      buStates[idx] = { ...buStates[idx], plan }
+      setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+      return true
     }
 
-    if (failedIndices.length > 0) {
-      const err = `${failedIndices.length} BU plan(s) failed to generate. Retry to resume.`
+    // Run BUs in batches of CONCURRENCY
+    const pendingIndices = units.map((_, i) => i).filter(i => !buStates[i]?.plan || buStates[i].plan._error)
+    for (let batchStart = 0; batchStart < pendingIndices.length; batchStart += CONCURRENCY) {
+      const batch = pendingIndices.slice(batchStart, batchStart + CONCURRENCY)
+      const results = await Promise.all(batch.map(idx => processBU(idx)))
+      results.forEach((ok, j) => { if (!ok) failedBUIndices.push(batch[j]) })
+    }
+
+    if (failedBUIndices.length > 0) {
+      const err = `${failedBUIndices.length} BU plan(s) failed. Retry to resume.`
       setGenError(err)
-      setGeneration(g => ({
-        ...(g || {}),
-        active:        false,
-        currentBatch:  [],
-        failedIndices,
-        failedStep:    'unit',
-        error:         err,
-      }))
+      setGeneration(g => ({ ...(g || {}), active: false, failedIndices: failedBUIndices, failedStep: 'section', error: err }))
       setIsGenerating(false)
       return { error: err }
     }
 
-    // ── Coordination synthesis (after all BU plans complete) ─────────────────
-    const completedPlans = plans.filter(p => p && !p._error)
-    setGeneration(g => ({
-      ...(g || {}),
-      phase:         'coordination',
-      currentBatch:  [],
-      failedIndices: [],
-    }))
+    // ── Coordination synthesis ────────────────────────────────────────────────
+    const completedPlans = buStates.map(bs => bs.plan).filter(p => p && !p._error)
+    setGeneration(g => ({ ...(g || {}), phase: 'coordination' }))
 
     console.log('[Stage3 API] coordination start')
-    const { messages: coordMessages } = buildStage3CoordinationSynthesisMessages(
-      s1Snap, completedPlans, { prompt: refinementPrompt, impactSummary },
-    )
-    const { result: coordResult, error: coordError } = await callAI(coordMessages, {
-      temperature: 0.3,
-      maxTokens:   1800,
-    })
+    const { messages: coordMsgs } = buildStage3CoordinationSynthesisMessages(s1Snap, completedPlans, refinement)
+    const { result: coordResult, error: coordError } = await callAI(coordMsgs, { temperature: 0.3, maxTokens: 1800 })
 
     if (coordError) {
       console.log('[Stage3 API] coordination failed')
       setGenError(coordError)
-      setGeneration(g => ({
-        ...(g || {}),
-        active:     false,
-        failedStep: 'coordination',
-        error:      coordError,
-      }))
+      setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', error: coordError }))
       setIsGenerating(false)
       return { error: coordError }
     }
@@ -1074,12 +1122,7 @@ export default function Stage3View({
       const parseError = parsedCoord.error || 'Coordination synthesis parse failed.'
       console.log('[Stage3 API] coordination failed')
       setGenError(parseError)
-      setGeneration(g => ({
-        ...(g || {}),
-        active:     false,
-        failedStep: 'coordination',
-        error:      parseError,
-      }))
+      setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', error: parseError }))
       setIsGenerating(false)
       return { error: parseError }
     }
@@ -1087,45 +1130,26 @@ export default function Stage3View({
     console.log('[Stage3 API] coordination complete')
     const coordination = parsedCoord.coordinationLayer
     const note         = parsedCoord.summaryNote
+    setGeneration(g => ({ ...(g || {}), coordinationLayer: coordination, summaryNote: note }))
 
-    setGeneration(g => ({
-      ...(g || {}),
-      coordinationLayer: coordination,
-      summaryNote:       note,
-    }))
-
-    // Learning signals — heuristic only, synchronous, never blocks save
+    // Learning signals — heuristic only, synchronous
     const learningSignals = deriveLearningSignals({
-      stage:          'Stage 3',
-      source:         'ai',
-      prompt:         refinementPrompt,
-      impactSummary:  impactSummary || (refinementPrompt
-        ? 'Regenerated Stage 3 with BU-first AI orchestration'
-        : 'Generated Stage 3 with BU-first AI orchestration'),
-      refinementType: refinementPrompt ? 'stage' : null,
-      structuralImpact: 'none',
-      stalenessEvents:  [],
+      stage: 'Stage 3', source: 'ai', prompt: refinementPrompt,
+      impactSummary: impactSummary || (refinementPrompt
+        ? 'Regenerated Stage 3 with hierarchical BU-first AI orchestration'
+        : 'Generated Stage 3 with hierarchical BU-first AI orchestration'),
+      refinementType: refinementPrompt ? 'stage' : null, structuralImpact: 'none', stalenessEvents: [],
     })
 
     const nextNum = stage3Revisions.length + 1
-    const record  = buildStage3RevisionRecord({
-      executionPlans:         completedPlans,
-      summaryNote:            note,
-      coordinationLayer:      coordination,
-      revisionNumber:         nextNum,
-      sourceBasisRevisionId:  stage1ActiveId,
-      sourceStage2RevisionId: stage2ActiveId,
-      source:                 'ai',
-      prompt:                 refinementPrompt,
-      impactSummary:          impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via ${AI_MODEL_LABEL} BU-first orchestration.`,
-      refinementType:         refinementPrompt ? 'stage' : null,
-      affectedUnit:           null,
-      structuralImpact:       'none',
-      refinementClassification: null,
-      learningSignals,
-    })
-
-    onSaveRevision(record)
+    onSaveRevision(buildStage3RevisionRecord({
+      executionPlans: completedPlans, summaryNote: note, coordinationLayer: coordination,
+      revisionNumber: nextNum, sourceBasisRevisionId: stage1ActiveId, sourceStage2RevisionId: stage2ActiveId,
+      source: 'ai', prompt: refinementPrompt,
+      impactSummary: impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via ${AI_MODEL_LABEL} hierarchical orchestration.`,
+      refinementType: refinementPrompt ? 'stage' : null, affectedUnit: null,
+      structuralImpact: 'none', refinementClassification: null, learningSignals,
+    }))
     setGeneration(null)
     setIsGenerating(false)
     return { error: null }
