@@ -15,9 +15,9 @@ import React, { useState, useCallback, useEffect, useRef } from 'react'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import {
   generateMockStage3,
-  buildStage3CoordinationMessages,
-  parseStage3CoordinationResponse,
   buildStage3BusinessUnitMessages,
+  buildStage3CoordinationSynthesisMessages,
+  parseStage3CoordinationSynthesisResponse,
   buildStage3UnitRefinementMessages,
   parseStage3UnitResponse,
 } from '../utils/stage3Prompts'
@@ -310,9 +310,15 @@ function CoordinationLayer({ layer }) {
 
 function GenerationProgress({ generation, onRetry }) {
   if (!generation?.active && !generation?.failedStep) return null
-  const units = generation.units || []
-  const plans = generation.plans || []
-  const mark = (status) => status === 'complete' ? '✓' : status === 'generating' ? '~' : status === 'failed' ? '!' : '○'
+  const units        = generation.units        || []
+  const plans        = generation.plans        || []
+  const currentBatch = generation.currentBatch || []
+  const failedIdxs   = generation.failedIndices || []
+  const phase        = generation.phase        || 'bu_generation'
+
+  const mark = s => ({ complete: '✓', generating: '~', failed: '!', pending: '○' }[s] || '○')
+  const retryLabel = generation.failedStep === 'coordination' ? 'Retry coordination' : 'Retry failed units'
+
   return (
     <div style={{
       background: 'rgba(59,130,246,.05)',
@@ -329,23 +335,34 @@ function GenerationProgress({ generation, onRetry }) {
             padding: '4px 12px', borderRadius: 4, cursor: 'pointer',
             background: 'rgba(251,146,60,.15)', border: '1px solid rgba(251,146,60,.4)', color: '#fb923c',
           }}>
-            Retry / resume
+            {retryLabel}
           </button>
         )}
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: generation.coordinationLayer ? '#00e5b4' : generation.failedStep === 'coordination' ? '#f87171' : '#fb923c' }}>
-          {mark(generation.coordinationLayer ? 'complete' : generation.failedStep === 'coordination' ? 'failed' : 'generating')} Coordination layer {generation.coordinationLayer ? 'complete' : generation.failedStep === 'coordination' ? 'failed' : 'generating'}
-        </div>
         {units.map((unit, i) => {
-          const status = plans[i] ? 'complete' : generation.failedStep === 'unit' && generation.failedIndex === i ? 'failed' : generation.currentIndex === i ? 'generating' : 'pending'
-          const color = status === 'complete' ? '#00e5b4' : status === 'failed' ? '#f87171' : status === 'generating' ? '#fb923c' : 'var(--muted)'
+          const plan = plans[i]
+          let status
+          if (plan && !plan._error)           status = 'complete'
+          else if (plan?._error || failedIdxs.includes(i)) status = 'failed'
+          else if (currentBatch.includes(i))  status = 'generating'
+          else                                status = 'pending'
+          const color = { complete: '#00e5b4', failed: '#f87171', generating: '#fb923c', pending: 'var(--muted)' }[status]
           return (
             <div key={`${unit.name}-${i}`} style={{ fontSize: 9, fontFamily: 'var(--fm)', color }}>
               {mark(status)} {unit.name} {status}
             </div>
           )
         })}
+        {(phase === 'coordination' || generation.coordinationLayer || generation.failedStep === 'coordination') && (
+          <div style={{
+            fontSize: 9, fontFamily: 'var(--fm)',
+            color: generation.coordinationLayer ? '#00e5b4' : generation.failedStep === 'coordination' ? '#f87171' : '#fb923c',
+          }}>
+            {mark(generation.coordinationLayer ? 'complete' : generation.failedStep === 'coordination' ? 'failed' : 'generating')}
+            {' '}Coordination synthesis {generation.coordinationLayer ? 'complete' : generation.failedStep === 'coordination' ? 'failed' : 'generating'}
+          </div>
+        )}
       </div>
       {generation.error && (
         <div style={{ marginTop: 8, fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.5 }}>
@@ -831,7 +848,9 @@ export default function Stage3View({
   const savedExecutionPlans = activeRev?.contentSnapshot?.executionPlans || []
   const savedSummaryNote    = activeRev?.contentSnapshot?.summaryNote    || ''
   const savedCoordinationLayer = activeRev?.contentSnapshot?.coordinationLayer || null
-  const executionPlans = generation ? (generation.plans || []).filter(Boolean) : savedExecutionPlans
+  const executionPlans = generation
+    ? (generation.plans || []).filter(p => p && !p._error)
+    : savedExecutionPlans
   const summaryNote    = generation?.summaryNote || savedSummaryNote
   const coordinationLayer = generation?.coordinationLayer || savedCoordinationLayer
 
@@ -885,7 +904,9 @@ export default function Stage3View({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldAutoGenerate])
 
-  // ── Full Stage 3 generation ─────────────────────────────────────────────────
+  // ── Full Stage 3 generation — BU-first, bounded-parallel, then coordination ──
+  const CONCURRENCY = 3
+
   async function runChunkedStage3({ refinementPrompt = '', impactSummary = '', resume = false } = {}) {
     if (!activeStage1Rev || !activeStage2Rev) return { error: 'No active upstream revisions.' }
     setIsGenerating(true)
@@ -895,128 +916,212 @@ export default function Stage3View({
 
     const s1Snap = activeStage1Rev.contentSnapshot
     const s2Snap = activeStage2Rev.contentSnapshot
-    let plans = resume ? [...(generation?.plans || [])] : []
-    let note = resume ? generation?.summaryNote : ''
-    let coordination = resume ? generation?.coordinationLayer : null
-    let units = resume ? generation?.units || [] : []
-    let parsedCoord = null
     const source = hasApiKey() ? 'ai' : 'mock'
 
-    if (hasApiKey()) {
-      if (!coordination) {
-        setGeneration({ active: true, units: [], plans: [], currentIndex: -1, coordinationLayer: null, summaryNote: '', refinementPrompt, impactSummary })
-        const { messages } = buildStage3CoordinationMessages(s1Snap, s2Snap, {
-          prompt: refinementPrompt,
-          impactSummary,
-          currentSummary: activeRev?.contentSnapshot?.summaryNote,
-        })
-        const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 3500 })
-        setRawResponse(result)
-        if (error) {
-          setGenError(error)
-          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', error }))
-          setIsGenerating(false)
-          return { error }
-        }
-        parsedCoord = parseStage3CoordinationResponse(result, s2Snap.businessUnits || [])
-        if (parsedCoord.error || !parsedCoord.coordinationLayer) {
-          const parseError = parsedCoord.error || 'Coordination parse failed.'
-          setGenError(parseError)
-          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', error: parseError }))
-          setIsGenerating(false)
-          return { error: parseError }
-        }
-        coordination = parsedCoord.coordinationLayer
-        units = parsedCoord.executionUnits
-        note = parsedCoord.summaryNote
-        plans = new Array(units.length).fill(null)
-        setGeneration(g => ({
-          ...(g || {}),
-          active: true,
-          coordinationLayer: coordination,
-          units,
-          plans,
-          summaryNote: note,
-          currentIndex: 0,
-          failedStep: null,
-          error: null,
-          refinementClassification: parsedCoord.refinementClassification,
-          structuralImpact: parsedCoord.structuralImpact,
-          refinementPrompt,
-          impactSummary,
-        }))
-      }
-
-      for (let i = 0; i < units.length; i++) {
-        if (plans[i]) continue
-        setGeneration(g => ({ ...(g || {}), active: true, currentIndex: i, failedStep: null, failedIndex: null, error: null }))
-        const { messages } = buildStage3BusinessUnitMessages(s1Snap, s2Snap, units[i], coordination, {
-          prompt: refinementPrompt,
-          impactSummary,
-        })
-        const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 3000 })
-        setRawResponse(result)
-        if (error) {
-          setGenError(error)
-          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'unit', failedIndex: i, error }))
-          setIsGenerating(false)
-          return { error }
-        }
-        const parsedPlan = parseStage3UnitResponse(result)
-        if (parsedPlan.error || !parsedPlan.plan) {
-          const parseError = parsedPlan.error || 'Unit response parse failed.'
-          setGenError(parseError)
-          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'unit', failedIndex: i, error: parseError }))
-          setIsGenerating(false)
-          return { error: parseError }
-        }
-        plans = plans.map((p, idx) => idx === i ? parsedPlan.plan : p)
-        setGeneration(g => ({ ...(g || {}), plans, currentIndex: i + 1 }))
-      }
-    } else {
+    // ── Mock path ────────────────────────────────────────────────────────────
+    if (!hasApiKey()) {
       const mock = generateMockStage3(s1Snap, s2Snap)
-      plans = mock.executionPlans
-      note = mock.summaryNote
-      coordination = mock.coordinationLayer
-      units = (s2Snap.businessUnits || []).map(u => ({ ...u, sourceStage2Name: u.name }))
-      setGeneration({ active: true, coordinationLayer: coordination, units, plans, summaryNote: note, currentIndex: units.length, refinementPrompt, impactSummary })
+      const learningSignals = deriveLearningSignals({
+        stage: 'Stage 3',
+        source: 'mock',
+        prompt: refinementPrompt,
+        impactSummary: impactSummary || 'Generated Stage 3 with mock generator',
+        refinementType: refinementPrompt ? 'stage' : null,
+        structuralImpact: 'none',
+        stalenessEvents: [],
+      })
+      const nextNum = stage3Revisions.length + 1
+      const record  = buildStage3RevisionRecord({
+        executionPlans:        mock.executionPlans,
+        summaryNote:           mock.summaryNote,
+        coordinationLayer:     mock.coordinationLayer,
+        revisionNumber:        nextNum,
+        sourceBasisRevisionId:  stage1ActiveId,
+        sourceStage2RevisionId: stage2ActiveId,
+        source:                'mock',
+        prompt:                refinementPrompt,
+        impactSummary:         impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via mock generator.`,
+        refinementType:        refinementPrompt ? 'stage' : null,
+        affectedUnit:          null,
+        structuralImpact:      'none',
+        refinementClassification: null,
+        learningSignals,
+      })
+      onSaveRevision(record)
+      setGeneration(null)
+      setIsGenerating(false)
+      return { error: null }
     }
 
-    if (plans.some(p => !p)) {
-      const err = 'Stage 3 generation is incomplete; retry the failed unit before saving a revision.'
+    // ── AI path ──────────────────────────────────────────────────────────────
+    const units = s2Snap.businessUnits || []
+    if (units.length === 0) {
+      setIsGenerating(false)
+      return { error: 'No business units in Stage 2. Cannot generate Stage 3.' }
+    }
+
+    // Resume: preserve completed plans from a previous attempt
+    let plans = resume
+      ? [...(generation?.plans || new Array(units.length).fill(null))]
+      : new Array(units.length).fill(null)
+    if (plans.length !== units.length) plans = new Array(units.length).fill(null)
+
+    setGeneration({
+      phase:          'bu_generation',
+      active:         true,
+      units,
+      plans:          [...plans],
+      currentBatch:   [],
+      failedIndices:  [],
+      coordinationLayer: null,
+      summaryNote:    '',
+      failedStep:     null,
+      error:          null,
+      refinementPrompt,
+      impactSummary,
+    })
+
+    // Determine which BU slots still need generating (skip completed, retry _error)
+    const pendingIndices = units
+      .map((_, i) => i)
+      .filter(i => !plans[i] || plans[i]._error)
+
+    const failedIndices = []
+
+    // Run BU API calls with bounded concurrency
+    for (let batchStart = 0; batchStart < pendingIndices.length; batchStart += CONCURRENCY) {
+      const batch = pendingIndices.slice(batchStart, batchStart + CONCURRENCY)
+      setGeneration(g => ({ ...(g || {}), currentBatch: batch }))
+
+      await Promise.all(batch.map(async (idx) => {
+        const unit = units[idx]
+        console.log(`[Stage3 API] BU start: ${unit.name}`)
+        const { messages } = buildStage3BusinessUnitMessages(s1Snap, s2Snap, unit, {
+          prompt: refinementPrompt,
+          impactSummary,
+        })
+        const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 4000 })
+        if (error) {
+          console.log(`[Stage3 API] BU failed: ${unit.name}`)
+          plans[idx] = { _error: error }
+          failedIndices.push(idx)
+          setGeneration(g => ({ ...(g || {}), plans: [...plans] }))
+          return
+        }
+        const parsed = parseStage3UnitResponse(result)
+        if (parsed.error || !parsed.plan) {
+          const parseError = parsed.error || 'Unit response parse failed.'
+          console.log(`[Stage3 API] BU failed: ${unit.name}`)
+          plans[idx] = { _error: parseError }
+          failedIndices.push(idx)
+          setGeneration(g => ({ ...(g || {}), plans: [...plans] }))
+          return
+        }
+        console.log(`[Stage3 API] BU complete: ${unit.name}`)
+        plans[idx] = parsed.plan
+        setGeneration(g => ({ ...(g || {}), plans: [...plans] }))
+      }))
+    }
+
+    if (failedIndices.length > 0) {
+      const err = `${failedIndices.length} BU plan(s) failed to generate. Retry to resume.`
       setGenError(err)
+      setGeneration(g => ({
+        ...(g || {}),
+        active:        false,
+        currentBatch:  [],
+        failedIndices,
+        failedStep:    'unit',
+        error:         err,
+      }))
       setIsGenerating(false)
       return { error: err }
     }
 
-    const structuralImpact = parsedCoord?.structuralImpact || generation?.structuralImpact || 'none'
-    const refinementClassification = parsedCoord?.refinementClassification || generation?.refinementClassification || null
-    const learningSignals = await collectStage3LearningSignals({
-      source,
-      prompt: refinementPrompt,
-      impactSummary: impactSummary || (refinementPrompt ? 'Regenerated Stage 3 with chunked AI' : `Generated Stage 3 with chunked ${source === 'ai' ? 'AI' : 'mock'} orchestration`),
+    // ── Coordination synthesis (after all BU plans complete) ─────────────────
+    const completedPlans = plans.filter(p => p && !p._error)
+    setGeneration(g => ({
+      ...(g || {}),
+      phase:         'coordination',
+      currentBatch:  [],
+      failedIndices: [],
+    }))
+
+    console.log('[Stage3 API] coordination start')
+    const { messages: coordMessages } = buildStage3CoordinationSynthesisMessages(
+      s1Snap, completedPlans, { prompt: refinementPrompt, impactSummary },
+    )
+    const { result: coordResult, error: coordError } = await callAI(coordMessages, {
+      temperature: 0.3,
+      maxTokens:   1800,
+    })
+
+    if (coordError) {
+      console.log('[Stage3 API] coordination failed')
+      setGenError(coordError)
+      setGeneration(g => ({
+        ...(g || {}),
+        active:     false,
+        failedStep: 'coordination',
+        error:      coordError,
+      }))
+      setIsGenerating(false)
+      return { error: coordError }
+    }
+
+    const parsedCoord = parseStage3CoordinationSynthesisResponse(coordResult)
+    if (parsedCoord.error || !parsedCoord.coordinationLayer) {
+      const parseError = parsedCoord.error || 'Coordination synthesis parse failed.'
+      console.log('[Stage3 API] coordination failed')
+      setGenError(parseError)
+      setGeneration(g => ({
+        ...(g || {}),
+        active:     false,
+        failedStep: 'coordination',
+        error:      parseError,
+      }))
+      setIsGenerating(false)
+      return { error: parseError }
+    }
+
+    console.log('[Stage3 API] coordination complete')
+    const coordination = parsedCoord.coordinationLayer
+    const note         = parsedCoord.summaryNote
+
+    setGeneration(g => ({
+      ...(g || {}),
+      coordinationLayer: coordination,
+      summaryNote:       note,
+    }))
+
+    // Learning signals — heuristic only, synchronous, never blocks save
+    const learningSignals = deriveLearningSignals({
+      stage:          'Stage 3',
+      source:         'ai',
+      prompt:         refinementPrompt,
+      impactSummary:  impactSummary || (refinementPrompt
+        ? 'Regenerated Stage 3 with BU-first AI orchestration'
+        : 'Generated Stage 3 with BU-first AI orchestration'),
       refinementType: refinementPrompt ? 'stage' : null,
-      structuralImpact,
-      refinementClassification,
-      beforeAfterSummary: 'Stage 3 generated through coordination-layer plus per-business-unit execution-plan calls, then assembled into one stage-level revision.',
-      stalenessEvents: [],
-    }, source === 'ai')
+      structuralImpact: 'none',
+      stalenessEvents:  [],
+    })
 
     const nextNum = stage3Revisions.length + 1
     const record  = buildStage3RevisionRecord({
-      executionPlans:        plans,
-      summaryNote:           note,
-      coordinationLayer:     coordination,
-      revisionNumber:        nextNum,
+      executionPlans:         completedPlans,
+      summaryNote:            note,
+      coordinationLayer:      coordination,
+      revisionNumber:         nextNum,
       sourceBasisRevisionId:  stage1ActiveId,
       sourceStage2RevisionId: stage2ActiveId,
-      source,
-      prompt:        refinementPrompt,
-      impactSummary: impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via ${source === 'ai' ? AI_MODEL_LABEL + ' chunked orchestration' : 'mock generator'}.`,
-      refinementType: refinementPrompt ? 'stage' : null,
-      affectedUnit:   null,
-      structuralImpact,
-      refinementClassification,
+      source:                 'ai',
+      prompt:                 refinementPrompt,
+      impactSummary:          impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via ${AI_MODEL_LABEL} BU-first orchestration.`,
+      refinementType:         refinementPrompt ? 'stage' : null,
+      affectedUnit:           null,
+      structuralImpact:       'none',
+      refinementClassification: null,
       learningSignals,
     })
 

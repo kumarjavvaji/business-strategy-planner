@@ -307,12 +307,11 @@ export function parseStage3CoordinationResponse(rawText, fallbackUnits = []) {
   }
 }
 
-export function buildStage3BusinessUnitMessages(stage1Snapshot, stage2Snapshot, unit, coordinationLayer, refinement = {}) {
-  const otherUnits = (stage2Snapshot?.businessUnits || [])
-    .filter(u => u.name !== unit?.name && u.name !== unit?.sourceStage2Name)
-    .map(u => `- ${u.name}: ${u.purpose || u.strategicInvolvement || ''}`)
-    .join('\n')
-  const coordinationSummary = JSON.stringify(coordinationLayer || {}, null, 2)
+export function buildStage3BusinessUnitMessages(stage1Snapshot, stage2Snapshot, unit, refinement = {}) {
+  const otherUnitNames = (stage2Snapshot?.businessUnits || [])
+    .filter(u => u.name !== (unit?.name || unit?.sourceStage2Name))
+    .map(u => u.name)
+    .join(', ')
   const refinementBlock = refinement?.prompt
     ? `\nRelevant refinement: ${refinement.prompt}\nImpact summary: ${refinement.impactSummary || 'none'}`
     : ''
@@ -334,11 +333,8 @@ ${stage1Summary(stage1Snapshot)}
 Business unit to generate:
 ${businessUnitSummary(unit)}
 
-Other units for dependency awareness:
-${otherUnits || 'none'}
-
-Coordination layer:
-${coordinationSummary}
+Other business unit names (for dependency awareness only):
+${otherUnitNames || 'none'}
 ${refinementBlock}
 
 Generate one domain-specific execution plan for "${unit?.name || unit?.sourceStage2Name}".`
@@ -349,6 +345,83 @@ Generate one domain-specific execution plan for "${unit?.name || unit?.sourceSta
       { role: 'user', content: userPrompt },
     ],
     systemPrompt,
+  }
+}
+
+// ── Coordination synthesis (BU-first: runs after all BU plans complete) ───────
+
+function buPlanBriefSummary(plan) {
+  const risks    = (plan.risks || []).slice(0, 2).join('; ')
+  const deps     = (plan.crossFunctionalDependencies || []).slice(0, 2).join('; ')
+  const unknowns = (plan.unresolvedUnknowns || []).slice(0, 2).join('; ')
+  return `${plan.buName}: exec_risk=${plan.executionRisk} readiness=${plan.organizationalReadiness} mission="${(plan.mission || '').slice(0, 100)}" top_deps=[${deps}] top_risks=[${risks}] top_unknowns=[${unknowns}]`
+}
+
+export function buildStage3CoordinationSynthesisMessages(stage1Snapshot, completedPlans, refinement = {}) {
+  const s1Context  = stage1Summary(stage1Snapshot)
+  const buSummaries = completedPlans
+    .map((plan, i) => `${i + 1}. ${buPlanBriefSummary(plan)}`)
+    .join('\n')
+  const refinementBlock = refinement?.prompt
+    ? `\nRefinement context: ${refinement.prompt}\nImpact: ${refinement.impactSummary || 'none'}`
+    : ''
+
+  const systemPrompt = `You are synthesizing a cross-functional coordination layer from completed per-BU execution plans.
+
+Do NOT generate BU execution plans. Synthesize only cross-BU coordination.
+
+Return ONLY JSON:
+{
+  "coordinationLayer": {
+    "executionSummary": "string — 2-sentence overall execution posture",
+    "sequencingOverview": "string — which BUs must sequence before others and why",
+    "dependencyCoordinationMap": ["string — specific cross-BU dependency with owning BU"],
+    "governanceModel": ["string — governance checkpoint or decision authority"],
+    "organizationalBottlenecks": ["string — specific bottleneck with owning BU"],
+    "sharedRisks": ["string — risk shared across 2+ BUs"],
+    "sharedUnknowns": ["string — unresolved question blocking multiple BUs"],
+    "operationalReadinessOverview": "string — honest cross-BU readiness assessment",
+    "crossFunctionalSuccessMetrics": ["string — metric requiring multiple BUs"],
+    "escalationDecisionOwnership": ["string — who escalates what, explicitly"],
+    "criticalExecutionPath": ["string — ordered steps on the critical path"],
+    "parallelizableWorkstreams": ["string — BU workstreams that can run concurrently"],
+    "confidenceReadinessAssessment": "string — overall confidence and readiness assessment"
+  },
+  "summaryNote": "string — 2-sentence executive execution posture note"
+}`
+
+  const userPrompt = `Stage 1 summary:
+${s1Context}
+
+Completed BU execution plan summaries (${completedPlans.length} units):
+${buSummaries}
+${refinementBlock}
+
+Synthesize the cross-functional coordination layer. Do not repeat or generate BU plans.`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt   },
+    ],
+    systemPrompt,
+  }
+}
+
+export function parseStage3CoordinationSynthesisResponse(rawText) {
+  const { parsed, error } = parseJsonObject(rawText)
+  if (error) return { coordinationLayer: null, summaryNote: '', error }
+  if (!parsed?.coordinationLayer) {
+    return {
+      coordinationLayer: null,
+      summaryNote: '',
+      error: 'Response did not contain a coordinationLayer object.',
+    }
+  }
+  return {
+    coordinationLayer: normaliseCoordinationLayer(parsed.coordinationLayer),
+    summaryNote:       safeStr(parsed.summaryNote),
+    error:             null,
   }
 }
 
