@@ -617,6 +617,105 @@ export function parseBUSectionResponse(sectionKey, rawText) {
 
 // Client-side assembly — no AI call needed.
 // Maps structure core + completed section outputs into one normalisePlan-compatible object.
+function valueToText(value) {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value.map(valueToText).join('; ')
+  if (typeof value === 'object') return Object.values(value).map(valueToText).join('; ')
+  return String(value)
+}
+
+export function buildStage3ExecutionAtomMessages(stage1Snapshot, s2Unit, handoffItem, generationMode, otherUnitNames) {
+  const planningContext = s2Unit?.stage3PlanningContext || {}
+  const sectionName = safeStr(handoffItem?.label || handoffItem?.elementName || handoffItem?.key || 'Execution section')
+  const handoffContext = safeStr(handoffItem?.detail || handoffItem?.text || valueToText(handoffItem?.parsedValue))
+  const modeNote = generationMode === 'full'
+    ? 'Use the complete Stage 2 handoff context to generate a full execution section.'
+    : generationMode === 'stage1_2_only'
+      ? 'Generate a limited Stage 1/2-only draft section. Be explicit about assumptions caused by missing handoff context.'
+      : 'Generate a limited section from partial or stale Stage 2 handoff context. Make missing context visible as constraints or unknowns.'
+
+  const systemPrompt = `You are generating ONE focused Stage 3 execution-plan atom for ONE business unit.
+
+This is not a whole BU plan. Generate only the execution section named below.
+
+The section must be domain-context specific, shaped by the Stage 2 handoff item and the BU's operating reality. Do not produce generic consultant prose.
+
+${modeNote}
+
+Return ONLY JSON:
+{
+  "sectionName": "string",
+  "objective": "string",
+  "executionStrategy": ["string"],
+  "decisionsRequired": ["string"],
+  "sequencingAndGates": ["string"],
+  "dependencies": ["string"],
+  "risks": ["string"],
+  "constraints": ["string"],
+  "unknowns": ["string"],
+  "validationReadinessChecks": ["string"],
+  "ownershipGovernance": ["string"],
+  "successIndicators": ["string"],
+  "failureSignals": ["string"],
+  "stage4DeliveryImplications": ["string"]
+}`
+
+  const userPrompt = `Stage 1 summary:
+${stage1Summary(stage1Snapshot)}
+
+Business unit:
+${businessUnitSummary(s2Unit)}
+
+Other business units:
+${otherUnitNames || 'none'}
+
+Stage 2 planning handoff:
+Domain of work: ${safeStr(planningContext.domainOfWork)}
+SME review lens: ${typeof planningContext.SMEReviewLens === 'string' ? safeStr(planningContext.SMEReviewLens) : safeStr(planningContext.SMEReviewLens?.summary || planningContext.SMEReviewLens?.reviewerProfile)}
+Handoff status: ${safeStr(planningContext.handoffStatus)}
+
+Execution atom to generate:
+Name: ${sectionName}
+Handoff detail:
+${handoffContext || 'No generated handoff detail is available; use Stage 1 and Stage 2 core context and mark assumptions clearly.'}
+
+Generate this one execution section for "${s2Unit?.name || s2Unit?.buName}".`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    systemPrompt,
+  }
+}
+
+export function parseStage3ExecutionAtomResponse(rawText) {
+  const { parsed, error } = parseJsonObject(rawText)
+  if (error) return { section: null, error }
+  if (!parsed) return { section: null, error: 'Empty execution atom response.' }
+  return {
+    section: {
+      sectionName: safeStr(parsed.sectionName || parsed.name),
+      objective: safeStr(parsed.objective),
+      executionStrategy: safeList(parsed.executionStrategy || parsed.strategy || parsed.actions),
+      decisionsRequired: safeList(parsed.decisionsRequired || parsed.decisions),
+      sequencingAndGates: safeList(parsed.sequencingAndGates || parsed.sequencing || parsed.gates),
+      dependencies: safeList(parsed.dependencies),
+      risks: safeList(parsed.risks),
+      constraints: safeList(parsed.constraints),
+      unknowns: safeList(parsed.unknowns || parsed.unresolvedUnknowns),
+      validationReadinessChecks: safeList(parsed.validationReadinessChecks || parsed.validation || parsed.readinessChecks),
+      ownershipGovernance: safeList(parsed.ownershipGovernance || parsed.governance || parsed.ownership),
+      successIndicators: safeList(parsed.successIndicators || parsed.successSignals || parsed.metrics),
+      failureSignals: safeList(parsed.failureSignals),
+      stage4DeliveryImplications: safeList(parsed.stage4DeliveryImplications || parsed.stage4Implications),
+    },
+    error: null,
+  }
+}
+
 export function assembleBUPlan(structure, sections) {
   const ws  = sections.workstreams  || {}
   const dep = sections.dependencies || {}

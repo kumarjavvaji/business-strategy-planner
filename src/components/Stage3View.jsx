@@ -20,6 +20,8 @@ import {
   buildBUSectionMessages,
   parseBUSectionResponse,
   assembleBUPlan,
+  buildStage3ExecutionAtomMessages,
+  parseStage3ExecutionAtomResponse,
   buildStage3CoordinationSynthesisMessages,
   parseStage3CoordinationSynthesisResponse,
   buildStage3UnitRefinementMessages,
@@ -33,6 +35,8 @@ import LearningSignals    from './LearningSignals'
 import RefinementPanel                    from './RefinementPanel'
 import { REFINEMENT_SCOPES }             from './Stage2View'
 import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
+import { ATOM_STATUSES, createGenerationAtom, summarizeAtoms } from '../utils/generationAtoms'
+import { runGenerationQueue } from '../utils/generationQueue'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -380,6 +384,108 @@ function orderBusinessUnitsForStage3(units, stage1Snapshot) {
     return score
   }
   return [...units].sort((a, b) => scoreUnit(a, units.indexOf(a)) - scoreUnit(b, units.indexOf(b)))
+}
+
+function buildExecutionAtomsForBU(unit, readiness, priorDraft, mode) {
+  const priorAtoms = priorDraft?.executionAtoms || []
+  const priorById = new Map(priorAtoms.map(atom => [atom.id, atom]))
+  const sourceItems = readiness.structureItems.map((item, idx) => {
+    const match = readiness.itemStates.find(state => (
+      state.key === item.key ||
+      state.key === String(idx) ||
+      state.key === item.label
+    ))
+    return {
+      ...item,
+      ...(match || {}),
+      elementName: item.label,
+      detail: match?.parsedValue ? listFromValue(match.parsedValue).join('; ') : item.text,
+    }
+  }).filter(item => mode === 'stage1_2_only' || item.parsedValue || item.text || item.status === 'complete')
+
+  const fallbackItems = [
+    { key: 'stage1_2_priorities', label: 'Stage 1/2 Execution Priorities', text: 'Draft from Stage 1 strategy and Stage 2 core BU responsibilities.' },
+    { key: 'stage1_2_dependencies', label: 'Stage 1/2 Dependencies and Constraints', text: 'Draft dependencies, constraints, and unknowns from Stage 2 core BU data.' },
+    { key: 'stage1_2_validation', label: 'Stage 1/2 Validation and Readiness', text: 'Draft validation needs, readiness checks, and success/failure signals from available source data.' },
+  ]
+
+  const items = sourceItems.length ? sourceItems : fallbackItems
+  return items.map((item, idx) => {
+    const id = `stage3:${storageSafeName(unit.name)}:${storageSafeName(item.key || item.label || idx)}`
+    return priorById.get(id) || createGenerationAtom({
+      id,
+      stage: 'stage3',
+      phase: 'executionPlanAtom',
+      parentId: unit.name,
+      businessUnitName: unit.name,
+      elementName: item.label || item.elementName || item.key,
+      childKey: item.key || String(idx),
+      status: ATOM_STATUSES.PENDING,
+      metadata: { handoffItem: item, generationMode: mode },
+    })
+  })
+}
+
+function assembleAtomizedBUPlan(unit, readiness, atoms, mode) {
+  const completedAtoms = atoms.filter(atom => atom.status === ATOM_STATUSES.COMPLETE && atom.parsedValue)
+  const failedAtoms = atoms.filter(atom => atom.status === ATOM_STATUSES.FAILED)
+  const pendingAtoms = atoms.filter(atom => ![ATOM_STATUSES.COMPLETE, ATOM_STATUSES.FAILED].includes(atom.status))
+  const sections = completedAtoms.map(atom => ({
+    ...atom.parsedValue,
+    atomId: atom.id,
+    sourceHandoffItem: atom.elementName,
+  }))
+  const flat = key => sections.flatMap(section => section[key] || [])
+  const planStatus = failedAtoms.length
+    ? (completedAtoms.length ? 'partial' : 'failed')
+    : pendingAtoms.length
+      ? 'partial'
+      : 'complete'
+
+  return {
+    buName: unit.name,
+    mission: unit.purpose || readiness.planningContext?.domainOfWork || '',
+    strategicRole: unit.strategicInvolvement || unit.purpose || '',
+    priorityOutcomes: sections.map(section => section.objective).filter(Boolean).slice(0, 5),
+    criticalWorkstreams: sections.map(section => section.sectionName).filter(Boolean),
+    executionSections: sections,
+    missingSections: pendingAtoms.map(atom => atom.elementName),
+    failedSections: failedAtoms.map(atom => ({ name: atom.elementName, error: atom.parserError })),
+    planStatus,
+    generationMode: mode,
+    sourceHandoffStatus: readiness.status,
+    handoffWarnings: mode === 'full'
+      ? []
+      : mode === 'stage1_2_only'
+        ? ['Generated without Stage 2 handoff context; review assumptions before coordination synthesis.']
+        : ['Generated from partial Stage 2 handoff context; missing or stale handoff elements may reduce specificity.'],
+    initiativesMissionCritical: flat('executionStrategy').slice(0, 5),
+    initiativesOptional: flat('decisionsRequired').slice(0, 4),
+    initiativesDeferred: [],
+    initiativesBlocked: flat('unknowns').slice(0, 4),
+    sequencingNarrative: flat('sequencingAndGates').slice(0, 3).join(' '),
+    keyMilestones: flat('sequencingAndGates').slice(0, 4),
+    crossFunctionalDependencies: flat('dependencies').slice(0, 6),
+    requiredCapabilities: flat('stage4DeliveryImplications').slice(0, 5),
+    staffingOwnership: flat('ownershipGovernance').slice(0, 5),
+    systemsTools: [],
+    governanceCadence: flat('ownershipGovernance').slice(0, 3),
+    decisionRights: flat('decisionsRequired').slice(0, 4),
+    risks: flat('risks').slice(0, 6),
+    constraints: flat('constraints').slice(0, 6),
+    unresolvedUnknowns: flat('unknowns').slice(0, 6),
+    assumptions: [],
+    leadingIndicators: flat('validationReadinessChecks').slice(0, 4),
+    keySuccessMetrics: flat('successIndicators').slice(0, 5),
+    failureSignals: flat('failureSignals').slice(0, 5),
+    readinessAssessment: planStatus === 'complete'
+      ? `${unit.name} has a complete atomized execution draft from ${completedAtoms.length} section${completedAtoms.length === 1 ? '' : 's'}.`
+      : `${unit.name} has a partial atomized execution draft; ${failedAtoms.length} failed and ${pendingAtoms.length} remain pending.`,
+    executionRisk: failedAtoms.length ? 'high' : mode === 'full' ? 'medium' : 'high',
+    dependencyComplexity: flat('dependencies').length > 4 ? 'high' : 'medium',
+    confidenceLevel: planStatus === 'complete' && mode === 'full' ? 'medium' : 'low',
+    organizationalReadiness: planStatus === 'complete' ? 'medium' : 'low',
+  }
 }
 
 // ── Scope selector (reuses Stage2View's REFINEMENT_SCOPES list) ──────────────
@@ -1399,6 +1505,39 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
               <BulletList items={plan.handoffWarnings} borderColor="rgba(251,146,60,.45)" />
             </div>
           )}
+          {plan.executionSections?.length > 0 && (
+            <PlanSection label="Atomized Execution Sections">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {plan.executionSections.map((section, sectionIdx) => (
+                  <div key={section.atomId || sectionIdx} style={{
+                    border: '1px solid var(--border)',
+                    borderRadius: 6,
+                    padding: '10px 11px',
+                    background: 'var(--s2)',
+                  }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text)', marginBottom: 5 }}>
+                      {section.sectionName || `Execution section ${sectionIdx + 1}`}
+                    </div>
+                    {section.objective && (
+                      <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 7 }}>
+                        {section.objective}
+                      </div>
+                    )}
+                    <TwoCol
+                      left={<PlanSection label="Execution Strategy" marginBottom={8}><BulletList items={section.executionStrategy} borderColor="rgba(59,130,246,.35)" /></PlanSection>}
+                      right={<PlanSection label="Validation / Readiness" marginBottom={8}><BulletList items={section.validationReadinessChecks} borderColor="rgba(0,229,180,.35)" /></PlanSection>}
+                      gap={12}
+                    />
+                    <TwoCol
+                      left={<PlanSection label="Dependencies" marginBottom={8}><BulletList items={section.dependencies} borderColor="rgba(139,92,246,.35)" /></PlanSection>}
+                      right={<PlanSection label="Risks / Unknowns" marginBottom={8}><BulletList items={[...(section.risks || []), ...(section.unknowns || [])]} borderColor="rgba(248,113,113,.35)" /></PlanSection>}
+                      gap={12}
+                    />
+                  </div>
+                ))}
+              </div>
+            </PlanSection>
+          )}
 
           {/* Mission */}
           {plan.mission && (
@@ -2167,7 +2306,7 @@ export default function Stage3View({
   }), [generation, activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage3Revisions.length, onSaveRevision])
 
   // ── Unit-level refinement ───────────────────────────────────────────────────
-  function persistBuPlanDraft(unit, plan, readiness, source) {
+  function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = []) {
     const now = new Date().toISOString()
     const draft = {
       version: STAGE3_DRAFT_PLAN_VERSION,
@@ -2175,6 +2314,8 @@ export default function Stage3View({
       sourceBasisRevisionId: stage1ActiveId,
       sourceStage2RevisionId: stage2ActiveId,
       plan,
+      executionAtoms,
+      atomSummary: summarizeAtoms(executionAtoms),
       planStatus: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_draft' : 'limited_draft',
       planGenerationMode: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_only' : 'limited',
       handoffStatus: readiness.status,
@@ -2208,83 +2349,81 @@ export default function Stage3View({
     setGenError(null)
 
     try {
+      const mode = readiness.completion === 'full'
+        ? 'full'
+        : readiness.completion === 'none'
+          ? 'stage1_2_only'
+          : 'limited'
+      const priorDraft = stage3DraftPlans[unit.name] || null
+      let atoms = buildExecutionAtomsForBU(unit, readiness, priorDraft, mode)
+
       if (!hasApiKey()) {
-        const mock = generateMockStage3(s1Snap, { ...activeStage2Rev.contentSnapshot, businessUnits: [enrichedUnit] })
-        const mockPlan = mock.executionPlans?.[0]
-        if (!mockPlan) throw new Error('Mock generator did not return a BU execution plan.')
-        const plan = {
-          ...mockPlan,
-          buName: unit.name,
-          planStatus: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_draft' : 'limited_draft',
-          generationContext: modeLabel,
-        }
-        persistBuPlanDraft(unit, plan, readiness, 'mock')
+        atoms = atoms.map(atom => ({
+          ...atom,
+          status: ATOM_STATUSES.COMPLETE,
+          parsedValue: {
+            sectionName: atom.elementName,
+            objective: `${unit.name} drafts ${atom.elementName} from available Stage 1/2 context.`,
+            executionStrategy: [atom.metadata?.handoffItem?.detail || atom.metadata?.handoffItem?.text || 'Use available strategy and BU context.'],
+            decisionsRequired: [],
+            sequencingAndGates: [],
+            dependencies: unit.dependencies || [],
+            risks: unit.risksAndUnknowns || [],
+            constraints: [],
+            unknowns: readiness.completion === 'none' ? ['Stage 2 handoff context has not been generated.'] : [],
+            validationReadinessChecks: unit.keySuccessMetrics || [],
+            ownershipGovernance: unit.keyResponsibilities || [],
+            successIndicators: unit.keySuccessMetrics || [],
+            failureSignals: [],
+            stage4DeliveryImplications: [],
+          },
+          completedAt: new Date().toISOString(),
+        }))
+        const plan = assembleAtomizedBUPlan(unit, readiness, atoms, mode)
+        persistBuPlanDraft(unit, plan, readiness, 'mock', atoms)
         setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null } }))
         return { error: null }
       }
 
-      let hasQueuedStage3Call = false
-      const callQueuedStage3AI = async (messages, options) => {
-        if (hasQueuedStage3Call) await sleep(STAGE3_QUEUE_DELAY_MS)
-        hasQueuedStage3Call = true
-        return callAI(messages, options)
-      }
-
-      console.log(`[Stage3 API] single BU structure start: ${unit.name}`)
-      const { messages: strMsgs } = buildBUStructureMessages(s1Snap, enrichedUnit, otherNames, {
-        prompt: readiness.completion === 'none'
-          ? 'Generate a limited draft from Stage 1 strategy basis and Stage 2 core business-unit data only. Make missing Stage 2 handoff context explicit as assumptions or unknowns.'
-          : readiness.completion === 'full'
-            ? 'Generate a full BU execution plan using the available Stage 2 handoff context.'
-            : 'Generate a limited draft using partial Stage 2 handoff context. Preserve warnings where handoff elements are missing or stale.',
-        impactSummary: `${modeLabel} BU execution-plan generation from readiness matrix.`,
+      const updatedAtoms = await runGenerationQueue({
+        atoms,
+        concurrency: 1,
+        delayMs: STAGE3_QUEUE_DELAY_MS,
+        retryFailedOnly: true,
+        onAtomUpdate: (atom, allAtoms) => {
+          const plan = assembleAtomizedBUPlan(unit, readiness, allAtoms, mode)
+          persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms)
+          setBuPlanGeneration(prev => ({
+            ...prev,
+            [unit.name]: { running: true, error: null, atomSummary: summarizeAtoms(allAtoms) },
+          }))
+        },
+        worker: async (atom) => {
+          console.log(`[Stage3 API] BU execution atom start: ${unit.name} / ${atom.elementName}`)
+          const { messages } = buildStage3ExecutionAtomMessages(
+            s1Snap,
+            enrichedUnit,
+            atom.metadata?.handoffItem || { key: atom.childKey, label: atom.elementName },
+            mode,
+            otherNames,
+          )
+          const response = await callAI(messages, { temperature: 0.3, maxTokens: 1300 })
+          if (response.error) {
+            const message = isRateLimitedAIResponse(response)
+              ? `Rate limited while generating ${unit.name} / ${atom.elementName}. Retry this atom after cooldown.`
+              : response.error
+            throw { message, rawResponseText: response.result || null, status: response.status, rateLimited: response.rateLimited }
+          }
+          const parsed = parseStage3ExecutionAtomResponse(response.result)
+          if (parsed.error || !parsed.section) {
+            throw { message: parsed.error || 'Execution atom parse failed.', rawResponseText: response.result || null }
+          }
+          return { rawResponseText: response.result, parsedValue: parsed.section }
+        },
       })
-      const strResponse = await callQueuedStage3AI(strMsgs, { temperature: 0.3, maxTokens: 900 })
-      if (strResponse.error) {
-        const err = isRateLimitedAIResponse(strResponse)
-          ? `Rate limited while generating ${unit.name}. Retry this BU after cooldown.`
-          : strResponse.error
-        throw new Error(err)
-      }
-      const parsedStr = parseBUStructureResponse(strResponse.result)
-      if (parsedStr.error || !parsedStr.structure) throw new Error(parsedStr.error || 'BU structure parse failed.')
 
-      const structure = parsedStr.structure
-      const sections = {}
-      const sectionTokens = { workstreams: 1400, lenses: 1200, risk: 1000 }
-      for (const sectionKey of structure.sections) {
-        console.log(`[Stage3 API] single BU section start: ${unit.name} / ${sectionKey}`)
-        const { messages: secMsgs } = buildBUSectionMessages(s1Snap, enrichedUnit, structure, sectionKey, otherNames, {
-          prompt: readiness.completion === 'none'
-            ? 'This is an explicitly requested Stage 1/2-only draft. Surface assumptions caused by missing Stage 2 handoff context.'
-            : readiness.completion === 'full'
-              ? 'Use the complete Stage 2 handoff context to generate a full execution section.'
-              : 'Use available partial handoff context and mark missing context as constraints or unknowns.',
-          impactSummary: `${modeLabel} BU execution-plan generation from readiness matrix.`,
-        })
-        const secResponse = await callQueuedStage3AI(secMsgs, { temperature: 0.3, maxTokens: sectionTokens[sectionKey] || 900 })
-        if (secResponse.error) {
-          const err = isRateLimitedAIResponse(secResponse)
-            ? `Rate limited while generating ${unit.name} / ${SECTION_LABELS[sectionKey] || sectionKey}. Retry this BU after cooldown.`
-            : secResponse.error
-          throw new Error(err)
-        }
-        const parsedSec = parseBUSectionResponse(sectionKey, secResponse.result)
-        if (parsedSec.error || !parsedSec.section) throw new Error(parsedSec.error || `${SECTION_LABELS[sectionKey] || sectionKey} parse failed.`)
-        sections[sectionKey] = parsedSec.section
-      }
-
-      const plan = {
-        ...assembleBUPlan(structure, sections),
-        planStatus: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_draft' : 'limited_draft',
-        generationContext: modeLabel,
-        handoffWarnings: readiness.completion === 'full'
-          ? []
-          : readiness.completion === 'none'
-            ? ['Generated without Stage 2 handoff context; review assumptions before coordination synthesis.']
-            : ['Generated from partial Stage 2 handoff context; missing or stale handoff elements may reduce specificity.'],
-      }
-      persistBuPlanDraft(unit, plan, readiness, 'ai')
+      const plan = assembleAtomizedBUPlan(unit, readiness, updatedAtoms, mode)
+      persistBuPlanDraft(unit, plan, readiness, 'ai', updatedAtoms)
       setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null } }))
       return { error: null }
     } catch (err) {
@@ -2418,7 +2557,7 @@ export default function Stage3View({
           onStage2Action={handleStage2HandoffAction}
           apiMode={apiMode}
           disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
-          generationEnabled={false}
+          generationEnabled
         />
         <div style={{
           background: 'var(--surface)', border: '1px solid var(--border)',
@@ -2558,7 +2697,7 @@ export default function Stage3View({
         onStage2Action={handleStage2HandoffAction}
         apiMode={apiMode}
         disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
-        generationEnabled={false}
+        generationEnabled
       />
 
       {/* ── Staleness banner ──────────────────────────────────────────────── */}
