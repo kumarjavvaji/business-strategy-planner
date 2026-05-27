@@ -75,6 +75,101 @@ function SubList({ label, items, borderColor }) {
   )
 }
 
+function Stage3HandoffShell() {
+  const [open, setOpen] = useState(false)
+  const disabledButtonStyle = {
+    fontSize: 8,
+    fontFamily: 'var(--fm)',
+    fontWeight: 600,
+    padding: '4px 8px',
+    borderRadius: 4,
+    cursor: 'not-allowed',
+    background: 'var(--surface)',
+    border: '1px solid var(--border)',
+    color: 'var(--muted)',
+    opacity: 0.58,
+  }
+  const placeholder = 'Not generated yet'
+  const Field = ({ label, value }) => (
+    <div style={{
+      padding: '7px 9px',
+      border: '1px solid var(--border)',
+      borderRadius: 4,
+      background: 'rgba(255,255,255,.015)',
+    }}>
+      <div style={{
+        fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+        textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3,
+      }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+        {value || placeholder}
+      </div>
+    </div>
+  )
+
+  return (
+    <div style={{
+      marginTop: 10,
+      borderTop: '1px solid var(--border)',
+      paddingTop: 10,
+    }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          width: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 10,
+          fontSize: 9,
+          fontFamily: 'var(--fm)',
+          fontWeight: 600,
+          padding: '6px 9px',
+          borderRadius: 5,
+          cursor: 'pointer',
+          background: open ? 'rgba(59,130,246,.08)' : 'var(--s2)',
+          border: `1px solid ${open ? 'rgba(59,130,246,.28)' : 'var(--border)'}`,
+          color: open ? 'var(--accent)' : 'var(--muted)',
+        }}
+      >
+        <span>Stage 3 Planning Handoff</span>
+        <span style={{ fontSize: 8, color: 'var(--muted)' }}>{open ? '▲' : '▼'}</span>
+      </button>
+
+      {open && (
+        <div style={{
+          marginTop: 8,
+          padding: '10px 11px',
+          background: 'rgba(59,130,246,.035)',
+          border: '1px solid rgba(59,130,246,.14)',
+          borderRadius: 6,
+        }}>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr 1fr',
+            gap: 8,
+            marginBottom: 9,
+          }}>
+            <Field label="domainOfWork" />
+            <Field label="SMEReviewLens" />
+            <Field label="handoffStructure" />
+            <Field label="handoffItems" />
+            <Field label="handoffStatus" value="Not started" />
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            <button disabled style={disabledButtonStyle}>Generate handoff structure</button>
+            <button disabled style={disabledButtonStyle}>Generate SME lens</button>
+            <button disabled style={disabledButtonStyle}>Generate handoff item</button>
+            <button disabled style={disabledButtonStyle}>Assemble BU handoff</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 async function collectStage2LearningSignals(context, useAI) {
   const heuristic = deriveLearningSignals({ stage: 'Stage 2', ...context })
   if (!useAI) return heuristic
@@ -231,6 +326,8 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
             <SubList label="Risks & Unknowns"     items={bu.risksAndUnknowns}    borderColor="rgba(248,113,113,.45)" />
             <SubList label="Key Success Metrics"  items={bu.keySuccessMetrics}   borderColor="rgba(0,229,180,.4)"   />
           </div>
+
+          <Stage3HandoffShell />
 
           {/* ── Unit-level refinement panel ───────────────────────────────── */}
           <div style={{
