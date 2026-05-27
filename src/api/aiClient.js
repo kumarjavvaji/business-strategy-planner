@@ -45,7 +45,7 @@ export function getApiMode() {
  *
  * @param {Array<{ role: 'system'|'user'|'assistant', content: string }>} messages
  * @param {{ model?: string, temperature?: number, maxTokens?: number, timeoutMs?: number }} options
- * @returns {Promise<{ result: string|null, error: string|null, status?: number, rateLimited?: boolean }>}
+ * @returns {Promise<{ result: string|null, error: string|null, status?: number, rateLimited?: boolean, stopReason?: string }>}
  */
 export async function callAI(messages, options = {}) {
   const key = import.meta.env.VITE_ANTHROPIC_API_KEY
@@ -116,8 +116,8 @@ export async function callAI(messages, options = {}) {
 
     // Anthropic response shape: { content: [{ type: 'text', text: '...' }] }
     const text = data?.content?.find?.(c => c.type === 'text')?.text ?? null
-    if (!text) return { result: null, error: 'Anthropic API returned an empty response.' }
-    return { result: text, error: null }
+    if (!text) return { result: null, error: 'Anthropic API returned an empty response.', stopReason: data?.stop_reason }
+    return { result: text, error: null, stopReason: data?.stop_reason }
 
   } catch (err) {
     clearTimeout(timer)

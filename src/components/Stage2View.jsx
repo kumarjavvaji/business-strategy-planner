@@ -240,12 +240,12 @@ function SmeLensValue({ value }) {
   if (typeof value === 'object') {
     const sections = [
       { key: 'summary',               label: null,                     list: false },
-      { key: 'reviewerProfile',        label: 'Reviewer profile',       list: false },
-      { key: 'decisionAuthority',      label: 'Decision authority',     list: false },
-      { key: 'challengeAreas',         label: 'Challenge areas',        list: true  },
-      { key: 'evidenceRequired',       label: 'Evidence required',      list: true  },
-      { key: 'operationalConcerns',    label: 'Operational concerns',   list: true  },
-      { key: 'planFailureConditions',  label: 'Plan failure conditions', list: true  },
+      { key: 'reviewerProfile',        label: 'Reviewer Profile',        list: false },
+      { key: 'decisionAuthority',      label: 'Decision Authority',      list: true  },
+      { key: 'challengeAreas',         label: 'Challenge Areas',         list: true  },
+      { key: 'evidenceRequired',       label: 'Evidence Required',       list: true  },
+      { key: 'operationalConcerns',    label: 'Operational Concerns',    list: true  },
+      { key: 'planFailureConditions',  label: 'Plan Failure Conditions', list: true  },
     ]
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
@@ -419,10 +419,19 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       completedThemes,
       otherBuNames,
     )
-    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+    const { result, error, stopReason } = await callAI(messages, { temperature: 0.3, maxTokens: 2300 })
 
     if (error) {
       setSmeLensState(prev => ({ ...prev, status: 'failed', rawResponse: result ?? null, parserError: error }))
+      return
+    }
+    if (stopReason === 'max_tokens') {
+      setSmeLensState(prev => ({
+        ...prev,
+        status: 'failed',
+        rawResponse: result ?? null,
+        parserError: 'SME lens generation exceeded token limit',
+      }))
       return
     }
 
@@ -465,10 +474,20 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       prompt,
       otherBuNames,
     )
-    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+    const { result, error, stopReason } = await callAI(messages, { temperature: 0.3, maxTokens: 2300 })
 
     if (error) {
       setSmeLensRefineUi(p => ({ ...p, busy: false, error }))
+      return
+    }
+    if (stopReason === 'max_tokens') {
+      setSmeLensState(prev => ({
+        ...prev,
+        status: prev.status || 'complete',
+        rawResponse: result ?? prev.rawResponse,
+        parserError: 'SME lens refinement exceeded token limit',
+      }))
+      setSmeLensRefineUi(prev => ({ ...prev, busy: false, error: 'SME lens refinement exceeded token limit' }))
       return
     }
 

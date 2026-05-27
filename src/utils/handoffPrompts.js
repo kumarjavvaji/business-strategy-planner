@@ -551,6 +551,30 @@ export function buildSmeLensMessages(stage1Snapshot, bu, domainOfWork, handoffSt
     ? `\nHandoff Items Generated (themes): ${completedLabels.join(', ')}`
     : ''
 
+  const readableRubricPrompt = `
+
+UPDATED SME LENS FORMAT REQUIREMENTS:
+Return SMEReviewLens as structured JSON:
+{
+  "SMEReviewLens": {
+    "summary": "1 sentence",
+    "reviewerProfile": "short paragraph",
+    "decisionAuthority": ["bullet", "bullet", "bullet"],
+    "challengeAreas": ["bullet", "bullet", "bullet", "bullet"],
+    "evidenceRequired": ["bullet", "bullet", "bullet", "bullet"],
+    "operationalConcerns": ["bullet", "bullet", "bullet", "bullet"],
+    "planFailureConditions": ["bullet", "bullet", "bullet", "bullet"]
+  }
+}
+
+Readable style rules:
+- Avoid long compound sentences.
+- Prefer short paragraphs and bullets.
+- Preserve detail, but separate ideas clearly.
+- Each bullet should make one review point.
+- Do not collapse the lens into a short label.
+- Do not produce prose outside JSON.`
+
   const systemPrompt = `You are a strategic planning analyst preparing a Stage 3 execution planning handoff.
 
 Identify the SME Review Lens for this business unit — a detailed description of who should review Stage 3 execution plans for this BU, what they own, what they would challenge, and what evidence they need.
@@ -584,7 +608,7 @@ Generate the SME Review Lens for ${bu.name}. Return only the JSON object.`
 
   return {
     messages: [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemPrompt + readableRubricPrompt },
       { role: 'user',   content: userPrompt   },
     ],
   }
@@ -649,7 +673,21 @@ export function parseSmeLensResponse(rawText) {
   // Structured object
   if (typeof raw === 'object') {
     if (raw.summary || raw.reviewerProfile || raw.challengeAreas) {
-      return { parsedValue: raw, error: null }
+      const toList = value => Array.isArray(value)
+        ? value.map(v => String(v ?? '').trim()).filter(Boolean)
+        : (typeof value === 'string' && value.trim() ? [value.trim()] : [])
+      return {
+        parsedValue: {
+          summary: typeof raw.summary === 'string' ? raw.summary.trim() : '',
+          reviewerProfile: typeof raw.reviewerProfile === 'string' ? raw.reviewerProfile.trim() : '',
+          decisionAuthority: toList(raw.decisionAuthority),
+          challengeAreas: toList(raw.challengeAreas),
+          evidenceRequired: toList(raw.evidenceRequired),
+          operationalConcerns: toList(raw.operationalConcerns),
+          planFailureConditions: toList(raw.planFailureConditions),
+        },
+        error: null,
+      }
     }
     // Unknown shape — extract any string values
     const text = Object.values(raw).filter(v => typeof v === 'string').join('\n').trim()
@@ -699,6 +737,18 @@ Rules:
 - Apply targeted changes only — do not rewrite content the instruction does not address
 - Be specific to this BU, its strategic role, and the company context`
 
+  const readabilityRefinementRules = `
+
+UPDATED READABILITY RULES:
+- Prefer the structured SMEReviewLens object with summary, reviewerProfile, decisionAuthority, challengeAreas, evidenceRequired, operationalConcerns, and planFailureConditions.
+- decisionAuthority, challengeAreas, evidenceRequired, operationalConcerns, and planFailureConditions should be arrays of bullets.
+- Avoid long compound sentences.
+- Preserve existing substance and detail.
+- Split long sentences into clearer sections.
+- Convert dense clauses into bullets.
+- Do not shorten aggressively unless the user explicitly asks for shortening.
+- Do not produce prose outside JSON.`
+
   const userMsg = `Stage 1 Strategy Basis:
 ${stage1Context}
 
@@ -717,7 +767,7 @@ Return only the updated JSON object.`
 
   return {
     messages: [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemPrompt + readabilityRefinementRules },
       { role: 'user',   content: userMsg       },
     ],
   }
