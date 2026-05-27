@@ -24,7 +24,7 @@ import {
 import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageSnapshots'
 import {
   buildHandoffStructureMessages, parseHandoffStructureResponse,
-  buildHandoffItemMessages, parseHandoffItemResponse,
+  parseHandoffItemResponse,
   buildHandoffChildAtomMessages, parseHandoffChildAtomResponse,
   buildHandoffItemRefinementMessages,
   buildHandoffChildAtomRefinementMessages,
@@ -174,30 +174,98 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
 
   async function handleGenerateItem(i, structureItem) {
     if (!activeStage1Rev || !parsed) return
-    patchItem(i, { status: 'generating', parserError: null, rawResponse: null })
 
-    const { messages } = buildHandoffItemMessages(
-      activeStage1Rev.contentSnapshot,
-      bu,
-      parsed.domainOfWork,
-      parsed.smeLens || null,
-      structureItem,
-      otherBuNames,
-    )
-    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1200 })
+    // Reset item and initialise child atoms — decomposition is the primary path
+    patchItem(i, {
+      status: 'generating',
+      isDecomposed: true,
+      assembledFromChildren: false,
+      parsedValue: null,
+      parserError: null,
+      rawResponse: null,
+      childAtoms: Object.fromEntries(CHILD_ATOM_KEYS.map(k => [k, { ...CHILD_ATOM_STATE_DEFAULT }])),
+      missingChildren: [],
+      failedChildren: [],
+    })
 
-    if (error) {
-      patchItem(i, { status: 'failed', parserError: error, rawResponse: result ?? null })
+    // Track each child result locally so assembly doesn't read stale React state
+    const localResults = {}
+
+    async function runOne(childKey) {
+      patchChildAtom(i, childKey, { status: 'generating', parserError: null, rawResponse: null })
+
+      const { messages } = buildHandoffChildAtomMessages(
+        activeStage1Rev.contentSnapshot,
+        bu,
+        parsed.domainOfWork,
+        parsed.smeLens || null,
+        structureItem,
+        childKey,
+        otherBuNames,
+      )
+      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+
+      if (error) {
+        patchChildAtom(i, childKey, { status: 'failed', parserError: error, rawResponse: result ?? null })
+        localResults[childKey] = { status: 'failed' }
+        return
+      }
+
+      const p = parseHandoffChildAtomResponse(result, childKey)
+      if (p.error) {
+        patchChildAtom(i, childKey, { status: 'failed', rawResponse: result, parserError: p.error })
+        localResults[childKey] = { status: 'failed' }
+        return
+      }
+
+      patchChildAtom(i, childKey, { status: 'complete', rawResponse: result, parsedValue: p.value, parserError: null })
+      localResults[childKey] = { status: 'complete', parsedValue: p.value }
+    }
+
+    // Bounded concurrency — process CHILD_ATOM_KEYS in pairs
+    const CONCURRENCY = 2
+    for (let j = 0; j < CHILD_ATOM_KEYS.length; j += CONCURRENCY) {
+      await Promise.all(CHILD_ATOM_KEYS.slice(j, j + CONCURRENCY).map(runOne))
+    }
+
+    // Assemble from local results (avoids reading stale React state)
+    const assembledValue = {}
+    const missingChildren = []
+    const failedChildren  = []
+
+    CHILD_ATOM_KEYS.forEach(key => {
+      const r = localResults[key]
+      if (r?.status === 'complete' && r.parsedValue !== null) {
+        assembledValue[key] = r.parsedValue
+      } else if (r?.status === 'failed') {
+        failedChildren.push(key)
+      } else {
+        missingChildren.push(key)
+      }
+    })
+
+    if (!Object.keys(assembledValue).length) {
+      patchItem(i, { status: 'failed', parserError: 'All child atoms failed to generate.' })
       return
     }
 
-    const p = parseHandoffItemResponse(result)
-    if (p.error) {
-      patchItem(i, { status: 'failed', rawResponse: result, parserError: p.error })
-      return
-    }
+    const isPartial = missingChildren.length > 0 || failedChildren.length > 0
 
-    patchItem(i, { status: 'complete', rawResponse: result, parsedValue: { key: p.key, value: p.value }, parserError: null })
+    const derivedKey = structureItem
+      .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
+      .split(/\s+/)
+      .map((w, idx) => idx === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1))
+      .join('')
+
+    if (!isPartial) setDecompositionOpen(prev => ({ ...prev, [i]: false }))
+
+    patchItem(i, {
+      status: isPartial ? 'partial' : 'complete',
+      assembledFromChildren: true,
+      parsedValue: { key: derivedKey, value: assembledValue },
+      missingChildren,
+      failedChildren,
+    })
   }
 
   // ── Child atom helpers ──────────────────────────────────────────────────────
@@ -219,15 +287,6 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
           },
         },
       }
-    })
-  }
-
-  function handleDecomposeItem(i) {
-    patchItem(i, {
-      isDecomposed: true,
-      childAtoms: Object.fromEntries(
-        CHILD_ATOM_KEYS.map(k => [k, { ...CHILD_ATOM_STATE_DEFAULT }])
-      ),
     })
   }
 
@@ -558,8 +617,12 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                       iState.status === 'complete' ? '#00e5b4'        :
                       canGenItem                   ? 'var(--accent)'  : 'var(--muted)'
 
+                    const genDoneCount = isGenItem && iState.childAtoms
+                      ? Object.values(iState.childAtoms).filter(cs => cs?.status === 'complete' || cs?.status === 'failed').length
+                      : null
+
                     const btnLabel =
-                      isGenItem                                        ? 'Generating…'       :
+                      isGenItem                                        ? `Generating… ${genDoneCount !== null ? `(${genDoneCount}/${CHILD_ATOM_KEYS.length})` : ''}`.trim() :
                       iState.status === 'complete' || isPartial       ? '↻ Regenerate item' :
                       iState.status === 'failed'                       ? 'Retry item'        :
                                                                          'Generate item'
@@ -703,19 +766,6 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                                 {iState.rawResponse}
                               </pre>
                             )}
-                            {!iState.isDecomposed && (
-                              <button
-                                onClick={() => handleDecomposeItem(i)}
-                                style={{
-                                  marginTop: 6, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
-                                  padding: '3px 8px', borderRadius: 3, cursor: 'pointer',
-                                  background: 'rgba(139,92,246,.1)', border: '1px solid rgba(139,92,246,.3)',
-                                  color: '#a78bfa',
-                                }}
-                              >
-                                Decompose failed item
-                              </button>
-                            )}
                           </div>
                         )}
 
@@ -731,7 +781,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                               color: 'var(--muted)',
                             }}
                           >
-                            {decompositionOpen[i] ? '▲ Hide decomposition details' : '▼ Show decomposition details'}
+                            {decompositionOpen[i] ? '▲ Hide generation details' : '▼ Show generation details'}
                           </button>
                         )}
 
@@ -747,7 +797,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                               fontSize: 8, fontFamily: 'var(--fm)', color: 'rgba(167,139,250,.8)',
                               textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 7,
                             }}>
-                              Fallback decomposition
+                              Generation details
                             </div>
 
                             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
