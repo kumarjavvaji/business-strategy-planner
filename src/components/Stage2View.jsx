@@ -19,6 +19,7 @@ import {
   buildStage2UnitRefinementMessages,
   parseStage2UnitResponse,
   buildStage2StageRefinementMessages,
+  orderBusinessUnits,
 } from '../utils/stage2Prompts'
 import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
@@ -393,7 +394,7 @@ export default function Stage2View({
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev     = stage2Revisions.find(r => r.id === stage2ActiveId) ?? null
-  const businessUnits = activeRev?.contentSnapshot?.businessUnits || []
+  const businessUnits = orderBusinessUnits(activeRev?.contentSnapshot?.businessUnits || [])
   const summaryNote   = activeRev?.contentSnapshot?.summaryNote   || ''
 
   // Staleness: latest Stage 2 rev was generated from a different Stage 1 rev
@@ -645,7 +646,7 @@ export default function Stage2View({
       }}>
         <div style={{ flex: 1, minWidth: 200 }}>
           <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>
-            Business Unit Mapping
+        Organisational Capability Mapping
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <Badge color={srcLbl.color}>{srcLbl.text}</Badge>
@@ -758,7 +759,7 @@ export default function Stage2View({
             textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8,
             display: 'flex', alignItems: 'center', gap: 8,
           }}>
-            Business Units
+            Organisational Capabilities
             <span style={{
               padding: '1px 6px', borderRadius: 3,
               background: 'var(--s2)', border: '1px solid var(--border)',
@@ -903,12 +904,12 @@ function EmptyState({
     }}>
       <div style={{ fontSize: 24, opacity: .18, marginBottom: 16, lineHeight: 1 }}>⬡</div>
       <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
-        Business Unit Mapping
+            Organisational Capability Mapping
       </div>
       <div style={{ fontSize: 11, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.7, maxWidth: 420, margin: '0 auto 24px' }}>
         {apiMode === 'ai'
-          ? 'Generate an AI-inferred business-unit structure from the active Stage 1 strategy basis.'
-          : 'Generate a mock business-unit structure from the active Stage 1 strategy basis. Add VITE_ANTHROPIC_API_KEY to .env.local and restart the dev server for AI generation.'}
+          ? 'Generate an AI-inferred organisational capability map from the active Stage 1 strategy basis.'
+          : 'Generate a mock organisational capability map from the active Stage 1 strategy basis. Add VITE_ANTHROPIC_API_KEY to .env.local and restart the dev server for AI generation.'}
       </div>
 
       {!activeStage1Rev && (

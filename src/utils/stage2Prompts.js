@@ -29,6 +29,54 @@ function safeStructuralImpact(value) {
   return STRUCTURAL_IMPACTS.has(value) ? value : 'none'
 }
 
+const ORDER_BUCKETS = [
+  { rank: 10, patterns: ['executive', 'leadership', 'strategy', 'steering', 'board', 'governance', 'transformation office', 'corporate strategy'] },
+  { rank: 20, patterns: ['compliance', 'regulatory', 'legal', 'risk', 'audit', 'privacy', 'security governance'] },
+  { rank: 30, patterns: ['product', 'capability strategy', 'architecture', 'technology', 'engineering', 'infrastructure', 'platform', 'data', 'analytics', 'model'] },
+  { rank: 40, patterns: ['delivery', 'operations', 'managed service', 'managed services', 'implementation', 'client enablement', 'customer success', 'support', 'service'] },
+  { rank: 45, patterns: ['consulting', 'advisory', 'advisor', 'field', 'frontline', 'consultant', 'client advisory', 'advisory delivery'] },
+  { rank: 60, patterns: ['sales', 'channel', 'business development', 'gtm', 'go-to-market'] },
+  { rank: 70, patterns: ['marketing', 'communications', 'brand', 'positioning'] },
+  { rank: 80, patterns: ['finance', 'commercial operations', 'commercial', 'people', 'hr', 'partnership', 'ecosystem', 'procurement'] },
+]
+
+function inferOrgOrder(unit) {
+  const text = [
+    unit?.name,
+    unit?.purpose,
+    unit?.strategicInvolvement,
+    ...(unit?.keyResponsibilities || []),
+  ].join(' ').toLowerCase()
+
+  for (const bucket of ORDER_BUCKETS) {
+    if (bucket.patterns.some(pattern => text.includes(pattern))) return bucket.rank
+  }
+  return 90
+}
+
+export function orderBusinessUnits(units) {
+  return (units || [])
+    .map((unit, index) => ({
+      ...unit,
+      orgOrder: Number.isFinite(unit.orgOrder) ? unit.orgOrder : inferOrgOrder(unit),
+      originalIndex: index,
+    }))
+    .sort((a, b) => (a.orgOrder - b.orgOrder) || (a.originalIndex - b.originalIndex))
+    .map(({ originalIndex, ...unit }) => unit)
+}
+
+const STAGE2_ORG_PHILOSOPHY = `
+
+STAGE 2 ORGANISATIONAL PHILOSOPHY:
+- Stage 2 is organisational capability mapping derived from strategic intent.
+- It should feel stable, structural, organisational, capability-oriented, and top-down.
+- It should focus on ownership, strategic purpose, dependencies, capability scope, governance role, and involvement level.
+- It should not become rollout orchestration, implementation sequencing, operational urgency management, or detailed execution pressure planning.
+- Integrate refinements proportionally into the broader organisational map; do not let one localized refinement reorder or dominate the whole structure.
+- Reserve sequencing, operational pressure, milestone orchestration, implementation pacing, and readiness coordination for Stage 3.
+- Order units by structural operating flow: executive/strategy/governance; regulatory/compliance/risk; product/architecture/technology; delivery/operations/client enablement; sales/GTM/marketing; supporting functions.
+`
+
 // ── AI prompt builder ─────────────────────────────────────────────────────────
 
 /**
@@ -39,15 +87,27 @@ function safeStructuralImpact(value) {
 export function buildStage2Messages(stage1Snapshot) {
   const context = stageSnapshotToText(stage1Snapshot)
 
-  const systemPrompt = `You are a strategic business analyst specialising in mapping corporate strategy to organisational execution.
+  const systemPrompt = `You are a strategic business analyst specialising in organisational capability mapping.
 
-Your task: Given a Stage 1 Strategy Basis document, infer the business unit structure and organisational involvement required to execute that strategy.
+Your task: Given a Stage 1 Strategy Basis document, infer the stable organisational capability map implied by the strategy.
+
+Stage 2 is an organisational mapping layer, not an execution plan. It should answer:
+- what organisational capabilities exist
+- why they exist
+- what they own
+- how they interact
+- what strategic role they play
 
 Draw on:
 - The explicit strategic context, thesis, opportunity, and key decisions provided
 - Comparable operating models for companies of this type and scale in this industry
 - Standard business function coverage matched to the identified business model
-- The specific execution needs implied by the investment posture and risks
+- The durable ownership, governance, and capability needs implied by the investment posture and risks
+
+Avoid:
+- rollout sequencing, implementation pacing, milestone orchestration, and operational urgency language
+- detailed execution choreography better suited to Stage 3
+- over-centering one localized refinement at the expense of the broader operating model
 
 Return ONLY a valid JSON object — no markdown, no prose, no code fences. Exact schema:
 
@@ -61,7 +121,8 @@ Return ONLY a valid JSON object — no markdown, no prose, no code fences. Exact
       "keyResponsibilities": ["string", "..."],
       "dependencies": ["string — other units, systems, or external parties this unit depends on", "..."],
       "risksAndUnknowns": ["string", "..."],
-      "keySuccessMetrics": ["string", "..."]
+      "keySuccessMetrics": ["string", "..."],
+      "orgOrder": "number - optional structural ordering hint; lower appears earlier"
     }
   ],
   "summaryNote": "string — 1–2 sentence executive note on the organisational model implied by this strategy"
@@ -78,11 +139,11 @@ Rules:
 
 ${context}
 
-Map the organisational involvement. Return only the JSON object.`
+Map the organisational capability structure. Return only the JSON object.`
 
   return {
     messages: [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemPrompt + STAGE2_ORG_PHILOSOPHY },
       { role: 'user',   content: userPrompt   },
     ],
     systemPrompt,
@@ -148,10 +209,11 @@ export function parseStage2Response(rawText) {
     dependencies:         safeList(u.dependencies),
     risksAndUnknowns:     safeList(u.risksAndUnknowns),
     keySuccessMetrics:    safeList(u.keySuccessMetrics),
+    orgOrder:             Number.isFinite(u.orgOrder) ? u.orgOrder : undefined,
   }))
 
   return {
-    businessUnits: normalised,
+    businessUnits: orderBusinessUnits(normalised),
     summaryNote:   safeStr(parsed.summaryNote),
     refinementClassification: safeStr(parsed.refinementClassification),
     structuralImpact: safeStructuralImpact(parsed.structuralImpact),
@@ -218,7 +280,7 @@ Regenerate the full Stage 2 business-unit mapping and return only JSON.`
 
   return {
     messages: [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemPrompt + STAGE2_ORG_PHILOSOPHY },
       { role: 'user',   content: userPrompt   },
     ],
     systemPrompt,
@@ -346,7 +408,7 @@ Apply the refinement classification rules above and return the updated JSON obje
 
   return {
     messages: [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemPrompt + STAGE2_ORG_PHILOSOPHY },
       { role: 'user',   content: userPrompt   },
     ],
     systemPrompt,
@@ -398,6 +460,7 @@ export function parseStage2UnitResponse(rawText) {
       dependencies:         safeList(parsed.dependencies),
       risksAndUnknowns:     safeList(parsed.risksAndUnknowns),
       keySuccessMetrics:    safeList(parsed.keySuccessMetrics),
+      orgOrder:             Number.isFinite(parsed.orgOrder) ? parsed.orgOrder : undefined,
     },
     error: null,
   }
@@ -421,12 +484,38 @@ export function generateMockStage2(stage1Snapshot) {
   const risks          = stage1Snapshot.risks           || []
 
   const cap  = s => s ? s.slice(0, 110) + (s.length > 110 ? '…' : '') : ''
-  const dec  = i => decisions[i] ? `Execute on key decision: ${cap(decisions[i])}` : null
+  const dec  = i => decisions[i] ? `Own strategic decision context: ${cap(decisions[i])}` : null
   const risk = i => risks[i]     ? cap(risks[i]) : null
 
   function compact(...items) { return items.filter(Boolean) }
 
   const businessUnits = [
+    {
+      name: 'Executive Leadership & Strategy',
+      purpose: `Set strategic direction, governance posture, and investment boundaries for ${cap(title, 90)}.`,
+      strategicInvolvement: 'Primary governance owner - sets strategic intent, decision rights, and investment guardrails',
+      involvementLevel: 'primary',
+      keyResponsibilities: compact(
+        'Define strategic ownership model and decision rights for the capability map',
+        'Hold investment posture and stage-gate authority across implicated functions',
+        'Resolve cross-functional ownership ambiguity before downstream execution planning',
+        dec(0),
+      ),
+      dependencies: [
+        'Finance & Commercial Operations - investment criteria and commercial guardrails',
+        'Compliance & Regulatory Affairs - governance constraints and risk posture',
+        'Product & Capability Strategy - capability scope and strategic tradeoffs',
+      ],
+      risksAndUnknowns: compact(
+        'Decision-right ambiguity may create downstream execution conflict',
+        risk(0) || 'Executive appetite for phase-two commitment remains conditional on validation evidence',
+      ),
+      keySuccessMetrics: [
+        'Clear strategic owner and decision forum defined',
+        'Investment guardrails documented for downstream execution planning',
+        'Cross-functional ownership model accepted by primary capability owners',
+      ],
+    },
     {
       name: 'Product & Engineering',
       purpose: `Build and own the core capability described by this strategy: ${cap(opportunity) || title}.`,
@@ -611,7 +700,7 @@ export function generateMockStage2(stage1Snapshot) {
 
   const thesisSnip = thesis ? ` Strategic thesis: ${cap(thesis)}` : ''
   return {
-    businessUnits,
-    summaryNote: `Inferred from "${title}" (${posture}).${thesisSnip} The operating model implies cross-functional execution led by Product & Engineering and Sales, governed by Legal & Compliance on the regulatory dimension. Finance holds the go/no-go gate at each staged checkpoint. Note: this is a mock-generated structure based on Stage 1 context — use AI generation with a configured API key for a context-specific analysis.`,
+    businessUnits: orderBusinessUnits(businessUnits),
+    summaryNote: `Inferred from "${title}" (${posture}).${thesisSnip} The organisational model maps durable capability ownership from executive governance through compliance, product/technology, delivery, GTM, and supporting commercial functions. Note: this is a mock-generated structure based on Stage 1 context - use AI generation with a configured API key for a context-specific analysis.`,
   }
 }
