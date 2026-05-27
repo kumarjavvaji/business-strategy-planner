@@ -200,3 +200,100 @@ export function parseHandoffItemResponse(rawText) {
 
   return { key, value, error: null }
 }
+
+// ── Handoff child atom ────────────────────────────────────────────────────────
+
+// Fixed fallback sub-fields used when a parent item is decomposed.
+export const CHILD_ATOM_KEYS = [
+  'summary',
+  'requiredOutputs',
+  'constraints',
+  'risksOrUnknowns',
+  'dependencies',
+  'validationNeeds',
+  'successSignals',
+  'stage4Implications',
+]
+
+const CHILD_FIELD_GUIDANCE = `Field value guidance:
+- summary: 2-3 sentences summarising what this item addresses for Stage 3
+- requiredOutputs: array of specific deliverables Stage 3 must produce
+- constraints: array of constraints Stage 3 must operate within
+- risksOrUnknowns: array of risks or open questions
+- dependencies: array of dependencies on other BUs, systems, or data
+- validationNeeds: array of things that must be validated before this item can proceed
+- successSignals: array of leading indicators or checkpoints
+- stage4Implications: string or array describing what this implies for Stage 4 decisions`
+
+/**
+ * Build messages for one child atom of a decomposed handoff item.
+ * One call per child — returns only the requested sub-field.
+ */
+export function buildHandoffChildAtomMessages(stage1Snapshot, bu, domainOfWork, smeLens, structureItem, childKey, otherBuNames) {
+  const stage1Context = stageSnapshotToText(stage1Snapshot)
+  const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
+
+  const buDetails = [
+    `Name: ${bu.name}`,
+    bu.purpose              ? `Purpose: ${bu.purpose}` : null,
+    bu.strategicInvolvement ? `Strategic Involvement: ${bu.strategicInvolvement}` : null,
+    bu.involvementLevel     ? `Involvement Level: ${bu.involvementLevel}` : null,
+    bu.keyResponsibilities?.length
+      ? `Key Responsibilities:\n${bu.keyResponsibilities.map(r => `  - ${r}`).join('\n')}`
+      : null,
+    bu.dependencies?.length
+      ? `Dependencies:\n${bu.dependencies.map(d => `  - ${d}`).join('\n')}`
+      : null,
+    bu.risksAndUnknowns?.length
+      ? `Risks & Unknowns:\n${bu.risksAndUnknowns.map(r => `  - ${r}`).join('\n')}`
+      : null,
+  ].filter(Boolean).join('\n')
+
+  const systemPrompt = `You are a strategic planning analyst preparing a Stage 3 execution planning handoff.
+
+Generate one specific sub-field for a handoff item. Return ONLY valid JSON — no markdown, no prose, no code fences:
+
+{ "key": "<exact field name>", "value": <string | string[] | object> }
+
+${CHILD_FIELD_GUIDANCE}
+
+Rules:
+- key: must exactly match the requested field name
+- value: substantive, specific, actionable — no generic content
+- Be specific to this company, BU, domain, and parent planning theme`
+
+  const smeLensLine = smeLens ? `\nSME Review Lens: ${smeLens}` : ''
+
+  const userPrompt = `Stage 1 Strategy Basis:
+${stage1Context}
+
+Business Unit:
+${buDetails}
+
+Domain of Work: ${domainOfWork}${smeLensLine}
+
+Parent Planning Theme:
+"${structureItem}"
+
+Other Business Units: ${otherBuList}
+
+Generate sub-field: ${childKey}
+
+Return only the JSON object with key "${childKey}".`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt   },
+    ],
+  }
+}
+
+/**
+ * Parse a child atom response — extracts value only (key is already known).
+ * @returns {{ value: any, error: string|null }}
+ */
+export function parseHandoffChildAtomResponse(rawText) {
+  const { value, error } = parseHandoffItemResponse(rawText)
+  return { value, error }
+}

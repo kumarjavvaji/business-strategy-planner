@@ -25,6 +25,8 @@ import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageS
 import {
   buildHandoffStructureMessages, parseHandoffStructureResponse,
   buildHandoffItemMessages, parseHandoffItemResponse,
+  buildHandoffChildAtomMessages, parseHandoffChildAtomResponse,
+  CHILD_ATOM_KEYS,
 } from '../utils/handoffPrompts'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
@@ -79,7 +81,11 @@ function SubList({ label, items, borderColor }) {
   )
 }
 
-const ITEM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
+const ITEM_STATE_DEFAULT = {
+  status: 'not_started', rawResponse: null, parsedValue: null, parserError: null,
+  isDecomposed: false, assembledFromChildren: false, childAtoms: null,
+}
+const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 
 function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
   const [open,         setOpen]         = useState(false)
@@ -159,6 +165,93 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
     }
 
     patchItem(i, { status: 'complete', rawResponse: result, parsedValue: { key: p.key, value: p.value }, parserError: null })
+  }
+
+  // ── Child atom helpers ──────────────────────────────────────────────────────
+
+  function patchChildAtom(i, childKey, patch) {
+    setItemStates(prev => {
+      const item = { ...ITEM_STATE_DEFAULT, ...(prev[i] || {}) }
+      return {
+        ...prev,
+        [i]: {
+          ...item,
+          childAtoms: {
+            ...(item.childAtoms || {}),
+            [childKey]: {
+              ...CHILD_ATOM_STATE_DEFAULT,
+              ...(item.childAtoms?.[childKey] || {}),
+              ...patch,
+            },
+          },
+        },
+      }
+    })
+  }
+
+  function handleDecomposeItem(i) {
+    patchItem(i, {
+      isDecomposed: true,
+      childAtoms: Object.fromEntries(
+        CHILD_ATOM_KEYS.map(k => [k, { ...CHILD_ATOM_STATE_DEFAULT }])
+      ),
+    })
+  }
+
+  async function handleGenerateChildAtom(i, structureItem, childKey) {
+    if (!activeStage1Rev || !parsed) return
+    patchChildAtom(i, childKey, { status: 'generating', parserError: null, rawResponse: null })
+
+    const { messages } = buildHandoffChildAtomMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed.domainOfWork,
+      parsed.smeLens || null,
+      structureItem,
+      childKey,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+
+    if (error) {
+      patchChildAtom(i, childKey, { status: 'failed', parserError: error, rawResponse: result ?? null })
+      return
+    }
+
+    const p = parseHandoffChildAtomResponse(result)
+    if (p.error) {
+      patchChildAtom(i, childKey, { status: 'failed', rawResponse: result, parserError: p.error })
+      return
+    }
+
+    patchChildAtom(i, childKey, { status: 'complete', rawResponse: result, parsedValue: p.value, parserError: null })
+  }
+
+  function handleAssembleItem(i, theme) {
+    const iState = itemStates[i]
+    if (!iState?.childAtoms) return
+
+    const assembledValue = {}
+    CHILD_ATOM_KEYS.forEach(key => {
+      const cs = iState.childAtoms[key]
+      if (cs?.status === 'complete' && cs.parsedValue !== null) {
+        assembledValue[key] = cs.parsedValue
+      }
+    })
+    if (!Object.keys(assembledValue).length) return
+
+    const existingKey = iState.parsedValue?.key
+    const derivedKey = existingKey || theme
+      .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
+      .split(/\s+/)
+      .map((w, idx) => idx === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1))
+      .join('')
+
+    patchItem(i, {
+      status: 'complete',
+      assembledFromChildren: true,
+      parsedValue: { key: derivedKey, value: assembledValue },
+    })
   }
 
   // ── Derived status label ────────────────────────────────────────────────────
@@ -292,7 +385,10 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                     const isGenItem = iState.status === 'generating'
                     const canGenItem = canGenItemBase && !isGenItem
 
+                    const assembled = iState.status === 'complete' && iState.assembledFromChildren
+
                     const borderColor =
+                      assembled                       ? 'rgba(139,92,246,.45)'  :
                       iState.status === 'complete'   ? 'rgba(0,229,180,.45)'   :
                       iState.status === 'failed'     ? 'rgba(248,113,113,.45)' :
                       isGenItem                      ? 'rgba(59,130,246,.55)'  :
@@ -300,16 +396,19 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
 
                     const btnBg =
                       iState.status === 'failed'   ? 'rgba(248,113,113,.1)'  :
+                      assembled                    ? 'rgba(139,92,246,.1)'   :
                       iState.status === 'complete' ? 'rgba(0,229,180,.08)'   :
                       canGenItem                   ? 'rgba(59,130,246,.1)'   : 'var(--surface)'
 
                     const btnBorder =
                       iState.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                      assembled                    ? 'rgba(139,92,246,.3)'   :
                       iState.status === 'complete' ? 'rgba(0,229,180,.3)'    :
                       canGenItem                   ? 'rgba(59,130,246,.3)'   : 'var(--border)'
 
                     const btnColor =
                       iState.status === 'failed'   ? '#f87171'        :
+                      assembled                    ? '#a78bfa'        :
                       iState.status === 'complete' ? '#00e5b4'        :
                       canGenItem                   ? 'var(--accent)'  : 'var(--muted)'
 
@@ -319,12 +418,20 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                       iState.status === 'failed'   ? 'Retry item'        :
                                                      'Generate item'
 
+                    const canAssemble = !!(iState.childAtoms &&
+                      Object.values(iState.childAtoms).some(cs => cs?.status === 'complete'))
+
                     return (
                       <div key={i} style={{ paddingLeft: 8, borderLeft: `2px solid ${borderColor}` }}>
                         {/* Theme row */}
                         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
                           <div style={{ flex: 1, fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
                             {theme}
+                            {assembled && (
+                              <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#a78bfa', opacity: .8 }}>
+                                assembled
+                              </span>
+                            )}
                           </div>
                           <button
                             onClick={() => handleGenerateItem(i, theme)}
@@ -348,7 +455,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                           </div>
                         )}
 
-                        {/* Per-item error + raw */}
+                        {/* Per-item error + raw + decompose trigger */}
                         {iState.status === 'failed' && (
                           <div style={{ marginTop: 4 }}>
                             <div style={{
@@ -367,6 +474,130 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
                               }}>
                                 {iState.rawResponse}
                               </pre>
+                            )}
+                            {!iState.isDecomposed && (
+                              <button
+                                onClick={() => handleDecomposeItem(i)}
+                                style={{
+                                  marginTop: 6, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                  padding: '3px 8px', borderRadius: 3, cursor: 'pointer',
+                                  background: 'rgba(139,92,246,.1)', border: '1px solid rgba(139,92,246,.3)',
+                                  color: '#a78bfa',
+                                }}
+                              >
+                                Decompose failed item
+                              </button>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Child atoms — shown whenever isDecomposed */}
+                        {iState.isDecomposed && iState.childAtoms && (
+                          <div style={{
+                            marginTop: 7, padding: '8px 9px',
+                            background: 'rgba(139,92,246,.04)',
+                            border: '1px solid rgba(139,92,246,.18)',
+                            borderRadius: 5,
+                          }}>
+                            <div style={{
+                              fontSize: 8, fontFamily: 'var(--fm)', color: 'rgba(167,139,250,.8)',
+                              textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 7,
+                            }}>
+                              Fallback decomposition
+                            </div>
+
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              {CHILD_ATOM_KEYS.map(childKey => {
+                                const cs = iState.childAtoms[childKey] || CHILD_ATOM_STATE_DEFAULT
+                                const isGenChild = cs.status === 'generating'
+                                const canGenChild = canGenItemBase && !isGenItem && !isGenChild
+
+                                const childBtnLabel =
+                                  isGenChild               ? 'Generating…' :
+                                  cs.status === 'complete' ? '↻'           :
+                                  cs.status === 'failed'   ? 'Retry'       :
+                                                             'Generate'
+
+                                const childBtnColor =
+                                  cs.status === 'failed'   ? '#f87171'           :
+                                  cs.status === 'complete' ? '#00e5b4'           :
+                                  canGenChild              ? '#a78bfa'           : 'var(--muted)'
+
+                                const childBtnBorder =
+                                  cs.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                                  cs.status === 'complete' ? 'rgba(0,229,180,.3)'    :
+                                  canGenChild              ? 'rgba(139,92,246,.35)'  : 'var(--border)'
+
+                                return (
+                                  <div key={childKey}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                      <div style={{
+                                        flex: 1, fontSize: 9, fontFamily: 'var(--fm)',
+                                        color: cs.status === 'complete' ? 'var(--text)' : 'var(--muted)',
+                                        lineHeight: 1.4,
+                                      }}>
+                                        {childKey}
+                                      </div>
+                                      <button
+                                        onClick={() => handleGenerateChildAtom(i, theme, childKey)}
+                                        disabled={!canGenChild}
+                                        style={{
+                                          flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                          padding: '2px 6px', borderRadius: 3,
+                                          cursor: canGenChild ? 'pointer' : 'not-allowed',
+                                          background: cs.status === 'failed'   ? 'rgba(248,113,113,.08)' :
+                                                      cs.status === 'complete' ? 'rgba(0,229,180,.06)'   :
+                                                      canGenChild              ? 'rgba(139,92,246,.1)'   : 'var(--surface)',
+                                          border: `1px solid ${childBtnBorder}`,
+                                          color: childBtnColor,
+                                          opacity: !canGenChild && !isGenChild ? 0.5 : 1,
+                                        }}
+                                      >
+                                        {childBtnLabel}
+                                      </button>
+                                    </div>
+
+                                    {cs.status === 'complete' && cs.parsedValue !== null && (
+                                      <div style={{ paddingLeft: 10, marginTop: 2 }}>
+                                        {renderItemValue(cs.parsedValue)}
+                                      </div>
+                                    )}
+
+                                    {cs.status === 'failed' && (
+                                      <div style={{ marginTop: 3, paddingLeft: 10 }}>
+                                        <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                                          ⚠ {cs.parserError}
+                                        </div>
+                                        {cs.rawResponse && (
+                                          <pre style={{
+                                            fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                                            background: 'var(--s2)', borderRadius: 3, padding: '4px 6px',
+                                            overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                            maxHeight: 80, overflowY: 'auto', margin: '3px 0 0',
+                                          }}>
+                                            {cs.rawResponse}
+                                          </pre>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                )
+                              })}
+                            </div>
+
+                            {canAssemble && (
+                              <button
+                                onClick={() => handleAssembleItem(i, theme)}
+                                style={{
+                                  marginTop: 9, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                  padding: '4px 9px', borderRadius: 4, cursor: 'pointer',
+                                  background: 'rgba(139,92,246,.14)',
+                                  border: '1px solid rgba(139,92,246,.35)',
+                                  color: '#a78bfa',
+                                }}
+                              >
+                                Assemble item from child atoms
+                              </button>
                             )}
                           </div>
                         )}
