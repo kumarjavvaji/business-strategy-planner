@@ -4,6 +4,31 @@
 
 import { stageSnapshotToText } from './stageSnapshots'
 
+const STAGE_REFINEMENT_CLASSES = [
+  'wording clarification',
+  'existing unit responsibility change',
+  'cross-functional dependency change',
+  'strategic emphasis change',
+  'KPI/measurement change',
+  'risk/unknown change',
+  'new business unit/capability needed',
+  'remove business unit',
+  'merge/split business units',
+]
+
+const STRUCTURAL_IMPACTS = new Set([
+  'none',
+  'unit_added',
+  'unit_removed',
+  'unit_merged',
+  'ownership_changed',
+  'dependencies_changed',
+])
+
+function safeStructuralImpact(value) {
+  return STRUCTURAL_IMPACTS.has(value) ? value : 'none'
+}
+
 // ── AI prompt builder ─────────────────────────────────────────────────────────
 
 /**
@@ -128,8 +153,75 @@ export function parseStage2Response(rawText) {
   return {
     businessUnits: normalised,
     summaryNote:   safeStr(parsed.summaryNote),
+    refinementClassification: safeStr(parsed.refinementClassification),
+    structuralImpact: safeStructuralImpact(parsed.structuralImpact),
     raw:           rawText,
     error:         null,
+  }
+}
+
+// Full-stage refinement prompt builder. Unlike unit refinement, this may add,
+// remove, merge, split, or reassign business units when the instruction implies
+// a structural operating-model change.
+export function buildStage2StageRefinementMessages(stage1Snapshot, currentStage2Snapshot, refinementPrompt, impactSummary) {
+  const s1Context = stageSnapshotToText(stage1Snapshot)
+  const s2Payload = JSON.stringify(currentStage2Snapshot || {}, null, 2)
+
+  const systemPrompt = `You are a strategic business analyst regenerating the FULL Stage 2 business-unit mapping from an existing Stage 2 revision plus a user refinement.
+
+Classify the refinement as exactly one primary class from this list:
+${STAGE_REFINEMENT_CLASSES.map(c => `- ${c}`).join('\n')}
+
+Then update the full Stage 2 JSON. The refinement may be structural. You may add, remove, merge, split, rename, reorder, or reassign business units if that is the coherent answer.
+
+Structural rules:
+- If a major client-facing role or capability is not clearly owned, either add a new unit/capability or explicitly assign it to an existing unit.
+- If the refinement says frontline consultants, advisors, field operators, implementation consultants, or similar roles are the primary client-facing operators, evaluate whether to create a unit such as "Consulting & Advisory Services", "Client Advisory", "Field Consulting", or "Advisory Delivery".
+- If you do not create a new consulting/advisory unit for such a refinement, assign the role explicitly to an existing unit and make that ownership visible in purpose, strategicInvolvement, responsibilities, dependencies, risks, and metrics.
+- Treat ownership, primary-client-channel, dependency, KPI, risk, and strategic emphasis changes as content changes, not notes.
+- Preserve coherent cross-functional dependencies after adding, removing, merging, or splitting units.
+
+Return ONLY a valid JSON object with this exact schema:
+{
+  "refinementClassification": "one class from the allowed list",
+  "structuralImpact": "none | unit_added | unit_removed | unit_merged | ownership_changed | dependencies_changed",
+  "businessUnits": [
+    {
+      "name": "string",
+      "purpose": "string",
+      "strategicInvolvement": "string",
+      "involvementLevel": "primary | supporting | informed",
+      "keyResponsibilities": ["string"],
+      "dependencies": ["string"],
+      "risksAndUnknowns": ["string"],
+      "keySuccessMetrics": ["string"]
+    }
+  ],
+  "summaryNote": "string"
+}
+
+Use 5-9 units unless the refinement clearly requires fewer or more. Order by strategic centrality.`
+
+  const userPrompt = `Stage 1 Strategy Basis:
+${s1Context}
+
+Current Stage 2 JSON:
+${s2Payload}
+
+Refinement instruction:
+${refinementPrompt}
+
+Optional impact summary:
+${impactSummary || 'none provided'}
+
+Regenerate the full Stage 2 business-unit mapping and return only JSON.`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt   },
+    ],
+    systemPrompt,
   }
 }
 

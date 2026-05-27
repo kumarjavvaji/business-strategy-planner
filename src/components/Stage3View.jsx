@@ -19,6 +19,7 @@ import {
   generateMockStage3,
   buildStage3UnitRefinementMessages,
   parseStage3UnitResponse,
+  buildStage3StageRefinementMessages,
 } from '../utils/stage3Prompts'
 import { buildStage3RevisionRecord, stage3SnapshotToText } from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
@@ -664,6 +665,7 @@ export default function Stage3View({
   const [rawResponse,  setRawResponse]  = useState(null)
   const [showRaw,      setShowRaw]      = useState(false)
   const [compareRevId, setCompareRevId] = useState(null)
+  const [isStageRefining, setIsStageRefining] = useState(false)
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev      = stage3Revisions.find(r => r.id === stage3ActiveId) ?? null
@@ -819,8 +821,63 @@ export default function Stage3View({
   }, [activeStage1Rev, activeStage2Rev, activeRev, executionPlans, summaryNote, stage3Revisions.length, onSaveRevision])
 
   // ── Stage-level correction ──────────────────────────────────────────────────
-  function handleStageRefinement({ prompt, impactSummary }) {
+  async function handleStageRefinement({ prompt, impactSummary }) {
     if (!activeRev) return
+
+    if (hasApiKey()) {
+      if (!activeStage1Rev) return { error: 'No active Stage 1 revision.' }
+      if (!activeStage2Rev) return { error: 'No active Stage 2 revision.' }
+      setIsStageRefining(true)
+      setGenError(null)
+      setRawResponse(null)
+      setShowRaw(false)
+
+      const { messages } = buildStage3StageRefinementMessages(
+        activeStage1Rev.contentSnapshot,
+        activeStage2Rev.contentSnapshot,
+        activeRev.contentSnapshot,
+        prompt,
+        impactSummary,
+      )
+      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 11000 })
+
+      if (error) {
+        setGenError(error)
+        setIsStageRefining(false)
+        return { error }
+      }
+
+      const parsed = parseStage3Response(result)
+      setRawResponse(result)
+
+      if (parsed.error || !parsed.executionPlans) {
+        const parseError = parsed.error || 'Response parse failed.'
+        setGenError(parseError)
+        setIsStageRefining(false)
+        return { error: parseError }
+      }
+
+      const nextNum = stage3Revisions.length + 1
+      const record  = buildStage3RevisionRecord({
+        executionPlans:         parsed.executionPlans,
+        summaryNote:            parsed.summaryNote,
+        revisionNumber:         nextNum,
+        sourceBasisRevisionId:  stage1ActiveId,
+        sourceStage2RevisionId: stage2ActiveId,
+        source:                 'ai',
+        prompt,
+        impactSummary:          impactSummary || `Regenerated Stage 3 with AI: ${prompt.slice(0, 90)}${prompt.length > 90 ? '...' : ''}`,
+        refinementType:         'stage',
+        affectedUnit:           null,
+        structuralImpact:       parsed.structuralImpact,
+        refinementClassification: parsed.refinementClassification,
+      })
+
+      onSaveRevision(record)
+      setIsStageRefining(false)
+      return { error: null }
+    }
+
     const nextNum = stage3Revisions.length + 1
     const record  = buildStage3RevisionRecord({
       executionPlans: activeRev.contentSnapshot.executionPlans,
@@ -833,8 +890,10 @@ export default function Stage3View({
       impactSummary,
       refinementType:         'stage',
       affectedUnit:           null,
+      structuralImpact:       'none',
     })
     onSaveRevision(record)
+    return { error: null }
   }
 
   // ── Guard: no Stage 2 revisions ─────────────────────────────────────────────
@@ -1098,10 +1157,11 @@ export default function Stage3View({
         onSaveRevision={handleStageRefinement}
         title="Cross-unit Execution Refinements"
         subtitle={
-          'Use this section for organisation-wide or cross-BU changes that affect multiple execution plans or the overall execution posture. ' +
-          'This saves a correction note as a new revision — use "Regenerate with AI" above to fully re-generate from updated upstream stages.'
+          apiMode === 'ai'
+            ? 'Use this section for organisation-wide, cross-BU, or structural execution changes. API mode regenerates the full Stage 3 execution-plan package, including added, removed, merged, or reassigned plans when needed.'
+            : 'Use this section to record organisation-wide or cross-BU execution corrections. Add an API key to regenerate the full Stage 3 package with AI.'
         }
-        saveLabel="Save refinement note"
+        saveLabel={apiMode === 'ai' ? 'Regenerate Stage 3 with AI' : 'Save manual correction note'}
         promptLabel="Refinement instruction"
         promptPlaceholder={
           'Examples:\n' +
@@ -1110,7 +1170,8 @@ export default function Stage3View({
           '· Add a shared data infrastructure unit as a cross-cutting workstream.\n' +
           '· All BUs should defer phase-two commitments until the phase-one go/no-go review is complete.'
         }
-        aiNotice={null}
+        aiNotice={apiMode === 'ai' ? 'AI regeneration enabled' : null}
+        isSaving={isStageRefining}
       />
 
       {/* ── Stage 4 CTA ───────────────────────────────────────────────────── */}

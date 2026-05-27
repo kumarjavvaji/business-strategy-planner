@@ -10,8 +10,28 @@ const safeStr  = v => (typeof v === 'string' ? v.trim() : String(v ?? ''))
 const safeList = v => (Array.isArray(v) ? v.map(safeStr).filter(Boolean) : [])
 const LEVELS   = new Set(['low', 'medium', 'high'])
 const ATYPES   = new Set(['fact', 'inferred', 'speculative'])
+const STAGE_REFINEMENT_CLASSES = [
+  'wording clarification',
+  'existing unit responsibility change',
+  'cross-functional dependency change',
+  'strategic emphasis change',
+  'KPI/measurement change',
+  'risk/unknown change',
+  'new business unit/capability needed',
+  'remove business unit',
+  'merge/split business units',
+]
+const STRUCTURAL_IMPACTS = new Set([
+  'none',
+  'unit_added',
+  'unit_removed',
+  'unit_merged',
+  'ownership_changed',
+  'dependencies_changed',
+])
 
 function safeLevel(v) { return LEVELS.has(v) ? v : 'medium' }
+function safeStructuralImpact(v) { return STRUCTURAL_IMPACTS.has(v) ? v : 'none' }
 
 function safeAssumptions(v) {
   if (!Array.isArray(v)) return []
@@ -171,6 +191,8 @@ export function parseStage3Response(rawText) {
   return {
     executionPlans: normalised,
     summaryNote:    safeStr(parsed.summaryNote),
+    refinementClassification: safeStr(parsed.refinementClassification),
+    structuralImpact: safeStructuralImpact(parsed.structuralImpact),
     raw:            rawText,
     error:          null,
   }
@@ -205,6 +227,68 @@ function normalisePlan(p) {
     dependencyComplexity:         safeLevel(p.dependencyComplexity),
     confidenceLevel:              safeLevel(p.confidenceLevel),
     organizationalReadiness:      safeLevel(p.organizationalReadiness),
+  }
+}
+
+// Full-stage refinement prompt builder. This can restructure the execution-plan
+// package by adding/removing/merging/splitting plans when the operating model
+// implied by Stage 2 plus the user refinement requires it.
+export function buildStage3StageRefinementMessages(
+  stage1Snapshot, stage2Snapshot, currentStage3Snapshot, refinementPrompt, impactSummary,
+) {
+  const s1Context = stageSnapshotToText(stage1Snapshot)
+  const s2Context = stage2SnapshotToText(stage2Snapshot)
+  const s3Payload = JSON.stringify(currentStage3Snapshot || {}, null, 2)
+
+  const systemPrompt = `You are an execution strategist regenerating the FULL Stage 3 execution-plan package from the upstream stages, an existing Stage 3 revision, and a user refinement.
+
+Classify the refinement as exactly one primary class from this list:
+${STAGE_REFINEMENT_CLASSES.map(c => `- ${c}`).join('\n')}
+
+Then update the full Stage 3 JSON. The refinement may be structural. You may add, remove, merge, split, rename, reorder, or reassign execution plans if that is the coherent answer.
+
+Structural rules:
+- If a major client-facing role or capability is not clearly owned, either add a new execution plan/capability or explicitly assign it to an existing plan.
+- If the refinement says frontline consultants, advisors, field operators, implementation consultants, or similar roles are the primary client-facing operators, evaluate whether there should be an execution plan for "Consulting & Advisory Services", "Client Advisory", "Field Consulting", or "Advisory Delivery".
+- If you do not create a new consulting/advisory plan for such a refinement, assign the role explicitly to an existing plan and make that ownership visible in mission, mission-critical initiatives, staffingOwnership, dependencies, systemsTools, leadingIndicators, keySuccessMetrics, failureSignals, and readinessAssessment.
+- Treat ownership, primary-client-channel, dependency, KPI, risk, and strategic emphasis changes as content changes, not notes.
+- Preserve one coherent execution package; update dependencies and sequencing after any structural change.
+
+Return ONLY a valid JSON object with this exact schema:
+{
+  "refinementClassification": "one class from the allowed list",
+  "structuralImpact": "none | unit_added | unit_removed | unit_merged | ownership_changed | dependencies_changed",
+  "executionPlans": [
+    ${BU_PLAN_SCHEMA}
+  ],
+  "summaryNote": "string"
+}
+
+Normally produce one executionPlan per Stage 2 business unit. If the refinement requires an additional cross-cutting capability plan, include it and explain why in summaryNote.`
+
+  const userPrompt = `Stage 1 Strategy Basis:
+${s1Context}
+
+Stage 2 Business Unit Mapping:
+${s2Context}
+
+Current Stage 3 JSON:
+${s3Payload}
+
+Refinement instruction:
+${refinementPrompt}
+
+Optional impact summary:
+${impactSummary || 'none provided'}
+
+Regenerate the full Stage 3 execution-plan package and return only JSON.`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: userPrompt   },
+    ],
+    systemPrompt,
   }
 }
 

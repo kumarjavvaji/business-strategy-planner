@@ -18,6 +18,7 @@ import {
   generateMockStage2,
   buildStage2UnitRefinementMessages,
   parseStage2UnitResponse,
+  buildStage2StageRefinementMessages,
 } from '../utils/stage2Prompts'
 import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
@@ -388,6 +389,7 @@ export default function Stage2View({
   const [rawResponse,    setRawResponse]    = useState(null)  // shown on parse fail
   const [showRaw,        setShowRaw]        = useState(false)
   const [compareRevId,   setCompareRevId]   = useState(null)
+  const [isStageRefining,setIsStageRefining]= useState(false)
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev     = stage2Revisions.find(r => r.id === stage2ActiveId) ?? null
@@ -532,8 +534,60 @@ export default function Stage2View({
   // ── Stage-level correction note ─────────────────────────────────────────────
   // Cross-functional / org-wide corrections: saves a full revision snapshot (manual).
   // Does not regenerate via AI — use "Regenerate with AI" for full AI regeneration.
-  function handleStageRefinement({ prompt, impactSummary }) {
+  async function handleStageRefinement({ prompt, impactSummary }) {
     if (!activeRev) return
+
+    if (hasApiKey()) {
+      if (!activeStage1Rev) return { error: 'No active Stage 1 revision.' }
+      setIsStageRefining(true)
+      setGenError(null)
+      setRawResponse(null)
+      setShowRaw(false)
+
+      const { messages } = buildStage2StageRefinementMessages(
+        activeStage1Rev.contentSnapshot,
+        activeRev.contentSnapshot,
+        prompt,
+        impactSummary,
+      )
+      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 7000 })
+
+      if (error) {
+        setGenError(error)
+        setIsStageRefining(false)
+        return { error }
+      }
+
+      const parsed = parseStage2Response(result)
+      setRawResponse(result)
+
+      if (parsed.error || !parsed.businessUnits) {
+        const parseError = parsed.error || 'Response parse failed.'
+        setGenError(parseError)
+        setIsStageRefining(false)
+        return { error: parseError }
+      }
+
+      const nextNum = stage2Revisions.length + 1
+      const record  = buildStage2RevisionRecord({
+        businessUnits:        parsed.businessUnits,
+        summaryNote:          parsed.summaryNote,
+        revisionNumber:       nextNum,
+        sourceBasisRevisionId: stage1ActiveId,
+        source:               'ai',
+        prompt,
+        impactSummary:        impactSummary || `Regenerated Stage 2 with AI: ${prompt.slice(0, 90)}${prompt.length > 90 ? '...' : ''}`,
+        refinementType:       'stage',
+        affectedUnit:         null,
+        structuralImpact:     parsed.structuralImpact,
+        refinementClassification: parsed.refinementClassification,
+      })
+
+      onSaveRevision(record)
+      setIsStageRefining(false)
+      return { error: null }
+    }
+
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
       businessUnits: activeRev.contentSnapshot.businessUnits,
@@ -545,8 +599,10 @@ export default function Stage2View({
       impactSummary,
       refinementType:        'stage',
       affectedUnit:          null,
+      structuralImpact:      'none',
     })
     onSaveRevision(record)
+    return { error: null }
   }
 
   // ── Source label for the current revision ───────────────────────────────────
@@ -752,10 +808,11 @@ export default function Stage2View({
         onSaveRevision={handleStageRefinement}
         title="Cross-functional Refinements"
         subtitle={
-          'Use this section for organisation-wide or cross-department changes that affect multiple business units or the overall operating model. ' +
-          'This saves a correction note as a new revision — use "Regenerate with AI" above to fully re-generate the BU structure from Stage 1.'
+          apiMode === 'ai'
+            ? 'Use this section for organisation-wide or structural changes. API mode regenerates the full Stage 2 business-unit mapping, including added, removed, merged, or reassigned units when needed.'
+            : 'Use this section to record organisation-wide or cross-department corrections. Add an API key to regenerate the full Stage 2 structure with AI.'
         }
-        saveLabel="Save refinement note"
+        saveLabel={apiMode === 'ai' ? 'Regenerate Stage 2 with AI' : 'Save manual correction note'}
         promptLabel="Refinement instruction"
         promptPlaceholder={
           'Examples:\n' +
@@ -764,7 +821,8 @@ export default function Stage2View({
           '· Reduce staffing assumptions across all units to reflect the revised budget posture.\n' +
           '· Elevate Legal & Compliance to primary across all units — regulatory risk is now the gating factor.'
         }
-        aiNotice={null}
+        aiNotice={apiMode === 'ai' ? 'AI regeneration enabled' : null}
+        isSaving={isStageRefining}
       />
 
       {/* ── Stage 3 CTA ────────────────────────────────────────────────── */}

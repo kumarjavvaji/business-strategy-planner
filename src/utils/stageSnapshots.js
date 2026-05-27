@@ -228,6 +228,8 @@ export function buildStage2RevisionRecord({
   refinementType,
   affectedUnit,
   refinementScope,   // 'auto'|'wording'|'ownership'|'cross-fn'|'execution'|'kpi'|null
+  structuralImpact,  // 'none'|'unit_added'|'unit_removed'|'unit_merged'|'ownership_changed'|'dependencies_changed'|null
+  refinementClassification,
 }) {
   const isFirst = revisionNumber === 1
   return {
@@ -242,6 +244,8 @@ export function buildStage2RevisionRecord({
     refinementType:       refinementType  || null,
     affectedUnit:         affectedUnit    || null,
     refinementScope:      (refinementScope && refinementScope !== 'auto') ? refinementScope : null,
+    structuralImpact:     structuralImpact || null,
+    refinementClassification: refinementClassification || null,
     contentSnapshot:      buildStage2Snapshot(businessUnits, summaryNote),
   }
 }
@@ -331,6 +335,8 @@ export function buildStage3RevisionRecord({
   refinementType,
   affectedUnit,
   refinementScope,   // 'auto'|'wording'|'ownership'|'cross-fn'|'execution'|'kpi'|null
+  structuralImpact,  // 'none'|'unit_added'|'unit_removed'|'unit_merged'|'ownership_changed'|'dependencies_changed'|null
+  refinementClassification,
 }) {
   const isFirst = revisionNumber === 1
   return {
@@ -346,6 +352,8 @@ export function buildStage3RevisionRecord({
     refinementType:         refinementType || null,
     affectedUnit:           affectedUnit   || null,
     refinementScope:        (refinementScope && refinementScope !== 'auto') ? refinementScope : null,
+    structuralImpact:       structuralImpact || null,
+    refinementClassification: refinementClassification || null,
     contentSnapshot:        buildStage3Snapshot(executionPlans, summaryNote),
   }
 }
