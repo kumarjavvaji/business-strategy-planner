@@ -22,7 +22,10 @@ import {
   orderBusinessUnits,
 } from '../utils/stage2Prompts'
 import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageSnapshots'
-import { buildHandoffStructureMessages, parseHandoffStructureResponse } from '../utils/handoffPrompts'
+import {
+  buildHandoffStructureMessages, parseHandoffStructureResponse,
+  buildHandoffItemMessages, parseHandoffItemResponse,
+} from '../utils/handoffPrompts'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
 import RefinementPanel    from './RefinementPanel'
@@ -76,25 +79,28 @@ function SubList({ label, items, borderColor }) {
   )
 }
 
+const ITEM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
+
 function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
   const [open,         setOpen]         = useState(false)
-  const [isGenerating, setIsGenerating] = useState(false)
-  const [rawResponse,  setRawResponse]  = useState(null)
-  const [parsed,       setParsed]       = useState(null)  // { domainOfWork, handoffStructure }
+  const [isGenerating, setIsGenerating] = useState(false)   // structure-level generation
+  const [structureRaw, setStructureRaw] = useState(null)
+  const [parsed,       setParsed]       = useState(null)    // { domainOfWork, handoffStructure }
   const [genError,     setGenError]     = useState(null)
+  const [itemStates,   setItemStates]   = useState({})      // { [index]: ITEM_STATE_DEFAULT }
 
-  const canGenerate = apiMode === 'ai' && !!activeStage1Rev && !isGenerating
+  // ── Structure generation ────────────────────────────────────────────────────
+
+  const canGenStructure = apiMode === 'ai' && !!activeStage1Rev && !isGenerating
 
   async function handleGenerateHandoffStructure() {
-    if (!canGenerate) return
+    if (!canGenStructure) return
     setIsGenerating(true)
     setGenError(null)
-    setRawResponse(null)
+    setStructureRaw(null)
 
     const { messages } = buildHandoffStructureMessages(
-      activeStage1Rev.contentSnapshot,
-      bu,
-      otherBuNames,
+      activeStage1Rev.contentSnapshot, bu, otherBuNames,
     )
     const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1500 })
 
@@ -104,7 +110,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
       return
     }
 
-    setRawResponse(result)
+    setStructureRaw(result)
     const p = parseHandoffStructureResponse(result)
 
     if (p.error) {
@@ -114,28 +120,72 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
     }
 
     setParsed({ domainOfWork: p.domainOfWork, handoffStructure: p.handoffStructure })
+    setItemStates({})   // reset all item state when structure changes
     setIsGenerating(false)
   }
 
+  // ── Per-item generation ─────────────────────────────────────────────────────
+
+  function patchItem(i, patch) {
+    setItemStates(prev => ({
+      ...prev,
+      [i]: { ...ITEM_STATE_DEFAULT, ...(prev[i] || {}), ...patch },
+    }))
+  }
+
+  async function handleGenerateItem(i, structureItem) {
+    if (!activeStage1Rev || !parsed) return
+    patchItem(i, { status: 'generating', parserError: null, rawResponse: null })
+
+    const { messages } = buildHandoffItemMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed.domainOfWork,
+      parsed.smeLens || null,
+      structureItem,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1200 })
+
+    if (error) {
+      patchItem(i, { status: 'failed', parserError: error, rawResponse: result ?? null })
+      return
+    }
+
+    const p = parseHandoffItemResponse(result)
+    if (p.error) {
+      patchItem(i, { status: 'failed', rawResponse: result, parserError: p.error })
+      return
+    }
+
+    patchItem(i, { status: 'complete', rawResponse: result, parsedValue: { key: p.key, value: p.value }, parserError: null })
+  }
+
+  // ── Derived status label ────────────────────────────────────────────────────
+
+  const itemCount = parsed?.handoffStructure?.length ?? 0
+  const doneCount = Object.values(itemStates).filter(s => s?.status === 'complete').length
+
+  function handoffStatusLabel() {
+    if (!parsed) return 'Not started'
+    if (itemCount === 0 || doneCount === 0) return 'Structure ready'
+    if (doneCount === itemCount) return 'All items complete'
+    return `${doneCount} / ${itemCount} items complete`
+  }
+
+  // ── Shared styles ───────────────────────────────────────────────────────────
+
   const disabledButtonStyle = {
-    fontSize: 8,
-    fontFamily: 'var(--fm)',
-    fontWeight: 600,
-    padding: '4px 8px',
-    borderRadius: 4,
-    cursor: 'not-allowed',
-    background: 'var(--surface)',
-    border: '1px solid var(--border)',
-    color: 'var(--muted)',
-    opacity: 0.58,
+    fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+    padding: '4px 8px', borderRadius: 4, cursor: 'not-allowed',
+    background: 'var(--surface)', border: '1px solid var(--border)',
+    color: 'var(--muted)', opacity: 0.58,
   }
 
   const Field = ({ label, value }) => (
     <div style={{
-      padding: '7px 9px',
-      border: '1px solid var(--border)',
-      borderRadius: 4,
-      background: 'rgba(255,255,255,.015)',
+      padding: '7px 9px', border: '1px solid var(--border)',
+      borderRadius: 4, background: 'rgba(255,255,255,.015)',
     }}>
       <div style={{
         fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
@@ -149,26 +199,57 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
     </div>
   )
 
+  // ── Item value renderer (string | array | object) ───────────────────────────
+
+  function renderItemValue(value, depth = 0) {
+    if (typeof value === 'string') {
+      return (
+        <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.6, marginTop: 4 }}>
+          {value}
+        </div>
+      )
+    }
+    if (Array.isArray(value)) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 }}>
+          {value.map((v, idx) => (
+            <div key={idx} style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+              · {typeof v === 'string' ? v : JSON.stringify(v)}
+            </div>
+          ))}
+        </div>
+      )
+    }
+    if (value && typeof value === 'object' && depth < 2) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 4 }}>
+          {Object.entries(value).map(([k, v]) => (
+            <div key={k}>
+              <div style={{
+                fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+                textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 1,
+              }}>
+                {k}
+              </div>
+              {renderItemValue(v, depth + 1)}
+            </div>
+          ))}
+        </div>
+      )
+    }
+    return null
+  }
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+
   return (
-    <div style={{
-      marginTop: 10,
-      borderTop: '1px solid var(--border)',
-      paddingTop: 10,
-    }}>
+    <div style={{ marginTop: 10, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
       <button
         onClick={() => setOpen(o => !o)}
         style={{
-          width: '100%',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: 10,
-          fontSize: 9,
-          fontFamily: 'var(--fm)',
-          fontWeight: 600,
-          padding: '6px 9px',
-          borderRadius: 5,
-          cursor: 'pointer',
+          width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          gap: 10, fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+          padding: '6px 9px', borderRadius: 5, cursor: 'pointer',
           background: open ? 'rgba(59,130,246,.08)' : 'var(--s2)',
           border: `1px solid ${open ? 'rgba(59,130,246,.28)' : 'var(--border)'}`,
           color: open ? 'var(--accent)' : 'var(--muted)',
@@ -180,102 +261,174 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode }) {
 
       {open && (
         <div style={{
-          marginTop: 8,
-          padding: '10px 11px',
-          background: 'rgba(59,130,246,.035)',
-          border: '1px solid rgba(59,130,246,.14)',
-          borderRadius: 6,
+          marginTop: 8, padding: '10px 11px',
+          background: 'rgba(59,130,246,.035)', border: '1px solid rgba(59,130,246,.14)', borderRadius: 6,
         }}>
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: '1fr 1fr',
-            gap: 8,
-            marginBottom: 9,
-          }}>
+
+          {/* ── Top metadata row ─────────────────────────────────── */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 9 }}>
             <Field label="domainOfWork" value={parsed?.domainOfWork} />
             <Field label="SMEReviewLens" />
-            <div style={{ gridColumn: '1 / -1' }}>
-              <div style={{
-                padding: '7px 9px',
-                border: '1px solid var(--border)',
-                borderRadius: 4,
-                background: 'rgba(255,255,255,.015)',
-              }}>
-                <div style={{
-                  fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
-                  textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3,
-                }}>
-                  handoffStructure
-                </div>
-                {parsed?.handoffStructure ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-                    {parsed.handoffStructure.map((item, i) => (
-                      <div key={i} style={{
-                        fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)',
-                        lineHeight: 1.55, paddingLeft: 8,
-                        borderLeft: '2px solid rgba(59,130,246,.35)',
-                      }}>
-                        {item}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
-                    Not generated yet
-                  </div>
-                )}
-              </div>
-            </div>
-            <Field label="handoffItems" />
-            <Field label="handoffStatus" value={parsed ? 'Structure ready' : 'Not started'} />
           </div>
 
+          {/* ── handoffStructure + per-item generation ───────────── */}
+          <div style={{
+            padding: '7px 9px', border: '1px solid var(--border)',
+            borderRadius: 4, background: 'rgba(255,255,255,.015)', marginBottom: 8,
+          }}>
+            <div style={{
+              fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+              textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6,
+            }}>
+              handoffStructure &amp; items
+            </div>
+
+            {parsed?.handoffStructure ? (() => {
+              const canGenItemBase = apiMode === 'ai' && !!activeStage1Rev && !!parsed.domainOfWork && !isGenerating
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {parsed.handoffStructure.map((theme, i) => {
+                    const iState = itemStates[i] || ITEM_STATE_DEFAULT
+                    const isGenItem = iState.status === 'generating'
+                    const canGenItem = canGenItemBase && !isGenItem
+
+                    const borderColor =
+                      iState.status === 'complete'   ? 'rgba(0,229,180,.45)'   :
+                      iState.status === 'failed'     ? 'rgba(248,113,113,.45)' :
+                      isGenItem                      ? 'rgba(59,130,246,.55)'  :
+                                                       'rgba(59,130,246,.22)'
+
+                    const btnBg =
+                      iState.status === 'failed'   ? 'rgba(248,113,113,.1)'  :
+                      iState.status === 'complete' ? 'rgba(0,229,180,.08)'   :
+                      canGenItem                   ? 'rgba(59,130,246,.1)'   : 'var(--surface)'
+
+                    const btnBorder =
+                      iState.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                      iState.status === 'complete' ? 'rgba(0,229,180,.3)'    :
+                      canGenItem                   ? 'rgba(59,130,246,.3)'   : 'var(--border)'
+
+                    const btnColor =
+                      iState.status === 'failed'   ? '#f87171'        :
+                      iState.status === 'complete' ? '#00e5b4'        :
+                      canGenItem                   ? 'var(--accent)'  : 'var(--muted)'
+
+                    const btnLabel =
+                      isGenItem                    ? 'Generating…'       :
+                      iState.status === 'complete' ? '↻ Regenerate item' :
+                      iState.status === 'failed'   ? 'Retry item'        :
+                                                     'Generate item'
+
+                    return (
+                      <div key={i} style={{ paddingLeft: 8, borderLeft: `2px solid ${borderColor}` }}>
+                        {/* Theme row */}
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                          <div style={{ flex: 1, fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+                            {theme}
+                          </div>
+                          <button
+                            onClick={() => handleGenerateItem(i, theme)}
+                            disabled={!canGenItem}
+                            style={{
+                              flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                              padding: '2px 7px', borderRadius: 3,
+                              cursor: canGenItem ? 'pointer' : 'not-allowed',
+                              background: btnBg, border: `1px solid ${btnBorder}`, color: btnColor,
+                              opacity: !canGenItem && !isGenItem ? 0.5 : 1,
+                            }}
+                          >
+                            {btnLabel}
+                          </button>
+                        </div>
+
+                        {/* Generated value */}
+                        {iState.status === 'complete' && iState.parsedValue && (
+                          <div style={{ paddingLeft: 4 }}>
+                            {renderItemValue(iState.parsedValue.value)}
+                          </div>
+                        )}
+
+                        {/* Per-item error + raw */}
+                        {iState.status === 'failed' && (
+                          <div style={{ marginTop: 4 }}>
+                            <div style={{
+                              display: 'flex', gap: 4, fontSize: 9, fontFamily: 'var(--fm)',
+                              color: '#f87171', lineHeight: 1.5,
+                            }}>
+                              <span style={{ flexShrink: 0 }}>⚠</span>
+                              <span>{iState.parserError}</span>
+                            </div>
+                            {iState.rawResponse && (
+                              <pre style={{
+                                fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                                background: 'var(--s2)', borderRadius: 4, padding: '6px 8px',
+                                overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                maxHeight: 120, overflowY: 'auto', margin: '4px 0 0',
+                              }}>
+                                {iState.rawResponse}
+                              </pre>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })() : (
+              <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+                Generate handoff structure first.
+              </div>
+            )}
+          </div>
+
+          {/* ── handoffStatus ────────────────────────────────────── */}
+          <div style={{ marginBottom: 9 }}>
+            <Field label="handoffStatus" value={handoffStatusLabel()} />
+          </div>
+
+          {/* ── Structure-level error ────────────────────────────── */}
           {genError && (
             <div style={{
               marginBottom: 8, fontSize: 9, fontFamily: 'var(--fm)',
-              color: '#f87171', lineHeight: 1.6,
-              padding: '6px 9px', borderRadius: 4,
-              background: 'rgba(248,113,113,.07)',
-              border: '1px solid rgba(248,113,113,.25)',
+              color: '#f87171', lineHeight: 1.6, padding: '6px 9px', borderRadius: 4,
+              background: 'rgba(248,113,113,.07)', border: '1px solid rgba(248,113,113,.25)',
             }}>
-              <div style={{ display: 'flex', gap: 5, marginBottom: rawResponse ? 5 : 0 }}>
+              <div style={{ display: 'flex', gap: 5, marginBottom: structureRaw ? 5 : 0 }}>
                 <span style={{ flexShrink: 0 }}>⚠</span>
                 <span>{genError}</span>
               </div>
-              {rawResponse && (
+              {structureRaw && (
                 <pre style={{
                   fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)',
                   background: 'var(--s2)', borderRadius: 4, padding: '8px 10px',
                   overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
                   maxHeight: 160, overflowY: 'auto', margin: 0,
                 }}>
-                  {rawResponse}
+                  {structureRaw}
                 </pre>
               )}
             </div>
           )}
 
+          {/* ── Action buttons ───────────────────────────────────── */}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             <button
               onClick={handleGenerateHandoffStructure}
-              disabled={!canGenerate}
+              disabled={!canGenStructure}
               style={{
-                fontSize: 8,
-                fontFamily: 'var(--fm)',
-                fontWeight: 600,
-                padding: '4px 8px',
-                borderRadius: 4,
-                cursor: canGenerate ? 'pointer' : 'not-allowed',
-                background: canGenerate ? 'rgba(59,130,246,.12)' : 'var(--surface)',
-                border: `1px solid ${canGenerate ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
-                color: canGenerate ? 'var(--accent)' : 'var(--muted)',
-                opacity: canGenerate ? 1 : 0.58,
+                fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '4px 8px', borderRadius: 4,
+                cursor: canGenStructure ? 'pointer' : 'not-allowed',
+                background: canGenStructure ? 'rgba(59,130,246,.12)' : 'var(--surface)',
+                border: `1px solid ${canGenStructure ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
+                color: canGenStructure ? 'var(--accent)' : 'var(--muted)',
+                opacity: canGenStructure ? 1 : 0.58,
               }}
             >
               {isGenerating ? 'Generating…' : parsed ? '↻ Regenerate handoff structure' : 'Generate handoff structure'}
             </button>
             <button disabled style={disabledButtonStyle}>Generate SME lens</button>
-            <button disabled style={disabledButtonStyle}>Generate handoff item</button>
             <button disabled style={disabledButtonStyle}>Assemble BU handoff</button>
           </div>
         </div>
