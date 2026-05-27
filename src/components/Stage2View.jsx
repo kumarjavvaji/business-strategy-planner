@@ -88,23 +88,49 @@ function SubList({ label, items, borderColor }) {
 const ITEM_STATE_DEFAULT = {
   status: 'not_started', rawResponse: null, parsedValue: null, parserError: null,
   isDecomposed: false, assembledFromChildren: false, childAtoms: null,
-  missingChildren: [], failedChildren: [],
+  missingChildren: [], failedChildren: [], isStale: false,
+}
+
+// Display label for a handoff structure item (string legacy or new object format)
+function getThemeLabel(theme) {
+  return typeof theme === 'string' ? theme : theme?.label || theme?.key || '(unnamed)'
+}
+
+// Formatted string for passing a structure item into prompt context
+function getThemeContext(theme) {
+  if (typeof theme === 'string') return theme
+  const parts = [theme.label]
+  if (theme.purpose)        parts.push(`Purpose: ${theme.purpose}`)
+  if (theme.SMEReviewFocus) parts.push(`SME Review Focus: ${theme.SMEReviewFocus}`)
+  return parts.filter(Boolean).join('\n')
+}
+
+// Derive a camelCase key from a structure item
+function getThemeKey(theme) {
+  if (typeof theme === 'object' && theme?.key) return theme.key
+  return getThemeLabel(theme)
+    .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
+    .split(/\s+/).map((w, i) => i === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1)).join('')
 }
 const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 const SME_LENS_STATE_DEFAULT   = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 
 function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, workspaceId }) {
-  const [open,             setOpen]             = useState(false)
-  const [isGenerating,     setIsGenerating]     = useState(false)
-  const [structureRaw,     setStructureRaw]     = useState(null)
-  const [parsed,           setParsed]           = useState(null)    // { domainOfWork, handoffStructure }
-  const [genError,         setGenError]         = useState(null)
-  const [itemStates,       setItemStates]       = useState({})      // { [index]: ITEM_STATE_DEFAULT }
-  const [smeLensState,     setSmeLensState]     = useState(SME_LENS_STATE_DEFAULT)
-  const [smeLensRefineUi,  setSmeLensRefineUi]  = useState({ open: false, prompt: '', busy: false, error: null })
-  const [itemRefineUi,     setItemRefineUi]     = useState({})      // { [i]: { open, prompt, busy, error } }
-  const [childRefineUi,    setChildRefineUi]    = useState({})      // { ['i/key']: { open, prompt, busy, error } }
-  const [decompositionOpen, setDecompositionOpen] = useState({})    // { [i]: bool }
+  const [open,              setOpen]              = useState(false)
+  const [isGenerating,      setIsGenerating]      = useState(false)
+  const [structureRaw,      setStructureRaw]      = useState(null)
+  const [parsed,            setParsed]            = useState(null)   // { domainOfWork, handoffStructure }
+  const [genError,          setGenError]          = useState(null)
+  const [itemStates,        setItemStates]        = useState({})     // { [index]: ITEM_STATE_DEFAULT }
+  const [smeLensState,      setSmeLensState]      = useState(SME_LENS_STATE_DEFAULT)
+  const [structureIsStale,  setStructureIsStale]  = useState(false)  // true after SME lens changes
+  const [buHandoff,         setBuHandoff]         = useState(null)   // assembled BU-level handoff
+  // transient UI state — not persisted
+  const [itemOpen,          setItemOpen]          = useState({})     // { [i]: bool }
+  const [smeLensRefineUi,   setSmeLensRefineUi]   = useState({ open: false, prompt: '', busy: false, error: null })
+  const [itemRefineUi,      setItemRefineUi]      = useState({})
+  const [childRefineUi,     setChildRefineUi]     = useState({})
+  const [decompositionOpen, setDecompositionOpen] = useState({})
 
   // ── Draft persistence ───────────────────────────────────────────────────────
   const hasHydrated = useRef(false)
@@ -116,10 +142,12 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     try {
       const raw = localStorage.getItem(storageKey)
       if (raw) {
-        const { parsed: p, itemStates: is, smeLensState: sls } = JSON.parse(raw)
+        const { parsed: p, itemStates: is, smeLensState: sls, structureIsStale: sis, buHandoff: bh } = JSON.parse(raw)
         if (p)   setParsed(p)
         if (is)  setItemStates(is)
         if (sls) setSmeLensState(sls)
+        if (sis) setStructureIsStale(sis)
+        if (bh)  setBuHandoff(bh)
       }
     } catch { /* ignore corrupt data */ }
     hasHydrated.current = true
@@ -130,13 +158,14 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   useEffect(() => {
     if (!hasHydrated.current || !storageKey) return
     try {
-      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates, smeLensState }))
+      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates, smeLensState, structureIsStale, buHandoff }))
     } catch { /* quota errors are non-fatal */ }
-  }, [parsed, itemStates, smeLensState, storageKey])
+  }, [parsed, itemStates, smeLensState, structureIsStale, buHandoff, storageKey])
 
   // ── Structure generation ────────────────────────────────────────────────────
 
-  const canGenStructure = apiMode === 'ai' && !!activeStage1Rev && !isGenerating
+  const hasSmeLens    = !!smeLensState.parsedValue
+  const canGenStructure = apiMode === 'ai' && !!activeStage1Rev && !isGenerating && hasSmeLens
 
   async function handleGenerateHandoffStructure() {
     if (!canGenStructure) return
@@ -145,9 +174,9 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     setStructureRaw(null)
 
     const { messages } = buildHandoffStructureMessages(
-      activeStage1Rev.contentSnapshot, bu, otherBuNames,
+      activeStage1Rev.contentSnapshot, bu, smeLensState.parsedValue, otherBuNames,
     )
-    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1500 })
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 2000 })
 
     if (error) {
       setGenError(error)
@@ -165,7 +194,8 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     }
 
     setParsed({ domainOfWork: p.domainOfWork, handoffStructure: p.handoffStructure })
-    setItemStates({})   // reset all item state when structure changes
+    setItemStates({})
+    setStructureIsStale(false)
     setIsGenerating(false)
   }
 
@@ -188,7 +218,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       completedThemes,
       otherBuNames,
     )
-    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 400 })
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
 
     if (error) {
       setSmeLensState(prev => ({ ...prev, status: 'failed', rawResponse: result ?? null, parserError: error }))
@@ -202,6 +232,20 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     }
 
     setSmeLensState({ status: 'complete', rawResponse: result, parsedValue: p.parsedValue, parserError: null })
+    // Mark existing structure/items stale when SME lens changes
+    if (parsed?.handoffStructure) {
+      setStructureIsStale(true)
+      setItemStates(prev => {
+        const updated = { ...prev }
+        Object.keys(updated).forEach(idx => {
+          const s = updated[idx]?.status
+          if (s === 'complete' || s === 'partial') {
+            updated[idx] = { ...updated[idx], isStale: true }
+          }
+        })
+        return updated
+      })
+    }
   }
 
   async function handleRefineSmeLens() {
@@ -220,7 +264,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       prompt,
       otherBuNames,
     )
-    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 400 })
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
 
     if (error) {
       setSmeLensRefineUi(p => ({ ...p, busy: false, error }))
@@ -235,6 +279,19 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
 
     setSmeLensState(prev => ({ ...prev, rawResponse: result, parsedValue: p.parsedValue, parserError: null }))
     setSmeLensRefineUi({ open: false, prompt: '', busy: false, error: null })
+    if (parsed?.handoffStructure) {
+      setStructureIsStale(true)
+      setItemStates(prev => {
+        const updated = { ...prev }
+        Object.keys(updated).forEach(idx => {
+          const s = updated[idx]?.status
+          if (s === 'complete' || s === 'partial') {
+            updated[idx] = { ...updated[idx], isStale: true }
+          }
+        })
+        return updated
+      })
+    }
   }
 
   // ── Per-item generation ─────────────────────────────────────────────────────
@@ -246,10 +303,14 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     }))
   }
 
-  async function handleGenerateItem(i, structureItem) {
+  async function handleGenerateItem(i, theme) {
     if (!activeStage1Rev || !parsed) return
 
-    // Reset item and initialise child atoms — decomposition is the primary path
+    const structureItemContext = getThemeContext(theme)
+    const themeKey = getThemeKey(theme)
+
+    // Open item to show progress; reset state
+    setItemOpen(prev => ({ ...prev, [i]: true }))
     patchItem(i, {
       status: 'generating',
       isDecomposed: true,
@@ -257,6 +318,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       parsedValue: null,
       parserError: null,
       rawResponse: null,
+      isStale: false,
       childAtoms: Object.fromEntries(CHILD_ATOM_KEYS.map(k => [k, { ...CHILD_ATOM_STATE_DEFAULT }])),
       missingChildren: [],
       failedChildren: [],
@@ -273,7 +335,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
         bu,
         parsed.domainOfWork,
         smeLensState.parsedValue || null,
-        structureItem,
+        structureItemContext,
         childKey,
         otherBuNames,
       )
@@ -325,18 +387,16 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
 
     const isPartial = missingChildren.length > 0 || failedChildren.length > 0
 
-    const derivedKey = structureItem
-      .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
-      .split(/\s+/)
-      .map((w, idx) => idx === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1))
-      .join('')
-
-    if (!isPartial) setDecompositionOpen(prev => ({ ...prev, [i]: false }))
+    if (!isPartial) {
+      setDecompositionOpen(prev => ({ ...prev, [i]: false }))
+      setItemOpen(prev => ({ ...prev, [i]: false }))  // collapse on full success
+    }
 
     patchItem(i, {
       status: isPartial ? 'partial' : 'complete',
       assembledFromChildren: true,
-      parsedValue: { key: derivedKey, value: assembledValue },
+      isStale: false,
+      parsedValue: { key: themeKey, value: assembledValue },
       missingChildren,
       failedChildren,
     })
@@ -417,11 +477,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     const isPartial = missingChildren.length > 0 || failedChildren.length > 0
 
     const existingKey = iState.parsedValue?.key
-    const derivedKey = existingKey || theme
-      .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
-      .split(/\s+/)
-      .map((w, idx) => idx === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1))
-      .join('')
+    const derivedKey = existingKey || getThemeKey(theme)
 
     patchItem(i, {
       status: isPartial ? 'partial' : 'complete',
@@ -434,6 +490,29 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     if (!isPartial) {
       setDecompositionOpen(prev => ({ ...prev, [i]: false }))
     }
+  }
+
+  function handleAssembleBuHandoff() {
+    if (!parsed?.handoffStructure) return
+    const items = parsed.handoffStructure.map((theme, i) => {
+      const iState = itemStates[i]
+      return {
+        key: getThemeKey(theme),
+        label: getThemeLabel(theme),
+        status: iState?.status || 'not_started',
+        value: iState?.parsedValue?.value || null,
+      }
+    })
+    const completedItems = items.filter(it => it.value !== null)
+    if (!completedItems.length) return
+    setBuHandoff({
+      assembledAt: new Date().toISOString(),
+      domainOfWork: parsed.domainOfWork,
+      smeLens: smeLensState.parsedValue || null,
+      items,
+      completedCount: completedItems.length,
+      totalCount: items.length,
+    })
   }
 
   // ── Refine item helpers ─────────────────────────────────────────────────────
@@ -737,6 +816,19 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
             </div>
           </div>
 
+          {/* ── Stale structure warning ──────────────────────────── */}
+          {structureIsStale && parsed?.handoffStructure && (
+            <div style={{
+              marginBottom: 8, padding: '6px 9px', borderRadius: 4,
+              background: 'rgba(251,146,60,.07)', border: '1px solid rgba(251,146,60,.3)',
+              fontSize: 9, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.5,
+              display: 'flex', gap: 6, alignItems: 'flex-start',
+            }}>
+              <span style={{ flexShrink: 0 }}>⚠</span>
+              <span>SME lens changed — regenerate the handoff structure to align with the updated lens.</span>
+            </div>
+          )}
+
           {/* ── handoffStructure + per-item generation ───────────── */}
           <div style={{
             padding: '7px 9px', border: '1px solid var(--border)',
@@ -804,23 +896,43 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                     const canAssemble = !!(iState.childAtoms &&
                       Object.values(iState.childAtoms).some(cs => cs?.status === 'complete'))
 
+                    const isItemOpen = isGenItem || iState.status === 'failed' || !!itemOpen[i]
+
                     return (
                       <div key={i} style={{ paddingLeft: 8, borderLeft: `2px solid ${borderColor}` }}>
                         {/* Theme row */}
                         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
                           <div style={{ flex: 1, fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
-                            {theme}
-                            {assembled && isPartial && (
+                            {getThemeLabel(theme)}
+                            {iState.isStale && (
+                              <span style={{ marginLeft: 5, fontSize: 7, fontFamily: 'var(--fm)', color: '#fb923c', opacity: .85, fontWeight: 600 }}>
+                                STALE
+                              </span>
+                            )}
+                            {assembled && isPartial && !iState.isStale && (
                               <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', opacity: .85 }}>
                                 partial
                               </span>
                             )}
-                            {assembled && !isPartial && (
+                            {assembled && !isPartial && !iState.isStale && (
                               <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#a78bfa', opacity: .8 }}>
                                 assembled
                               </span>
                             )}
                           </div>
+                          {(iState.status === 'complete' || iState.status === 'partial') && (
+                            <button
+                              onClick={() => setItemOpen(prev => ({ ...prev, [i]: !prev[i] }))}
+                              style={{
+                                flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)',
+                                padding: '1px 5px', borderRadius: 3, cursor: 'pointer',
+                                background: 'transparent', border: '1px solid var(--border)',
+                                color: 'var(--muted)',
+                              }}
+                            >
+                              {isItemOpen ? '▲' : '▼'}
+                            </button>
+                          )}
                           <button
                             onClick={() => handleGenerateItem(i, theme)}
                             disabled={!canGenItem}
@@ -837,7 +949,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                         </div>
 
                         {/* Generated value — direct or assembled (complete/partial) */}
-                        {(iState.status === 'complete' || iState.status === 'partial') && iState.parsedValue && (
+                        {isItemOpen && (iState.status === 'complete' || iState.status === 'partial') && iState.parsedValue && (
                           <div style={{ paddingLeft: 4 }}>
                             {isPartial && (
                               <div style={{ marginBottom: 5 }}>
@@ -921,7 +1033,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                         )}
 
                         {/* Per-item error + raw + decompose trigger */}
-                        {iState.status === 'failed' && (
+                        {isItemOpen && iState.status === 'failed' && (
                           <div style={{ marginTop: 4 }}>
                             <div style={{
                               display: 'flex', gap: 4, fontSize: 9, fontFamily: 'var(--fm)',
@@ -944,7 +1056,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                         )}
 
                         {/* UX Fix C — toggle for decomposition after full assembly */}
-                        {assembled && !isPartial && iState.isDecomposed && (
+                        {isItemOpen && assembled && !isPartial && iState.isDecomposed && (
                           <button
                             onClick={() => setDecompositionOpen(prev => ({ ...prev, [i]: !prev[i] }))}
                             style={{
@@ -960,7 +1072,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                         )}
 
                         {/* Child atoms — shown if isDecomposed AND (partial/not-assembled OR toggle open) */}
-                        {iState.isDecomposed && iState.childAtoms && (assembled && !isPartial ? decompositionOpen[i] : true) && (
+                        {isItemOpen && iState.isDecomposed && iState.childAtoms && (assembled && !isPartial ? decompositionOpen[i] : true) && (
                           <div style={{
                             marginTop: 7, padding: '8px 9px',
                             background: 'rgba(139,92,246,.04)',
@@ -1174,28 +1286,14 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
             </div>
           )}
 
-          {/* ── Action buttons ───────────────────────────────────── */}
+          {/* ── Action buttons — SME lens → structure → assemble ─── */}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            <button
-              onClick={handleGenerateHandoffStructure}
-              disabled={!canGenStructure}
-              style={{
-                fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
-                padding: '4px 8px', borderRadius: 4,
-                cursor: canGenStructure ? 'pointer' : 'not-allowed',
-                background: canGenStructure ? 'rgba(59,130,246,.12)' : 'var(--surface)',
-                border: `1px solid ${canGenStructure ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
-                color: canGenStructure ? 'var(--accent)' : 'var(--muted)',
-                opacity: canGenStructure ? 1 : 0.58,
-              }}
-            >
-              {isGenerating ? 'Generating…' : parsed ? '↻ Regenerate handoff structure' : 'Generate handoff structure'}
-            </button>
+            {/* 1. Generate SME lens */}
             {(() => {
               const isGenLens = smeLensState.status === 'generating'
               const canGenLens = apiMode === 'ai' && !!activeStage1Rev && !isGenLens
               const lensLabel =
-                isGenLens                            ? 'Generating…'          :
+                isGenLens                            ? 'Generating…'           :
                 smeLensState.status === 'complete'   ? '↻ Regenerate SME lens' :
                 smeLensState.status === 'failed'     ? 'Retry SME lens'        :
                                                        'Generate SME lens'
@@ -1225,8 +1323,94 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                 </button>
               )
             })()}
-            <button disabled style={disabledButtonStyle}>Assemble BU handoff</button>
+
+            {/* 2. Generate handoff structure (requires SME lens) */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <button
+                onClick={handleGenerateHandoffStructure}
+                disabled={!canGenStructure}
+                style={{
+                  fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                  padding: '4px 8px', borderRadius: 4,
+                  cursor: canGenStructure ? 'pointer' : 'not-allowed',
+                  background: canGenStructure ? 'rgba(59,130,246,.12)' : 'var(--surface)',
+                  border: `1px solid ${canGenStructure ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
+                  color: canGenStructure ? 'var(--accent)' : 'var(--muted)',
+                  opacity: canGenStructure ? 1 : 0.58,
+                }}
+              >
+                {isGenerating ? 'Generating…' : parsed ? '↻ Regenerate handoff structure' : 'Generate handoff structure'}
+              </button>
+              {!hasSmeLens && apiMode === 'ai' && (
+                <div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', paddingLeft: 1 }}>
+                  Generate SME lens first
+                </div>
+              )}
+            </div>
+
+            {/* 3. Assemble BU handoff */}
+            {(() => {
+              const canAssembleBu = !!parsed?.handoffStructure && doneCount > 0
+              return (
+                <button
+                  onClick={handleAssembleBuHandoff}
+                  disabled={!canAssembleBu}
+                  style={{
+                    fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                    padding: '4px 8px', borderRadius: 4,
+                    cursor: canAssembleBu ? 'pointer' : 'not-allowed',
+                    background: buHandoff     ? 'rgba(0,229,180,.08)'  :
+                                canAssembleBu ? 'rgba(139,92,246,.12)' : 'var(--surface)',
+                    border: `1px solid ${
+                      buHandoff     ? 'rgba(0,229,180,.3)'    :
+                      canAssembleBu ? 'rgba(139,92,246,.35)'  : 'var(--border)'
+                    }`,
+                    color: buHandoff     ? '#00e5b4'  :
+                           canAssembleBu ? '#a78bfa'  : 'var(--muted)',
+                    opacity: canAssembleBu ? 1 : 0.58,
+                  }}
+                >
+                  {buHandoff ? '↻ Re-assemble BU handoff' : 'Assemble BU handoff'}
+                </button>
+              )
+            })()}
           </div>
+
+          {/* ── Assembled BU handoff summary ─────────────────────── */}
+          {buHandoff && (
+            <div style={{
+              marginTop: 9, padding: '8px 10px', borderRadius: 5,
+              background: 'rgba(0,229,180,.04)', border: '1px solid rgba(0,229,180,.2)',
+            }}>
+              <div style={{
+                fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4',
+                textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6,
+              }}>
+                BU Handoff — {buHandoff.completedCount}/{buHandoff.totalCount} items assembled
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                {buHandoff.items.map(item => (
+                  <div key={item.key} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{
+                      fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                      color: item.value ? '#00e5b4' : 'var(--muted)',
+                    }}>
+                      {item.value ? '✓' : '○'}
+                    </span>
+                    <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: item.value ? 'var(--text)' : 'var(--muted2)', lineHeight: 1.4 }}>
+                      {item.label}
+                    </span>
+                    {item.status === 'partial' && (
+                      <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: '#fb923c' }}>partial</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', opacity: .7 }}>
+                Assembled {new Date(buHandoff.assembledAt).toLocaleString()}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

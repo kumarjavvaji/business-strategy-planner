@@ -1,10 +1,14 @@
 // Handoff prompt builders and response parsers.
 // buildHandoffStructureMessages — one call per BU, returns domainOfWork + handoffStructure.
-// buildHandoffItemMessages      — one call per item, returns key + value for one structure theme.
+// buildHandoffChildAtomMessages — one call per child atom of a structure item.
 
 import { stageSnapshotToText } from './stageSnapshots'
 
-export function buildHandoffStructureMessages(stage1Snapshot, bu, otherBuNames) {
+/**
+ * Build messages to generate the handoff structure for one BU.
+ * Requires smeLens — the SME Review Lens drives what Stage 3 artifacts are needed.
+ */
+export function buildHandoffStructureMessages(stage1Snapshot, bu, smeLens, otherBuNames) {
   const stage1Context = stageSnapshotToText(stage1Snapshot)
   const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
 
@@ -18,29 +22,49 @@ export function buildHandoffStructureMessages(stage1Snapshot, bu, otherBuNames) 
       : null,
   ].filter(Boolean).join('\n')
 
-  const systemPrompt = `You are a strategic planning analyst preparing a Stage 3 planning handoff.
+  const smeLensSection = smeLens ? `\nSME Review Lens:\n${smeLens}` : ''
 
-Given a Stage 1 strategy basis and one target business unit, return:
+  const systemPrompt = `You are a strategic planning analyst preparing a Stage 3 execution planning handoff.
+
+Given a Stage 1 strategy basis, one target business unit, and the SME Review Lens for that BU, return:
 1. domainOfWork — a concise label for this BU's planning domain in this strategy (2–6 words)
-2. handoffStructure — 3–6 planning themes or responsibility areas this BU must address in Stage 3 execution planning
+2. handoffStructure — 4–7 Stage 3 execution-planning artifacts this BU must produce or validate
+
+CRITICAL: Each handoffStructure item must represent a Stage 3 planning artifact or execution question — NOT a restatement of the BU's Stage 2 responsibilities.
+
+Good example: "Partner Evaluation Decision Model" — a Stage 3 artifact Stage 3 must produce
+Bad example: "Partner evaluation and selection" — restates Stage 2 responsibility in task language
+
+The central question each item must answer:
+"What must Stage 3 produce so this BU can act, validate, govern, or operationalize its part of the strategy?"
 
 Return ONLY valid JSON — no markdown, no prose, no code fences. Exact schema:
 
 {
   "domainOfWork": "string",
-  "handoffStructure": ["string", "..."]
+  "handoffStructure": [
+    {
+      "key": "camelCase identifier derived from the label",
+      "label": "Artifact or planning question label (3–8 words)",
+      "purpose": "What this artifact is and why Stage 3 must produce it (1–2 sentences)",
+      "whyThisMattersForStage3": "What breaks in execution if this artifact is missing (1 sentence)",
+      "SMEReviewFocus": "What the SME will scrutinize in this artifact (1 short phrase)",
+      "required": true
+    }
+  ]
 }
 
 Rules:
 - domainOfWork: 2–6 words, specific to this BU and strategy context
-- handoffStructure: 3–6 items, each a concrete planning theme for Stage 3
+- handoffStructure: 4–7 items, each shaped by the provided SME Review Lens
+- SMEReviewFocus: derive directly from the SME Review Lens provided
 - Be specific to this company, strategy, and BU — no generic lists`
 
   const userPrompt = `Stage 1 Strategy Basis:
 ${stage1Context}
 
 Target Business Unit:
-${buDetails}
+${buDetails}${smeLensSection}
 
 Other Business Units in this strategy: ${otherBuList}
 
@@ -51,6 +75,26 @@ Generate the handoff structure for ${bu.name} only. Return only the JSON object.
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: userPrompt   },
     ],
+  }
+}
+
+// Normalize a single structure item — handles both legacy string format and new object format
+function normalizeStructureItem(item) {
+  if (typeof item === 'string') {
+    const label = item.trim()
+    const key = label.toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
+      .split(/\s+/).map((w, i) => i === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1)).join('')
+    return { key, label, purpose: '', whyThisMattersForStage3: '', SMEReviewFocus: '', required: true }
+  }
+  const label = typeof item.label === 'string' ? item.label.trim() : typeof item.key === 'string' ? item.key : '(unnamed)'
+  const key   = typeof item.key   === 'string' ? item.key.trim()   : label.toLowerCase().replace(/[^a-z0-9]/g, '')
+  return {
+    key,
+    label,
+    purpose:               typeof item.purpose               === 'string' ? item.purpose.trim()               : '',
+    whyThisMattersForStage3: typeof item.whyThisMattersForStage3 === 'string' ? item.whyThisMattersForStage3.trim() : '',
+    SMEReviewFocus:        typeof item.SMEReviewFocus        === 'string' ? item.SMEReviewFocus.trim()        : '',
+    required:              item.required !== false,
   }
 }
 
@@ -77,11 +121,18 @@ export function parseHandoffStructureResponse(rawText) {
   }
 
   const domainOfWork = typeof parsed?.domainOfWork === 'string' ? parsed.domainOfWork.trim() : null
-  const handoffStructure = Array.isArray(parsed?.handoffStructure)
-    ? parsed.handoffStructure.filter(s => typeof s === 'string' && s.trim()).map(s => s.trim())
-    : null
+  const rawStructure = Array.isArray(parsed?.handoffStructure) ? parsed.handoffStructure : null
 
-  if (!domainOfWork || !handoffStructure?.length) {
+  if (!domainOfWork || !rawStructure?.length) {
+    return { domainOfWork: null, handoffStructure: null, error: 'Response missing required fields.' }
+  }
+
+  const handoffStructure = rawStructure
+    .filter(s => s && (typeof s === 'string' || typeof s === 'object'))
+    .map(normalizeStructureItem)
+    .filter(s => s.label)
+
+  if (!handoffStructure.length) {
     return { domainOfWork: null, handoffStructure: null, error: 'Response missing required fields.' }
   }
 
@@ -480,37 +531,46 @@ Return only the JSON object with key "${childKey}".`
 
 /**
  * Build messages to generate the SMEReviewLens for one BU.
- * @param {object}       stage1Snapshot
- * @param {object}       bu
- * @param {string|null}  domainOfWork      — already-generated domain label (or null)
- * @param {string[]|null} handoffStructure — already-generated structure themes (or null)
- * @param {string[]|null} completedThemes  — subset of handoffStructure with completed items
- * @param {string[]}     otherBuNames
+ * Produces a paragraph description of the SME reviewer, not a short label.
  */
 export function buildSmeLensMessages(stage1Snapshot, bu, domainOfWork, handoffStructure, completedThemes, otherBuNames) {
   const stage1Context = stageSnapshotToText(stage1Snapshot)
   const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
 
   const domainLine = domainOfWork ? `\nDomain of Work: ${domainOfWork}` : ''
-  const structureSection = handoffStructure?.length
-    ? `\nHandoff Structure Themes:\n${handoffStructure.map(s => `  - ${s}`).join('\n')}`
+  const structureLabels = Array.isArray(handoffStructure)
+    ? handoffStructure.map(s => typeof s === 'string' ? s : s.label || s.key).filter(Boolean)
+    : []
+  const structureSection = structureLabels.length
+    ? `\nHandoff Structure Themes:\n${structureLabels.map(s => `  - ${s}`).join('\n')}`
     : ''
-  const completedSection = completedThemes?.length
-    ? `\nHandoff Items Generated (themes): ${completedThemes.join(', ')}`
+  const completedLabels = Array.isArray(completedThemes)
+    ? completedThemes.map(s => typeof s === 'string' ? s : s.label || s.key).filter(Boolean)
+    : []
+  const completedSection = completedLabels.length
+    ? `\nHandoff Items Generated (themes): ${completedLabels.join(', ')}`
     : ''
 
   const systemPrompt = `You are a strategic planning analyst preparing a Stage 3 execution planning handoff.
 
-Identify the SME Review Lens for this business unit — the specific area of subject-matter expertise that Stage 3 execution planning should draw on for validation, calibration, and risk assessment.
+Identify the SME Review Lens for this business unit — a detailed description of who should review Stage 3 execution plans for this BU, what they own, what they would challenge, and what evidence they need.
 
 Return ONLY valid JSON — no markdown, no prose, no code fences:
 
 { "SMEReviewLens": "string" }
 
-Rules:
-- SMEReviewLens: one concise phrase (3–10 words) naming the expert review lens
-- Be specific to this BU, its domain of work, and the strategy — no generic labels
-- Examples: "Legal & regulatory sign-off", "Supply chain resilience", "Customer segment economics"`
+Rules for SMEReviewLens — write a paragraph (2–5 sentences) that defines:
+- Who the likely SME/reviewer is (their role and relevant expertise background)
+- What decisions they own or influence in this strategy context
+- What they would challenge or question in the execution plan
+- What evidence or analysis they would require before accepting the plan
+- What operational details they care about
+- What would make the Stage 3 execution plan useful or unusable to them
+
+Style example:
+"A vendor-risk / regulated fintech integration SME would review whether the partner path actually reduces internal API burden, whether vendor outputs satisfy SR 11-7 evidence needs, whether contract terms prevent ongoing maintenance dependency, and whether escalation triggers are clear before partner scope bleed affects client delivery."
+
+Be specific to this BU, its strategic role, and the company context — not a generic reviewer description.`
 
   const userPrompt = `Stage 1 Strategy Basis:
 ${stage1Context}
@@ -571,8 +631,11 @@ export function buildSmeLensRefinementMessages(stage1Snapshot, bu, domainOfWork,
   const otherBuList = otherBuNames.length > 0 ? otherBuNames.join(', ') : 'None'
 
   const domainLine = domainOfWork ? `\nDomain of Work: ${domainOfWork}` : ''
-  const structureSection = handoffStructure?.length
-    ? `\nHandoff Structure Themes:\n${handoffStructure.map(s => `  - ${s}`).join('\n')}`
+  const structureLabels2 = Array.isArray(handoffStructure)
+    ? handoffStructure.map(s => typeof s === 'string' ? s : s.label || s.key).filter(Boolean)
+    : []
+  const structureSection = structureLabels2.length
+    ? `\nHandoff Structure Themes:\n${structureLabels2.map(s => `  - ${s}`).join('\n')}`
     : ''
 
   const systemPrompt = `You are a strategic planning analyst refining the SME Review Lens for a Stage 3 execution planning handoff.
