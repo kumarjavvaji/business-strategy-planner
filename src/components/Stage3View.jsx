@@ -48,6 +48,7 @@ const READINESS_COLORS = {
 }
 
 const STAGE3_QUEUE_DELAY_MS = 850
+const STAGE3_DRAFT_PLAN_VERSION = 1
 
 function riskColor(level)      { return RISK_COLORS[level]     || '#fb923c' }
 function readyColor(level)     { return READINESS_COLORS[level] || '#fb923c' }
@@ -59,6 +60,315 @@ function sleep(ms) {
 function isRateLimitedAIResponse(response) {
   const error = response?.error || ''
   return !!(response?.rateLimited || response?.status === 429 || /429|rate.?limit|rate_limit/i.test(error))
+}
+
+function storageSafeName(name) {
+  return String(name || 'unnamed').replace(/[^a-z0-9_-]+/gi, '_').slice(0, 90)
+}
+
+function stage2HandoffDraftKey(workspaceId, buName) {
+  return workspaceId ? `bsp_v1_handoff_${workspaceId}_${buName}` : null
+}
+
+function stage3BuPlanDraftKey(workspaceId, stage1Id, stage2Id, buName) {
+  if (!workspaceId || !stage1Id || !stage2Id || !buName) return null
+  return `bsp_v1_stage3_bu_plan_${workspaceId}_${stage1Id}_${stage2Id}_${storageSafeName(buName)}`
+}
+
+function readJsonStorage(key) {
+  if (!key || typeof localStorage === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+function writeJsonStorage(key, value) {
+  if (!key || typeof localStorage === 'undefined') return
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {}
+}
+
+function valueToSearchText(value) {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return value.map(valueToSearchText).join(' ')
+  if (typeof value === 'object') return Object.values(value).map(valueToSearchText).join(' ')
+  return String(value)
+}
+
+function listFromValue(value) {
+  if (!value) return []
+  if (Array.isArray(value)) {
+    return value.map(v => {
+      if (typeof v === 'string') return v
+      if (v?.name || v?.label || v?.title) {
+        return [v.name || v.label || v.title, v.purpose, v.whyThisSectionMatters, v.SMEReviewFocus]
+          .filter(Boolean)
+          .join(' - ')
+      }
+      return valueToSearchText(v)
+    }).filter(Boolean)
+  }
+  if (typeof value === 'string') return value ? [value] : []
+  return valueToSearchText(value) ? [valueToSearchText(value)] : []
+}
+
+function normalizeStructureItems(structure) {
+  if (!Array.isArray(structure)) return []
+  return structure.map((item, idx) => {
+    if (typeof item === 'string') {
+      return { key: item.toLowerCase().replace(/[^a-z0-9]+/g, '_'), label: item, text: item, required: true }
+    }
+    const label = item?.label || item?.name || item?.title || `Handoff item ${idx + 1}`
+    return {
+      key: item?.key || label.toLowerCase().replace(/[^a-z0-9]+/g, '_'),
+      label,
+      text: valueToSearchText(item),
+      required: item?.required !== false,
+    }
+  })
+}
+
+function extractDraftItemStates(draft) {
+  const states = draft?.itemStates || draft?.handoffItems || draft?.generatedItems || {}
+  return Object.entries(states).map(([key, state]) => ({
+    key,
+    status: state?.status || draft?.statuses?.handoffItems?.[key]?.status || 'not_started',
+    isStale: !!(state?.isStale || draft?.staleFlags?.handoffItems?.[key]),
+    parsedValue: state?.parsedValue || draft?.parsedValues?.handoffItems?.[key] || null,
+    parserError: state?.parserError || draft?.parserErrors?.handoffItems?.[key]?.parserError || null,
+    childAtoms: state?.childAtoms || draft?.childAtoms?.[key] || {},
+    text: `${key} ${valueToSearchText(state?.parsedValue || draft?.parsedValues?.handoffItems?.[key])} ${valueToSearchText(state?.childAtoms || draft?.childAtoms?.[key])}`,
+  }))
+}
+
+function getSmeLensFromDraft(draft, compiled = {}) {
+  return draft?.SMEReviewLens
+    || draft?.SMEReviewLensAtom?.parsedValue
+    || draft?.smeLensState?.parsedValue
+    || draft?.parsedValues?.SMEReviewLens
+    || compiled.SMEReviewLens
+    || compiled.SMEReviewLensAtom?.parsedValue
+    || null
+}
+
+function buildPlanningContextFromDraft(unit, draft) {
+  const compiled = unit?.stage3PlanningContext || {}
+  const parsed = draft?.parsed || {}
+  const structureItems = normalizeStructureItems(
+    parsed.handoffStructure || draft?.handoffStructure || compiled.handoffStructure || compiled.likelyExecutionSections,
+  )
+  const itemStates = extractDraftItemStates(draft)
+  const assembled = draft?.buHandoff || draft?.assembledBuHandoff || null
+  const textFor = (patterns) => {
+    const rx = new RegExp(patterns.join('|'), 'i')
+    return itemStates
+      .filter(item => rx.test(item.key) || rx.test(item.text))
+      .flatMap(item => listFromValue(item.parsedValue))
+      .slice(0, 8)
+  }
+  return {
+    ...compiled,
+    domainOfWork: parsed.domainOfWork || draft?.domainOfWork || compiled.domainOfWork || '',
+    SMEReviewLens: getSmeLensFromDraft(draft, compiled),
+    handoffStructure: structureItems,
+    likelyExecutionSections: compiled.likelyExecutionSections?.length
+      ? compiled.likelyExecutionSections
+      : structureItems.map(item => ({
+          name: item.label,
+          purpose: '',
+          whyThisSectionMatters: item.text,
+          required: item.required,
+        })),
+    criticalDependenciesToExplore: compiled.criticalDependenciesToExplore?.length
+      ? compiled.criticalDependenciesToExplore
+      : textFor(['depend', 'coordination', 'handoff', 'input', 'output']),
+    riskThemesToExplore: compiled.riskThemesToExplore?.length
+      ? compiled.riskThemesToExplore
+      : textFor(['risk', 'constraint', 'unknown', 'assumption']),
+    constraintsToCarryForward: compiled.constraintsToCarryForward?.length
+      ? compiled.constraintsToCarryForward
+      : textFor(['constraint', 'capacity', 'limit']),
+    unresolvedQuestionsForStage3: compiled.unresolvedQuestionsForStage3?.length
+      ? compiled.unresolvedQuestionsForStage3
+      : textFor(['question', 'unknown', 'unresolved']),
+    validationNeedsForStage3: compiled.validationNeedsForStage3?.length
+      ? compiled.validationNeedsForStage3
+      : textFor(['validation', 'evidence', 'review', 'metric', 'readiness']),
+    stage4DeliveryImplications: compiled.stage4DeliveryImplications?.length
+      ? compiled.stage4DeliveryImplications
+      : textFor(['stage 4', 'delivery', 'epic', 'acceptance', 'requirement', 'implementation']),
+    priorRefinementsToPreserve: compiled.priorRefinementsToPreserve?.length
+      ? compiled.priorRefinementsToPreserve
+      : listFromValue(assembled?.priorRefinementsToPreserve || draft?.refinementPrompts).slice(0, 6),
+    handoffStatus: draft?.handoffStatus || assembled?.handoffStatus || compiled.handoffStatus || 'not_started',
+  }
+}
+
+function mergePlansByBuName(savedPlans, draftPlans) {
+  const merged = [...(savedPlans || [])]
+  for (const plan of draftPlans || []) {
+    const idx = merged.findIndex(p => p?.buName === plan?.buName)
+    if (idx >= 0) merged[idx] = { ...merged[idx], ...plan }
+    else merged.push(plan)
+  }
+  return merged
+}
+
+const READINESS_COLUMNS = [
+  {
+    key: 'sequencing',
+    label: 'Sequencing / Incentives',
+    terms: ['sequenc', 'priorit', 'gate', 'incentiv', 'decision', 'milestone', 'path', 'tradeoff'],
+    needed: ['priorities', 'decision gates'],
+  },
+  {
+    key: 'risk',
+    label: 'Risks / Constraints',
+    terms: ['risk', 'constraint', 'unknown', 'question', 'assumption', 'limit', 'exposure'],
+    needed: ['risk themes', 'constraints'],
+  },
+  {
+    key: 'measurement',
+    label: 'Measurement / Readiness',
+    terms: ['metric', 'measure', 'success', 'failure', 'readiness', 'validation', 'evidence', 'indicator'],
+    needed: ['validation needs', 'success/failure signals'],
+  },
+  {
+    key: 'dependencies',
+    label: 'Cross-functional Dependencies',
+    terms: ['depend', 'input', 'output', 'coordination', 'handoff', 'interface', 'partner'],
+    needed: ['inputs/outputs', 'coordination needs'],
+  },
+  {
+    key: 'governance',
+    label: 'Staffing / Governance',
+    terms: ['owner', 'govern', 'decision', 'escalat', 'resource', 'staff', 'capacity', 'authority'],
+    needed: ['ownership', 'decision rights'],
+  },
+  {
+    key: 'domain',
+    label: 'Domain Execution Lens',
+    terms: ['domain', 'sme', 'review', 'lens', 'operational', 'execution'],
+    needed: ['domain of work', 'SME lens'],
+  },
+]
+
+function assessReadinessCell(column, handoff) {
+  if (!handoff?.exists) return { status: 'not_started', detail: 'No handoff item generated' }
+  if (column.key === 'domain') {
+    const missing = []
+    if (!handoff.domainOfWork) missing.push('domain of work')
+    if (!handoff.smeLens) missing.push('SME lens')
+    if (!handoff.structureItems.length) missing.push('handoff structure')
+    if (handoff.structureIsStale || handoff.smeLensStale) {
+      return { status: 'stale', detail: 'Needs regeneration or confirmation' }
+    }
+    if (!missing.length) return { status: 'ready', detail: 'SME lens + domain present' }
+    return { status: 'partial', detail: `${missing.length === 1 ? 'Needed' : 'Needed'}: ${missing.slice(0, 2).join(', ')}` }
+  }
+
+  const rx = new RegExp(column.terms.join('|'), 'i')
+  const matchingItems = [
+    ...handoff.structureItems.filter(item => rx.test(item.text) || rx.test(item.label)),
+    ...handoff.itemStates.filter(item => rx.test(item.key) || rx.test(item.text)),
+  ]
+  const completeItems = matchingItems.filter(item => item.status === 'complete' || item.parsedValue || Object.keys(item.childAtoms || {}).length)
+  const staleItems = matchingItems.filter(item => item.isStale)
+  const failedItems = matchingItems.filter(item => item.status === 'failed' || item.parserError)
+
+  if (staleItems.length) return { status: 'stale', detail: 'Needs regeneration or confirmation' }
+  if (completeItems.length) {
+    const partial = failedItems.length || completeItems.length < matchingItems.length
+    return {
+      status: partial ? 'partial' : 'ready',
+      detail: partial
+        ? `${completeItems.length} item${completeItems.length === 1 ? '' : 's'} present; some missing`
+        : `${completeItems.length} item${completeItems.length === 1 ? '' : 's'} present`,
+    }
+  }
+  if (matchingItems.length) return { status: 'needed', detail: `Generate ${matchingItems[0].label || matchingItems[0].key}` }
+  return { status: 'needed', detail: `Needed: ${column.needed.join(', ')}` }
+}
+
+function summarizeHandoffReadiness(bu, draft) {
+  const compiled = bu?.stage3PlanningContext || {}
+  const parsed = draft?.parsed || {}
+  const domainOfWork = parsed.domainOfWork || draft?.domainOfWork || compiled.domainOfWork || ''
+  const smeLens = getSmeLensFromDraft(draft, compiled)
+  const structureItems = normalizeStructureItems(
+    parsed.handoffStructure || draft?.handoffStructure || compiled.handoffStructure || compiled.likelyExecutionSections,
+  )
+  const itemStates = extractDraftItemStates(draft)
+  const exists = !!(domainOfWork || smeLens || structureItems.length || itemStates.length || draft?.buHandoff || draft?.assembledBuHandoff || Object.keys(compiled).length)
+  const handoff = {
+    exists,
+    domainOfWork,
+    smeLens,
+    structureItems,
+    itemStates,
+    structureIsStale: !!(draft?.structureIsStale || draft?.statuses?.structureIsStale || draft?.staleFlags?.structureIsStale),
+    smeLensStale: !!(draft?.SMEReviewLensAtom?.isStale || draft?.smeLensState?.isStale || draft?.staleFlags?.SMEReviewLens),
+    status: draft?.handoffStatus || draft?.buHandoff?.handoffStatus || compiled.handoffStatus || (exists ? 'partial' : 'not_started'),
+  }
+  const cells = Object.fromEntries(READINESS_COLUMNS.map(col => [col.key, assessReadinessCell(col, handoff)]))
+  const readyCount = Object.values(cells).filter(c => c.status === 'ready').length
+  const usableCount = Object.values(cells).filter(c => ['ready', 'partial'].includes(c.status)).length
+  const staleCount = Object.values(cells).filter(c => c.status === 'stale').length
+  const failedCount = itemStates.filter(item => item.status === 'failed' || item.parserError).length
+  const completion = !exists
+    ? 'none'
+    : staleCount || failedCount
+      ? 'partial'
+      : readyCount >= 5
+        ? 'full'
+        : usableCount >= 2
+          ? 'partial'
+          : 'limited'
+  return {
+    ...handoff,
+    cells,
+    readyCount,
+    usableCount,
+    staleCount,
+    failedCount,
+    completion,
+    planMode: completion === 'full' ? 'full' : completion === 'none' ? 'stage1_2_only' : 'limited',
+    planningContext: buildPlanningContextFromDraft(bu, draft),
+  }
+}
+
+function orderBusinessUnitsForStage3(units, stage1Snapshot) {
+  const numericOrder = units
+    .map((unit, idx) => ({ unit, idx, order: Number(unit?.orgOrder) }))
+    .filter(row => Number.isFinite(row.order))
+  if (numericOrder.length >= Math.max(2, Math.ceil(units.length * 0.6))) {
+    return [...units].sort((a, b) => {
+      const ao = Number.isFinite(Number(a?.orgOrder)) ? Number(a.orgOrder) : 999
+      const bo = Number.isFinite(Number(b?.orgOrder)) ? Number(b.orgOrder) : 999
+      return ao - bo
+    })
+  }
+
+  const strategyText = valueToSearchText(stage1Snapshot).toLowerCase()
+  const scoreUnit = (unit, idx) => {
+    const text = valueToSearchText(unit).toLowerCase()
+    let score = idx * 3
+    if (/executive|leadership|strategy|govern|decision|authority|sponsor/.test(text)) score -= 70
+    if (/primary|accountable|owner|driver/.test(unit?.involvementLevel || unit?.strategicInvolvement || '')) score -= 45
+    if (/product|architecture|capability|portfolio/.test(text)) score -= 25
+    if (/risk|compliance|control|regulatory|audit/.test(text)) score -= /compliance|regulatory|risk|audit/.test(strategyText) ? 35 : 5
+    if (/engineering|technology|platform|data|api|infrastructure/.test(text)) score -= 10
+    if (/delivery|service|client|advisory|consult/.test(text)) score += 8
+    if (/partner|vendor|channel/.test(text)) score += 18
+    if (/sales|marketing|gtm|commercial|finance|support/.test(text)) score += 28
+    return score
+  }
+  return [...units].sort((a, b) => scoreUnit(a, units.indexOf(a)) - scoreUnit(b, units.indexOf(b)))
 }
 
 // ── Scope selector (reuses Stage2View's REFINEMENT_SCOPES list) ──────────────
@@ -427,6 +737,209 @@ function GenerationProgress({ generation, onRetry }) {
   )
 }
 
+const matrixThStyle = {
+  textAlign: 'left',
+  padding: '8px 9px',
+  fontSize: 8,
+  fontFamily: 'var(--fm)',
+  color: 'var(--muted)',
+  textTransform: 'uppercase',
+  letterSpacing: '.04em',
+  borderRight: '1px solid var(--border)',
+  verticalAlign: 'bottom',
+}
+
+const matrixTdStyle = {
+  padding: '8px 9px',
+  verticalAlign: 'top',
+  borderRight: '1px solid var(--border)',
+}
+
+function ReadinessBadge({ status, detail }) {
+  const palette = {
+    ready:       { color: '#00e5b4', label: 'Ready' },
+    partial:     { color: '#fb923c', label: 'Partial' },
+    needed:      { color: '#fbbf24', label: 'Needed' },
+    stale:       { color: '#f87171', label: 'Stale' },
+    not_started: { color: 'var(--muted)', label: 'Not started' },
+  }
+  const p = palette[status] || palette.not_started
+  return (
+    <div style={{ minWidth: 112 }}>
+      <div style={{ fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700, color: p.color, marginBottom: 3 }}>
+        {p.label}
+      </div>
+      <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+        {detail}
+      </div>
+    </div>
+  )
+}
+
+function Stage3ReadinessMatrix({
+  rows,
+  planDrafts,
+  planGeneration,
+  draftOptIns,
+  onOptIntoStage12Draft,
+  onGenerateBUPlan,
+  apiMode,
+  disabled,
+}) {
+  const completedCount = rows.filter(row => planDrafts[row.unit.name]?.plan).length
+  const coordinationText = completedCount === 0
+    ? 'Coordination pending until BU plans exist.'
+    : completedCount === 1
+      ? 'Coordination not ready; one BU plan exists.'
+      : completedCount === rows.length
+        ? 'Full coordination synthesis is ready after all required BU plans exist.'
+        : 'Provisional coordination can be synthesized once explicitly triggered.'
+
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--r)',
+      padding: '13px 14px',
+      marginBottom: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: 10 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>
+            BU Execution Readiness
+          </div>
+          <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55 }}>
+            Readiness is based on the Stage 2 handoff draft and compiled context for each business unit.
+            Generated BU plans are persisted as Stage 3 drafts until a full stage-level revision is assembled.
+          </div>
+        </div>
+        <Badge color={completedCount === rows.length && rows.length ? '#00e5b4' : '#fb923c'} small>
+          {completedCount}/{rows.length} plans
+        </Badge>
+      </div>
+
+      <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 6 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 980 }}>
+          <thead>
+            <tr style={{ background: 'var(--s2)' }}>
+              <th style={matrixThStyle}>Business Unit</th>
+              {READINESS_COLUMNS.map(col => (
+                <th key={col.key} style={matrixThStyle}>{col.label}</th>
+              ))}
+              <th style={matrixThStyle}>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, idx) => {
+              const unit = row.unit
+              const readiness = row.readiness
+              const draft = planDrafts[unit.name]
+              const gen = planGeneration[unit.name]
+              const hasPlan = !!draft?.plan
+              const noHandoff = readiness.completion === 'none'
+              const optIn = !!draftOptIns[unit.name]
+              const canGenerate = !disabled && !gen?.running && (!noHandoff || optIn)
+              const cta = hasPlan
+                ? 'Regenerate BU plan'
+                : readiness.completion === 'full'
+                  ? 'Generate full exec plan'
+                  : readiness.completion === 'partial' || readiness.completion === 'limited'
+                    ? 'Generate limited draft'
+                    : optIn
+                      ? 'Generate from Stage 1/2 only'
+                      : 'Pending handoff'
+
+              return (
+                <tr key={unit.name || idx} style={{ borderTop: '1px solid var(--border)' }}>
+                  <td style={matrixTdStyle}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>
+                      {unit.name}
+                    </div>
+                    <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 5 }}>
+                      <Badge color={readiness.completion === 'full' ? '#00e5b4' : readiness.completion === 'none' ? 'var(--muted)' : '#fb923c'} small>
+                        {readiness.completion === 'full' ? 'complete handoff' : readiness.completion === 'none' ? 'no handoff' : 'partial handoff'}
+                      </Badge>
+                      {hasPlan && (
+                        <Badge color={draft.planGenerationMode === 'full' ? '#00e5b4' : '#fb923c'} small>
+                          {draft.planGenerationMode === 'full' ? 'full plan saved' : 'draft plan saved'}
+                        </Badge>
+                      )}
+                    </div>
+                    {readiness.domainOfWork && (
+                      <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+                        {readiness.domainOfWork}
+                      </div>
+                    )}
+                  </td>
+                  {READINESS_COLUMNS.map(col => (
+                    <td key={col.key} style={matrixTdStyle}>
+                      <ReadinessBadge {...readiness.cells[col.key]} />
+                    </td>
+                  ))}
+                  <td style={matrixTdStyle}>
+                    <button
+                      onClick={() => onGenerateBUPlan(unit, readiness)}
+                      disabled={!canGenerate}
+                      style={{
+                        fontSize: 8,
+                        fontFamily: 'var(--fm)',
+                        fontWeight: 700,
+                        padding: '5px 9px',
+                        borderRadius: 4,
+                        cursor: canGenerate ? 'pointer' : 'not-allowed',
+                        background: canGenerate ? 'var(--accent)' : 'var(--s2)',
+                        border: `1px solid ${canGenerate ? 'var(--accent)' : 'var(--border)'}`,
+                        color: canGenerate ? '#000' : 'var(--muted)',
+                        opacity: canGenerate ? 1 : 0.65,
+                        width: '100%',
+                      }}
+                    >
+                      {gen?.running ? 'Generating...' : cta}
+                    </button>
+                    {noHandoff && !optIn && (
+                      <button
+                        onClick={() => onOptIntoStage12Draft(unit.name)}
+                        disabled={disabled || gen?.running}
+                        style={{
+                          marginTop: 5,
+                          fontSize: 8,
+                          fontFamily: 'var(--fm)',
+                          padding: '3px 7px',
+                          borderRadius: 4,
+                          cursor: disabled ? 'not-allowed' : 'pointer',
+                          background: 'transparent',
+                          border: '1px solid var(--border)',
+                          color: 'var(--muted)',
+                          width: '100%',
+                        }}
+                      >
+                        Use Stage 1/2 only
+                      </button>
+                    )}
+                    {gen?.error && (
+                      <div style={{ marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                        {gen.error}
+                      </div>
+                    )}
+                    {apiMode !== 'ai' && (
+                      <div style={{ marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.4 }}>
+                        Mock plan
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ marginTop: 9, fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55 }}>
+        {coordinationText}
+      </div>
+    </div>
+  )
+}
+
 function IndicatorStrip({ plan }) {
   const indicators = [
     { label: 'Exec Risk',   value: plan.executionRisk,           color: riskColor(plan.executionRisk)              },
@@ -530,6 +1043,28 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
       {/* Card body */}
       {open && (
         <div style={{ padding: '14px 14px 0' }}>
+          {plan.planStatus && plan.planStatus !== 'full' && (
+            <div style={{
+              marginBottom: 12,
+              padding: '8px 11px',
+              background: 'rgba(251,146,60,.07)',
+              border: '1px solid rgba(251,146,60,.25)',
+              borderRadius: 5,
+              fontSize: 9,
+              fontFamily: 'var(--fm)',
+              color: '#fb923c',
+              lineHeight: 1.55,
+            }}>
+              {plan.planStatus === 'stage1_2_draft'
+                ? 'Stage 1/2-only draft. Review assumptions before coordination synthesis.'
+                : 'Limited draft. Missing or stale Stage 2 handoff context may reduce specificity.'}
+            </div>
+          )}
+          {plan.handoffWarnings?.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <BulletList items={plan.handoffWarnings} borderColor="rgba(251,146,60,.45)" />
+            </div>
+          )}
 
           {/* Mission */}
           {plan.mission && (
@@ -878,6 +1413,7 @@ function ApiModeStatus({ apiMode }) {
 
 export default function Stage3View({
   workspace,
+  workspaceId,
   stage1Revisions,
   stage1ActiveId,
   stage2Revisions,
@@ -896,15 +1432,19 @@ export default function Stage3View({
   const [compareRevId, setCompareRevId] = useState(null)
   const [isStageRefining, setIsStageRefining] = useState(false)
   const [generation, setGeneration] = useState(null)
+  const [stage3DraftPlans, setStage3DraftPlans] = useState({})
+  const [buPlanGeneration, setBuPlanGeneration] = useState({})
+  const [stage12DraftOptIns, setStage12DraftOptIns] = useState({})
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev      = stage3Revisions.find(r => r.id === stage3ActiveId) ?? null
   const savedExecutionPlans = activeRev?.contentSnapshot?.executionPlans || []
   const savedSummaryNote    = activeRev?.contentSnapshot?.summaryNote    || ''
   const savedCoordinationLayer = activeRev?.contentSnapshot?.coordinationLayer || null
+  const persistedExecutionPlans = Object.values(stage3DraftPlans).map(d => d?.plan).filter(Boolean)
   const executionPlans = generation
     ? (generation.buStates || []).map(bs => bs?.plan).filter(p => p && !p._error)
-    : savedExecutionPlans
+    : mergePlansByBuName(savedExecutionPlans, persistedExecutionPlans)
   const summaryNote    = generation?.summaryNote || savedSummaryNote
   const coordinationLayer = generation?.coordinationLayer || savedCoordinationLayer
 
@@ -929,6 +1469,28 @@ export default function Stage3View({
 
   const compareRevision = compareRevId ? stage3Revisions.find(r => r.id === compareRevId) ?? null : null
   const apiMode         = getApiMode()
+  const effectiveWorkspaceId = workspaceId || workspace?.id || null
+  const orderedStage2BUs = orderBusinessUnitsForStage3(stage2BUs, activeStage1Rev?.contentSnapshot)
+  const readinessRows = orderedStage2BUs.map(unit => {
+    const draft = readJsonStorage(stage2HandoffDraftKey(effectiveWorkspaceId, unit.name))
+    return { unit, draft, readiness: summarizeHandoffReadiness(unit, draft) }
+  })
+
+  useEffect(() => {
+    if (!effectiveWorkspaceId || !stage1ActiveId || !stage2ActiveId || !stage2BUs.length) {
+      setStage3DraftPlans({})
+      return
+    }
+    const hydrated = {}
+    for (const bu of stage2BUs) {
+      const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, bu.name)
+      const draft = readJsonStorage(key)
+      if (draft?.version === STAGE3_DRAFT_PLAN_VERSION && draft?.plan?.buName) {
+        hydrated[bu.name] = draft
+      }
+    }
+    setStage3DraftPlans(hydrated)
+  }, [effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, activeStage2Rev?.id])
 
   // ── Source rev labels ───────────────────────────────────────────────────────
   function sourceLabel(src) {
@@ -1258,6 +1820,133 @@ export default function Stage3View({
   }), [generation, activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage3Revisions.length, onSaveRevision])
 
   // ── Unit-level refinement ───────────────────────────────────────────────────
+  function persistBuPlanDraft(unit, plan, readiness, source) {
+    const now = new Date().toISOString()
+    const draft = {
+      version: STAGE3_DRAFT_PLAN_VERSION,
+      businessUnitName: unit.name,
+      sourceBasisRevisionId: stage1ActiveId,
+      sourceStage2RevisionId: stage2ActiveId,
+      plan,
+      planStatus: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_draft' : 'limited_draft',
+      planGenerationMode: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_only' : 'limited',
+      handoffStatus: readiness.status,
+      readinessSummary: {
+        completion: readiness.completion,
+        readyCount: readiness.readyCount,
+        usableCount: readiness.usableCount,
+        staleCount: readiness.staleCount,
+        failedCount: readiness.failedCount,
+      },
+      source,
+      lastSavedAt: now,
+    }
+    const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name)
+    writeJsonStorage(key, draft)
+    setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
+  }
+
+  async function handleGenerateBUPlan(unit, readiness) {
+    if (!activeStage1Rev || !activeStage2Rev) return { error: 'No active upstream revisions.' }
+    const s1Snap = activeStage1Rev.contentSnapshot
+    const enrichedUnit = { ...unit, stage3PlanningContext: readiness.planningContext }
+    const otherNames = orderedStage2BUs.filter(u => u.name !== unit.name).map(u => u.name).join(', ')
+    const modeLabel = readiness.completion === 'full'
+      ? 'full'
+      : readiness.completion === 'none'
+        ? 'Stage 1/2-only draft'
+        : 'limited draft'
+
+    setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: true, error: null } }))
+    setGenError(null)
+
+    try {
+      if (!hasApiKey()) {
+        const mock = generateMockStage3(s1Snap, { ...activeStage2Rev.contentSnapshot, businessUnits: [enrichedUnit] })
+        const mockPlan = mock.executionPlans?.[0]
+        if (!mockPlan) throw new Error('Mock generator did not return a BU execution plan.')
+        const plan = {
+          ...mockPlan,
+          buName: unit.name,
+          planStatus: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_draft' : 'limited_draft',
+          generationContext: modeLabel,
+        }
+        persistBuPlanDraft(unit, plan, readiness, 'mock')
+        setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null } }))
+        return { error: null }
+      }
+
+      let hasQueuedStage3Call = false
+      const callQueuedStage3AI = async (messages, options) => {
+        if (hasQueuedStage3Call) await sleep(STAGE3_QUEUE_DELAY_MS)
+        hasQueuedStage3Call = true
+        return callAI(messages, options)
+      }
+
+      console.log(`[Stage3 API] single BU structure start: ${unit.name}`)
+      const { messages: strMsgs } = buildBUStructureMessages(s1Snap, enrichedUnit, otherNames, {
+        prompt: readiness.completion === 'none'
+          ? 'Generate a limited draft from Stage 1 strategy basis and Stage 2 core business-unit data only. Make missing Stage 2 handoff context explicit as assumptions or unknowns.'
+          : readiness.completion === 'full'
+            ? 'Generate a full BU execution plan using the available Stage 2 handoff context.'
+            : 'Generate a limited draft using partial Stage 2 handoff context. Preserve warnings where handoff elements are missing or stale.',
+        impactSummary: `${modeLabel} BU execution-plan generation from readiness matrix.`,
+      })
+      const strResponse = await callQueuedStage3AI(strMsgs, { temperature: 0.3, maxTokens: 900 })
+      if (strResponse.error) {
+        const err = isRateLimitedAIResponse(strResponse)
+          ? `Rate limited while generating ${unit.name}. Retry this BU after cooldown.`
+          : strResponse.error
+        throw new Error(err)
+      }
+      const parsedStr = parseBUStructureResponse(strResponse.result)
+      if (parsedStr.error || !parsedStr.structure) throw new Error(parsedStr.error || 'BU structure parse failed.')
+
+      const structure = parsedStr.structure
+      const sections = {}
+      const sectionTokens = { workstreams: 1400, lenses: 1200, risk: 1000 }
+      for (const sectionKey of structure.sections) {
+        console.log(`[Stage3 API] single BU section start: ${unit.name} / ${sectionKey}`)
+        const { messages: secMsgs } = buildBUSectionMessages(s1Snap, enrichedUnit, structure, sectionKey, otherNames, {
+          prompt: readiness.completion === 'none'
+            ? 'This is an explicitly requested Stage 1/2-only draft. Surface assumptions caused by missing Stage 2 handoff context.'
+            : readiness.completion === 'full'
+              ? 'Use the complete Stage 2 handoff context to generate a full execution section.'
+              : 'Use available partial handoff context and mark missing context as constraints or unknowns.',
+          impactSummary: `${modeLabel} BU execution-plan generation from readiness matrix.`,
+        })
+        const secResponse = await callQueuedStage3AI(secMsgs, { temperature: 0.3, maxTokens: sectionTokens[sectionKey] || 900 })
+        if (secResponse.error) {
+          const err = isRateLimitedAIResponse(secResponse)
+            ? `Rate limited while generating ${unit.name} / ${SECTION_LABELS[sectionKey] || sectionKey}. Retry this BU after cooldown.`
+            : secResponse.error
+          throw new Error(err)
+        }
+        const parsedSec = parseBUSectionResponse(sectionKey, secResponse.result)
+        if (parsedSec.error || !parsedSec.section) throw new Error(parsedSec.error || `${SECTION_LABELS[sectionKey] || sectionKey} parse failed.`)
+        sections[sectionKey] = parsedSec.section
+      }
+
+      const plan = {
+        ...assembleBUPlan(structure, sections),
+        planStatus: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_draft' : 'limited_draft',
+        generationContext: modeLabel,
+        handoffWarnings: readiness.completion === 'full'
+          ? []
+          : readiness.completion === 'none'
+            ? ['Generated without Stage 2 handoff context; review assumptions before coordination synthesis.']
+            : ['Generated from partial Stage 2 handoff context; missing or stale handoff elements may reduce specificity.'],
+      }
+      persistBuPlanDraft(unit, plan, readiness, 'ai')
+      setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null } }))
+      return { error: null }
+    } catch (err) {
+      const message = err?.message || String(err)
+      setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: message } }))
+      return { error: message }
+    }
+  }
+
   const handleUnitRegenerate = useCallback(async (planIndex, refinementPrompt, impactSummary, refinementScope) => {
     if (!activeStage1Rev)  return { error: 'No active Stage 1 revision.' }
     if (!activeStage2Rev)  return { error: 'No active Stage 2 revision.' }
@@ -1372,6 +2061,16 @@ export default function Stage3View({
   if (stage3Revisions.length === 0) {
     return (
       <div style={{ maxWidth: 840, padding: '0 16px 40px' }}>
+        <Stage3ReadinessMatrix
+          rows={readinessRows}
+          planDrafts={stage3DraftPlans}
+          planGeneration={buPlanGeneration}
+          draftOptIns={stage12DraftOptIns}
+          onOptIntoStage12Draft={buName => setStage12DraftOptIns(prev => ({ ...prev, [buName]: true }))}
+          onGenerateBUPlan={handleGenerateBUPlan}
+          apiMode={apiMode}
+          disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
+        />
         <div style={{
           background: 'var(--surface)', border: '1px solid var(--border)',
           borderRadius: 'var(--r)', padding: '40px 32px', textAlign: 'center', marginBottom: 12,
@@ -1499,6 +2198,17 @@ export default function Stage3View({
           <ApiModeStatus apiMode={apiMode} />
         </div>
       </div>
+
+      <Stage3ReadinessMatrix
+        rows={readinessRows}
+        planDrafts={stage3DraftPlans}
+        planGeneration={buPlanGeneration}
+        draftOptIns={stage12DraftOptIns}
+        onOptIntoStage12Draft={buName => setStage12DraftOptIns(prev => ({ ...prev, [buName]: true }))}
+        onGenerateBUPlan={handleGenerateBUPlan}
+        apiMode={apiMode}
+        disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
+      />
 
       {/* ── Staleness banner ──────────────────────────────────────────────── */}
       {isStale && (

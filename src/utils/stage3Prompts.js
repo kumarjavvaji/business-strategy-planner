@@ -199,6 +199,35 @@ function stage1Summary(stage1Snapshot) {
 }
 
 function businessUnitSummary(unit) {
+  const planningContext = unit?.stage3PlanningContext || {}
+  const rawLikelySections = Array.isArray(planningContext.likelyExecutionSections)
+    ? planningContext.likelyExecutionSections
+    : []
+  const likelySections = safeList(
+    rawLikelySections.map(section => (
+      typeof section === 'string'
+        ? section
+        : [
+            section?.name,
+            section?.purpose,
+            section?.whyThisSectionMatters,
+          ].filter(Boolean).join(' - ')
+    )),
+  )
+  const planningLines = planningContext && Object.keys(planningContext).length
+    ? `
+Stage 3 planning handoff:
+Domain of work: ${safeStr(planningContext.domainOfWork)}
+SME review lens: ${typeof planningContext.SMEReviewLens === 'string' ? safeStr(planningContext.SMEReviewLens) : safeStr(planningContext.SMEReviewLens?.summary || planningContext.SMEReviewLens?.reviewerProfile)}
+Likely execution sections: ${likelySections.join('; ')}
+Critical dependencies to explore: ${safeList(planningContext.criticalDependenciesToExplore).join('; ')}
+Risk themes to explore: ${safeList(planningContext.riskThemesToExplore).join('; ')}
+Constraints to carry forward: ${safeList(planningContext.constraintsToCarryForward).join('; ')}
+Unresolved Stage 3 questions: ${safeList(planningContext.unresolvedQuestionsForStage3).join('; ')}
+Validation needs: ${safeList(planningContext.validationNeedsForStage3).join('; ')}
+Stage 4 implications: ${safeList(planningContext.stage4DeliveryImplications).join('; ')}
+Prior refinements to preserve: ${safeList(planningContext.priorRefinementsToPreserve).join('; ')}`
+    : ''
   return `Name: ${unit?.name || unit?.buName || 'Unnamed unit'}
 Purpose: ${unit?.purpose || ''}
 Strategic involvement: ${unit?.strategicInvolvement || ''}
@@ -206,7 +235,7 @@ Involvement level: ${unit?.involvementLevel || ''}
 Responsibilities: ${(unit?.keyResponsibilities || []).join('; ')}
 Dependencies: ${(unit?.dependencies || []).join('; ')}
 Risks/unknowns: ${(unit?.risksAndUnknowns || []).join('; ')}
-Success metrics: ${(unit?.keySuccessMetrics || []).join('; ')}`
+Success metrics: ${(unit?.keySuccessMetrics || []).join('; ')}${planningLines}`
 }
 
 export function buildStage3CoordinationMessages(stage1Snapshot, stage2Snapshot, refinement = {}) {
