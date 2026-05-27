@@ -38,6 +38,7 @@ import RevisionDiffViewer from './RevisionDiffViewer'
 import RefinementPanel    from './RefinementPanel'
 import LearningSignals    from './LearningSignals'
 import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
+import { ATOM_STATUSES } from '../utils/generationAtoms'
 
 // ── Involvement level styles ──────────────────────────────────────────────────
 const LEVEL_COLORS = {
@@ -87,7 +88,7 @@ function SubList({ label, items, borderColor }) {
 }
 
 const ITEM_STATE_DEFAULT = {
-  status: 'not_started', rawResponse: null, parsedValue: null, parserError: null,
+  status: ATOM_STATUSES.NOT_STARTED, rawResponse: null, parsedValue: null, parserError: null,
   isDecomposed: false, assembledFromChildren: false, childAtoms: null,
   missingChildren: [], failedChildren: [], isStale: false,
 }
@@ -113,8 +114,8 @@ function getThemeKey(theme) {
     .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
     .split(/\s+/).map((w, i) => i === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1)).join('')
 }
-const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
-const SME_LENS_STATE_DEFAULT   = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
+const CHILD_ATOM_STATE_DEFAULT = { status: ATOM_STATUSES.NOT_STARTED, rawResponse: null, parsedValue: null, parserError: null }
+const SME_LENS_STATE_DEFAULT   = { status: ATOM_STATUSES.NOT_STARTED, rawResponse: null, parsedValue: null, parserError: null }
 
 function normalizeHandoffDraftPayload(payload = {}) {
   const legacyParsed = payload.parsed || null
