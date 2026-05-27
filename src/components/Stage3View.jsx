@@ -47,8 +47,19 @@ const READINESS_COLORS = {
   high:   '#00e5b4',
 }
 
+const STAGE3_QUEUE_DELAY_MS = 850
+
 function riskColor(level)      { return RISK_COLORS[level]     || '#fb923c' }
 function readyColor(level)     { return READINESS_COLORS[level] || '#fb923c' }
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function isRateLimitedAIResponse(response) {
+  const error = response?.error || ''
+  return !!(response?.rateLimited || response?.status === 429 || /429|rate.?limit|rate_limit/i.test(error))
+}
 
 // ── Scope selector (reuses Stage2View's REFINEMENT_SCOPES list) ──────────────
 
@@ -319,9 +330,19 @@ function GenerationProgress({ generation, onRetry }) {
   const buStates = generation.buStates || []
   const phase    = generation.phase    || 'bu_phases'
 
-  const mark = s => ({ complete: '✓', generating: '~', failed: '!', pending: '○' }[s] || '○')
-  const col  = s => ({ complete: '#00e5b4', failed: '#f87171', generating: '#fb923c', pending: 'var(--muted)' }[s] || 'var(--muted)')
-  const retryLabel = generation.failedStep === 'coordination' ? 'Retry coordination' : 'Retry failed units'
+  const mark = s => ({ complete: '✓', generating: '~', failed: '!', rate_limited: '!', pending: '○' }[s] || '○')
+  const col  = s => ({
+    complete: '#00e5b4',
+    failed: '#f87171',
+    rate_limited: '#fb923c',
+    generating: '#fb923c',
+    pending: 'var(--muted)',
+  }[s] || 'var(--muted)')
+  const retryLabel = generation.rateLimited
+    ? 'Resume after cooldown'
+    : generation.failedStep === 'coordination'
+      ? 'Retry coordination'
+      : 'Retry failed sections'
 
   return (
     <div style={{
@@ -351,11 +372,13 @@ function GenerationProgress({ generation, onRetry }) {
           // Determine overall BU status
           let buStatus
           if (plan && !plan._error)                         buStatus = 'complete'
+          else if (bs.structureStatus === 'rate_limited')   buStatus = 'rate_limited'
           else if (bs.structureStatus === 'failed')         buStatus = 'failed'
           else if (bs.structureStatus === 'generating')     buStatus = 'generating'
           else if (bs.structureStatus === 'complete') {
             const sv = Object.values(bs.sectionStatuses || {})
-            if (sv.some(s => s === 'failed'))               buStatus = 'failed'
+            if (sv.some(s => s === 'rate_limited'))         buStatus = 'rate_limited'
+            else if (sv.some(s => s === 'failed'))          buStatus = 'failed'
             else if (sv.some(s => s === 'generating'))      buStatus = 'generating'
             else if (sv.length && sv.every(s => s === 'complete')) buStatus = 'assembling'
             else                                            buStatus = 'generating'
@@ -936,7 +959,6 @@ export default function Stage3View({
   }, [shouldAutoGenerate])
 
   // ── Full Stage 3 generation — hierarchical: structure → sections → assembly → coordination ──
-  const CONCURRENCY = 3
 
   async function runChunkedStage3({ refinementPrompt = '', impactSummary = '', resume = false } = {}) {
     if (!activeStage1Rev || !activeStage2Rev) return { error: 'No active upstream revisions.' }
@@ -977,59 +999,99 @@ export default function Stage3View({
     if (units.length === 0) { setIsGenerating(false); return { error: 'No business units in Stage 2.' } }
 
     const emptyBUState = () => ({ structureStatus: 'pending', structure: null, sectionStatuses: {}, sections: {}, plan: null })
+    const resetInFlight = (status) => status === 'generating' ? 'pending' : status
+    const normalizeResumeBUState = (bs) => {
+      if (!bs) return emptyBUState()
+      return {
+        ...emptyBUState(),
+        ...bs,
+        structureStatus: resetInFlight(bs.structureStatus || 'pending'),
+        sectionStatuses: Object.fromEntries(
+          Object.entries(bs.sectionStatuses || {}).map(([key, status]) => [key, resetInFlight(status)]),
+        ),
+        plan: bs.plan && !bs.plan._error ? bs.plan : null,
+      }
+    }
+    let hasQueuedStage3Call = false
+    const callQueuedStage3AI = async (messages, options) => {
+      if (hasQueuedStage3Call) await sleep(STAGE3_QUEUE_DELAY_MS)
+      hasQueuedStage3Call = true
+      return callAI(messages, options)
+    }
 
-    // Resume: keep completed buStates, reset failed ones
+    // Resume: keep completed structures/sections/plans and only retry failed or rate-limited chunks.
     let buStates = (resume && generation?.buStates?.length === units.length)
-      ? generation.buStates.map(bs => bs?.plan && !bs.plan._error ? bs : emptyBUState())
+      ? generation.buStates.map(normalizeResumeBUState)
       : units.map(() => emptyBUState())
 
     setGeneration({
       phase: 'bu_phases', active: true, units, buStates: [...buStates],
       coordinationLayer: null, summaryNote: '',
-      failedStep: null, failedIndices: [], error: null, refinementPrompt, impactSummary,
+      failedStep: null, failedIndices: [], failedSections: [], rateLimited: false,
+      error: null, refinementPrompt, impactSummary,
     })
 
     const otherNames = (idx) => units.filter((_, i) => i !== idx).map(u => u.name).join(', ')
     const refinement = { prompt: refinementPrompt, impactSummary }
     const failedBUIndices = []
 
-    // Process one BU fully: structure → sections (parallel) → assembly
+    // Process one BU fully through the global queue: structure → sections → assembly.
     async function processBU(idx) {
       const unit = units[idx]
+      const currentState = buStates[idx] || emptyBUState()
+      if (currentState.plan && !currentState.plan._error) return { ok: true }
 
       // ── Structure call ──────────────────────────────────────────────────
-      console.log(`[Stage3 API] BU structure start: ${unit.name}`)
-      buStates[idx] = { ...emptyBUState(), structureStatus: 'generating' }
-      setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-
-      const { messages: strMsgs } = buildBUStructureMessages(s1Snap, unit, otherNames(idx), refinement)
-      const { result: strResult, error: strError } = await callAI(strMsgs, { temperature: 0.3, maxTokens: 900 })
-
-      if (strError) {
-        console.log(`[Stage3 API] BU structure failed: ${unit.name}`)
-        buStates[idx] = { ...buStates[idx], structureStatus: 'failed', structure: { _error: strError } }
+      let structure = currentState.structure
+      if (!structure || currentState.structureStatus !== 'complete') {
+        console.log(`[Stage3 API] BU structure start: ${unit.name}`)
+        buStates[idx] = { ...emptyBUState(), ...currentState, structureStatus: 'generating', plan: null }
         setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-        return false
+
+        const { messages: strMsgs } = buildBUStructureMessages(s1Snap, unit, otherNames(idx), refinement)
+        const strResponse = await callQueuedStage3AI(strMsgs, { temperature: 0.3, maxTokens: 900 })
+        const { result: strResult, error: strError } = strResponse
+
+        if (strError) {
+          const rateLimited = isRateLimitedAIResponse(strResponse)
+          console.log(`[Stage3 API] BU structure ${rateLimited ? 'rate limited' : 'failed'}: ${unit.name}`)
+          buStates[idx] = {
+            ...buStates[idx],
+            structureStatus: rateLimited ? 'rate_limited' : 'failed',
+            structure: { _error: strError },
+          }
+          setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+          return { ok: false, rateLimited, failedIndex: idx, failedSection: null, error: strError }
+        }
+
+        const parsedStr = parseBUStructureResponse(strResult)
+        if (parsedStr.error || !parsedStr.structure) {
+          const err = parsedStr.error || 'Structure parse failed.'
+          console.log(`[Stage3 API] BU structure failed: ${unit.name}`)
+          buStates[idx] = { ...buStates[idx], structureStatus: 'failed', structure: { _error: err } }
+          setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+          return { ok: false, rateLimited: false, failedIndex: idx, failedSection: null, error: err }
+        }
+
+        console.log(`[Stage3 API] BU structure complete: ${unit.name} → sections: [${parsedStr.structure.sections.join(', ')}]`)
+        structure = parsedStr.structure
+        const sectionStatuses = Object.fromEntries(structure.sections.map(k => [k, 'pending']))
+        buStates[idx] = { ...buStates[idx], structureStatus: 'complete', structure, sectionStatuses, sections: {} }
+        setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
       }
 
-      const parsedStr = parseBUStructureResponse(strResult)
-      if (parsedStr.error || !parsedStr.structure) {
-        const err = parsedStr.error || 'Structure parse failed.'
-        console.log(`[Stage3 API] BU structure failed: ${unit.name}`)
-        buStates[idx] = { ...buStates[idx], structureStatus: 'failed', structure: { _error: err } }
-        setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-        return false
-      }
-
-      console.log(`[Stage3 API] BU structure complete: ${unit.name} → sections: [${parsedStr.structure.sections.join(', ')}]`)
-      const structure = parsedStr.structure
-      const sectionStatuses = Object.fromEntries(structure.sections.map(k => [k, 'pending']))
-      buStates[idx] = { ...buStates[idx], structureStatus: 'complete', structure, sectionStatuses, sections: {} }
-      setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-
-      // ── Section calls (parallel within BU) ─────────────────────────────
+      // ── Section calls (global queue: one API call at a time) ───────────
       const sectionTokens = { workstreams: 1400, lenses: 1200, risk: 1000 }
-      await Promise.all(structure.sections.map(async (sectionKey) => {
+      for (const sectionKey of structure.sections) {
+        if (buStates[idx].sections?.[sectionKey] && !buStates[idx].sections[sectionKey]._error) {
+          buStates[idx] = {
+            ...buStates[idx],
+            sectionStatuses: { ...buStates[idx].sectionStatuses, [sectionKey]: 'complete' },
+          }
+          setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
+          continue
+        }
+
         console.log(`[Stage3 API] BU section start: ${unit.name} / ${sectionKey}`)
         buStates[idx] = {
           ...buStates[idx],
@@ -1039,17 +1101,19 @@ export default function Stage3View({
 
         const maxTok = sectionTokens[sectionKey] || 900
         const { messages: secMsgs } = buildBUSectionMessages(s1Snap, unit, structure, sectionKey, otherNames(idx), refinement)
-        const { result: secResult, error: secError } = await callAI(secMsgs, { temperature: 0.3, maxTokens: maxTok })
+        const secResponse = await callQueuedStage3AI(secMsgs, { temperature: 0.3, maxTokens: maxTok })
+        const { result: secResult, error: secError } = secResponse
 
         if (secError) {
-          console.log(`[Stage3 API] BU section failed: ${unit.name} / ${sectionKey}`)
+          const rateLimited = isRateLimitedAIResponse(secResponse)
+          console.log(`[Stage3 API] BU section ${rateLimited ? 'rate limited' : 'failed'}: ${unit.name} / ${sectionKey}`)
           buStates[idx] = {
             ...buStates[idx],
-            sectionStatuses: { ...buStates[idx].sectionStatuses, [sectionKey]: 'failed' },
+            sectionStatuses: { ...buStates[idx].sectionStatuses, [sectionKey]: rateLimited ? 'rate_limited' : 'failed' },
             sections: { ...buStates[idx].sections, [sectionKey]: { _error: secError } },
           }
           setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-          return
+          return { ok: false, rateLimited, failedIndex: idx, failedSection: sectionKey, error: secError }
         }
 
         const parsedSec = parseBUSectionResponse(sectionKey, secResult)
@@ -1062,7 +1126,7 @@ export default function Stage3View({
             sections: { ...buStates[idx].sections, [sectionKey]: { _error: err } },
           }
           setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-          return
+          continue
         }
 
         console.log(`[Stage3 API] BU section complete: ${unit.name} / ${sectionKey}`)
@@ -1072,31 +1136,56 @@ export default function Stage3View({
           sections: { ...buStates[idx].sections, [sectionKey]: parsedSec.section },
         }
         setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-      }))
+      }
 
       // Check for section failures
-      if (structure.sections.some(k => buStates[idx].sections[k]?._error)) return false
+      const failedSection = structure.sections.find(k => buStates[idx].sections[k]?._error)
+      if (failedSection) {
+        return { ok: false, rateLimited: false, failedIndex: idx, failedSection, error: buStates[idx].sections[failedSection]._error }
+      }
 
       // ── Client-side assembly ────────────────────────────────────────────
       const plan = assembleBUPlan(structure, buStates[idx].sections)
       console.log(`[Stage3 API] BU complete: ${unit.name}`)
       buStates[idx] = { ...buStates[idx], plan }
       setGeneration(g => ({ ...(g || {}), buStates: [...buStates] }))
-      return true
+      return { ok: true }
     }
 
-    // Run BUs in batches of CONCURRENCY
+    // Run one global Stage 3 queue. This intentionally avoids nested BU/section fanout.
     const pendingIndices = units.map((_, i) => i).filter(i => !buStates[i]?.plan || buStates[i].plan._error)
-    for (let batchStart = 0; batchStart < pendingIndices.length; batchStart += CONCURRENCY) {
-      const batch = pendingIndices.slice(batchStart, batchStart + CONCURRENCY)
-      const results = await Promise.all(batch.map(idx => processBU(idx)))
-      results.forEach((ok, j) => { if (!ok) failedBUIndices.push(batch[j]) })
+    const failedSections = []
+    let rateLimitPause = null
+    for (const idx of pendingIndices) {
+      const result = await processBU(idx)
+      if (!result.ok) {
+        failedBUIndices.push(idx)
+        if (result.failedSection) failedSections.push({ unitIndex: idx, sectionKey: result.failedSection })
+        if (result.rateLimited) {
+          rateLimitPause = result
+          break
+        }
+      }
     }
 
     if (failedBUIndices.length > 0) {
-      const err = `${failedBUIndices.length} BU plan(s) failed. Retry to resume.`
+      const failedUnitName = units[rateLimitPause?.failedIndex]?.name
+      const failedSectionName = rateLimitPause?.failedSection
+        ? (SECTION_LABELS[rateLimitPause.failedSection] || rateLimitPause.failedSection)
+        : 'structure'
+      const err = rateLimitPause
+        ? `Stage 3 hit API rate limiting at ${failedUnitName || 'a business unit'} / ${failedSectionName}. Completed sections were preserved. Resume after cooldown to retry only unfinished sections.`
+        : `${failedSections.length || failedBUIndices.length} Stage 3 section(s) failed. Retry to resume only failed sections.`
       setGenError(err)
-      setGeneration(g => ({ ...(g || {}), active: false, failedIndices: failedBUIndices, failedStep: 'section', error: err }))
+      setGeneration(g => ({
+        ...(g || {}),
+        active: false,
+        failedIndices: failedBUIndices,
+        failedSections,
+        failedStep: rateLimitPause ? 'rate_limit' : 'section',
+        rateLimited: !!rateLimitPause,
+        error: err,
+      }))
       setIsGenerating(false)
       return { error: err }
     }
@@ -1107,14 +1196,19 @@ export default function Stage3View({
 
     console.log('[Stage3 API] coordination start')
     const { messages: coordMsgs } = buildStage3CoordinationSynthesisMessages(s1Snap, completedPlans, refinement)
-    const { result: coordResult, error: coordError } = await callAI(coordMsgs, { temperature: 0.3, maxTokens: 1800 })
+    const coordResponse = await callQueuedStage3AI(coordMsgs, { temperature: 0.3, maxTokens: 1800 })
+    const { result: coordResult, error: coordError } = coordResponse
 
     if (coordError) {
+      const rateLimited = isRateLimitedAIResponse(coordResponse)
       console.log('[Stage3 API] coordination failed')
-      setGenError(coordError)
-      setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', error: coordError }))
+      const err = rateLimited
+        ? 'Stage 3 hit API rate limiting during coordination synthesis. Completed sections were preserved. Resume after cooldown to synthesize coordination and save the revision.'
+        : coordError
+      setGenError(err)
+      setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', rateLimited, error: err }))
       setIsGenerating(false)
-      return { error: coordError }
+      return { error: err }
     }
 
     const parsedCoord = parseStage3CoordinationSynthesisResponse(coordResult)

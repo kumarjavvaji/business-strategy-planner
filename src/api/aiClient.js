@@ -45,7 +45,7 @@ export function getApiMode() {
  *
  * @param {Array<{ role: 'system'|'user'|'assistant', content: string }>} messages
  * @param {{ model?: string, temperature?: number, maxTokens?: number, timeoutMs?: number }} options
- * @returns {Promise<{ result: string|null, error: string|null }>}
+ * @returns {Promise<{ result: string|null, error: string|null, status?: number, rateLimited?: boolean }>}
  */
 export async function callAI(messages, options = {}) {
   const key = import.meta.env.VITE_ANTHROPIC_API_KEY
@@ -104,7 +104,12 @@ export async function callAI(messages, options = {}) {
         const parsed = JSON.parse(bodyText)
         if (parsed?.error?.message) msg = parsed.error.message
       } catch { /* ignore */ }
-      return { result: null, error: msg }
+      return {
+        result: null,
+        error: msg,
+        status: response.status,
+        rateLimited: response.status === 429,
+      }
     }
 
     const data = await response.json()
