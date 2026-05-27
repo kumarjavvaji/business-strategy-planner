@@ -33,6 +33,26 @@ const STRUCTURAL_IMPACTS = new Set([
 function safeLevel(v) { return LEVELS.has(v) ? v : 'medium' }
 function safeStructuralImpact(v) { return STRUCTURAL_IMPACTS.has(v) ? v : 'none' }
 
+const EXECUTION_LENS_NAMES = [
+  'compliance/governance',
+  'auditability',
+  'regulatory validation',
+  'platform/architecture',
+  'infrastructure scalability',
+  'delivery/operations',
+  'enablement/training',
+  'client advisory',
+  'GTM/messaging',
+  'marketing/commercialization',
+  'finance/commercial gating',
+  'vendor coordination',
+  'implementation readiness',
+  'data governance',
+  'operational support',
+  'escalation management',
+  'organizational change management',
+]
+
 function safeAssumptions(v) {
   if (!Array.isArray(v)) return []
   return v
@@ -43,9 +63,39 @@ function safeAssumptions(v) {
     .filter(a => a.text)
 }
 
+function safeExecutionLenses(v) {
+  if (!Array.isArray(v)) return []
+  return v
+    .map(lens => {
+      if (typeof lens === 'string') {
+        return { name: safeStr(lens), focus: '', actions: [], risks: [], validation: [] }
+      }
+      return {
+        name:       safeStr(lens?.name || lens?.lens),
+        focus:      safeStr(lens?.focus || lens?.purpose),
+        actions:    safeList(lens?.actions || lens?.workstreams),
+        risks:      safeList(lens?.risks),
+        validation: safeList(lens?.validation || lens?.evidence),
+      }
+    })
+    .filter(lens => lens.name || lens.focus || lens.actions.length || lens.risks.length || lens.validation.length)
+}
+
 // ── Schema string (shared between full and unit prompts) ──────────────────────
 
 const BU_PLAN_SCHEMA = `{
+  "strategicRole": "string - concise explanation of why this BU matters in the strategy",
+  "priorityOutcomes": ["string - universal core, 2-3 outcome statements"],
+  "criticalWorkstreams": ["string - universal core, 2-4 concrete workstreams"],
+  "executionLenses": [
+    {
+      "name": "one relevant execution lens",
+      "focus": "why this lens matters for this BU",
+      "actions": ["string - materially useful actions only"],
+      "risks": ["string - lens-specific risk only"],
+      "validation": ["string - evidence or validation need only"]
+    }
+  ],
   "buName": "string — exact name of the business unit",
   "mission": "string — 1-sentence operator-style mission for this BU in this initiative (no generic language)",
   "strategicObjectives": ["string — 2-3 items"],
@@ -76,6 +126,25 @@ const BU_PLAN_SCHEMA = `{
   "confidenceLevel": "low | medium | high",
   "organizationalReadiness": "low | medium | high"
 }`
+
+const DOMAIN_ADAPTIVE_STAGE3_RULES = `
+STAGE SEMANTICS:
+- Stage 2 is organizational capability topology: what capabilities exist, what they own, and how they interact.
+- Stage 3 is domain-adaptive operationalization: how operators execute, validate, govern, coordinate, and assess the strategy.
+- Do not move Stage 2 mapping work into Stage 3, and do not turn every Stage 3 plan into the same enterprise template.
+
+DOMAIN-ADAPTIVE EXECUTION RULES:
+1. Every business unit needs a concise universal execution core: mission, strategicRole, priorityOutcomes, criticalWorkstreams, dependencies, constraints, risks/unknowns, success/failure indicators, and readinessAssessment.
+2. Additional detail must adapt to the BU and strategy context. Emphasize only materially useful dimensions based on operational burden, regulatory exposure, technical complexity, client-facing responsibility, GTM dependency, maturity, implementation risk, and uncertainty.
+3. Use executionLenses only when relevant. Candidate lenses: ${EXECUTION_LENS_NAMES.join('; ')}.
+4. Omit irrelevant sections by returning empty arrays or empty strings. Empty is better than generic filler.
+5. Preserve executive readability and SME actionability. Prefer short concrete items over exhaustive consultant-style sections.
+6. Compliance units should emphasize auditability, evidence generation, regulatory timing, approvals, and liability exposure.
+7. Technology units should emphasize architecture, integration, observability, scalability, and infrastructure dependencies.
+8. Delivery/advisory units should emphasize enablement, client trust, field readiness, narrative consistency, escalation routing, and feedback loops.
+9. Sales/marketing units should emphasize positioning, adoption, messaging coordination, and commercialization readiness.
+10. Finance units should emphasize investment posture, ROI assumptions, commercial gating, and operational leverage.
+`
 
 // ── Full Stage 3 generation ───────────────────────────────────────────────────
 
@@ -111,6 +180,8 @@ For EACH business unit, reason through:
 - What would invalidate the entire plan for this BU?
 - What are the real staffing and system constraints?
 - What governance touchpoints are genuinely required vs. theatre?
+
+${DOMAIN_ADAPTIVE_STAGE3_RULES}
 
 Return ONLY a valid JSON object — no markdown, no prose, no code fences. Exact schema:
 
@@ -199,11 +270,19 @@ export function parseStage3Response(rawText) {
 }
 
 function normalisePlan(p) {
+  const priorityOutcomes = safeList(p.priorityOutcomes || p.strategicObjectives)
+  const criticalWorkstreams = safeList(p.criticalWorkstreams || p.initiativesMissionCritical)
+  const legacyObjectives = safeList(p.strategicObjectives)
+  const legacyCritical = safeList(p.initiativesMissionCritical)
   return {
     buName:                       safeStr(p.buName)                || 'Unnamed unit',
     mission:                      safeStr(p.mission),
-    strategicObjectives:          safeList(p.strategicObjectives),
-    initiativesMissionCritical:   safeList(p.initiativesMissionCritical),
+    strategicRole:                safeStr(p.strategicRole || p.strategicInvolvement),
+    priorityOutcomes,
+    criticalWorkstreams,
+    executionLenses:              safeExecutionLenses(p.executionLenses),
+    strategicObjectives:          legacyObjectives.length ? legacyObjectives : priorityOutcomes,
+    initiativesMissionCritical:   legacyCritical.length ? legacyCritical : criticalWorkstreams,
     initiativesOptional:          safeList(p.initiativesOptional),
     initiativesDeferred:          safeList(p.initiativesDeferred),
     initiativesBlocked:           safeList(p.initiativesBlocked),
@@ -253,6 +332,8 @@ Structural rules:
 - If you do not create a new consulting/advisory plan for such a refinement, assign the role explicitly to an existing plan and make that ownership visible in mission, mission-critical initiatives, staffingOwnership, dependencies, systemsTools, leadingIndicators, keySuccessMetrics, failureSignals, and readinessAssessment.
 - Treat ownership, primary-client-channel, dependency, KPI, risk, and strategic emphasis changes as content changes, not notes.
 - Preserve one coherent execution package; update dependencies and sequencing after any structural change.
+
+${DOMAIN_ADAPTIVE_STAGE3_RULES}
 
 Return ONLY a valid JSON object with this exact schema:
 {
@@ -394,6 +475,8 @@ CRITICAL RULES — FOLLOW WITHOUT EXCEPTION:
 Preserve organisational coherence with the other plans. Do not create dependencies or decision
 rights that conflict with other units.
 
+${DOMAIN_ADAPTIVE_STAGE3_RULES}
+
 Return ONLY a valid JSON object — no markdown, no prose, no code fences:
 ${BU_PLAN_SCHEMA}`
 
@@ -481,6 +564,39 @@ export function generateMockStage3(stage1Snapshot, stage2Snapshot) {
 
   const cap = (s, n = 100) => s ? (s.length > n ? s.slice(0, n) + '…' : s) : ''
 
+  function inferMockLenses(bu) {
+    const text = [
+      bu.name,
+      bu.purpose,
+      bu.strategicInvolvement,
+      ...(bu.keyResponsibilities || []),
+      ...(bu.dependencies || []),
+      ...(bu.risksAndUnknowns || []),
+    ].join(' ').toLowerCase()
+    const lenses = []
+    const add = (name, focus, actions, risks = [], validation = []) => {
+      lenses.push({ name, focus, actions, risks, validation })
+    }
+
+    if (/compliance|regulat|risk|legal|audit|governance/.test(text)) {
+      add('compliance/governance', 'Control evidence and approval timing determine whether execution can proceed.', ['Define evidence requirements for the first gate', 'Confirm approval workflow and accountable approver'], ['Regulatory interpretation changes after work has started'], ['Evidence package accepted by the accountable control owner'])
+    }
+    if (/tech|platform|data|system|infrastructure|architecture|security|integration|engineering/.test(text)) {
+      add('platform/architecture', 'Technical dependencies shape feasibility, observability, and scale readiness.', ['Map required integrations and data flows', 'Identify observability and support requirements before launch'], ['Integration scope is larger than the planning assumption'], ['Architecture review confirms no launch-blocking dependency'])
+    }
+    if (/delivery|operations|service|advisory|consult|client|field|implementation|enablement/.test(text)) {
+      add('delivery/operations', 'Field execution and client trust depend on readiness, escalation routes, and feedback loops.', ['Prepare field readiness materials', 'Define escalation routing and feedback capture process'], ['Client-facing teams receive inconsistent guidance'], ['Readiness checks show operators can explain and execute the offer'])
+    }
+    if (/sales|channel|gtm|market|commercial|revenue|customer acquisition/.test(text)) {
+      add('GTM/messaging', 'Commercial uptake depends on positioning clarity and timing with delivery readiness.', ['Align launch messaging with product and delivery constraints', 'Define adoption signals for early GTM review'], ['Sales motion promises capabilities before delivery readiness'], ['Messaging review confirms consistent buyer narrative'])
+    }
+    if (/finance|pricing|budget|roi|investment|commercial/.test(text)) {
+      add('finance/commercial gating', 'Investment posture and ROI assumptions determine how far execution should scale.', ['Set spend thresholds for phase advancement', 'Validate unit economics before expansion'], ['Costs scale before demand or validation evidence is strong enough'], ['Gate review confirms ROI assumptions remain credible'])
+    }
+
+    return lenses.slice(0, 3)
+  }
+
   function makePlan(bu) {
     const isPrimary    = bu.involvementLevel === 'primary'
     const isInformed   = bu.involvementLevel === 'informed'
@@ -505,17 +621,24 @@ export function generateMockStage3(stage1Snapshot, stage2Snapshot) {
       ? [`Blocked on: ${cap(deps[0], 70)} — unblock by completing upstream milestone`]
       : []
 
+    const priorityOutcomes = [
+      cap(bu.purpose, 90) || `Deliver ${name} contribution to the strategy`,
+      isPrimary ? `Produce the evidence needed for the next executive gate` : `Provide timely input without slowing the primary workstreams`,
+      deps.length ? `Resolve critical handoffs with dependent units` : `Keep execution scope narrow enough for reliable review`,
+    ].filter(Boolean).slice(0, 3)
+    const criticalWorkstreams = missionCritical.length > 0
+      ? missionCritical
+      : [`Execute core ${name} responsibilities per the strategy basis`]
+
     return {
       buName: name,
       mission: `${isPrimary ? 'Own' : isInformed ? 'Monitor' : 'Support'} the ${cap(bu.strategicInvolvement || bu.purpose, 80)} for this initiative.`,
-      strategicObjectives: [
-        cap(bu.purpose, 90) || `Deliver ${name} contribution to the strategy`,
-        `Establish clear decision rights and handoff protocols with dependent units`,
-        isPrimary ? `Lead the evidence generation required for the go/no-go gate` : `Provide structured input to the core execution team`,
-      ].filter(Boolean).slice(0, 3),
-      initiativesMissionCritical: missionCritical.length > 0
-        ? missionCritical
-        : [`Execute core ${name} responsibilities per the strategy basis`],
+      strategicRole: `${name} turns the Stage 2 capability map into ${isPrimary ? 'primary execution ownership' : isInformed ? 'review and signal monitoring' : 'supporting execution capacity'} for this strategy.`,
+      priorityOutcomes,
+      criticalWorkstreams,
+      executionLenses: inferMockLenses(bu),
+      strategicObjectives: priorityOutcomes,
+      initiativesMissionCritical: criticalWorkstreams,
       initiativesOptional: optional.length > 0
         ? optional
         : [`Develop supplementary materials beyond the minimum required`],

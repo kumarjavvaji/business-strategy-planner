@@ -182,6 +182,7 @@ function AssumptionItem({ assumption }) {
 // ── Initiative grid ───────────────────────────────────────────────────────────
 
 function InitiativeBlock({ label, items, accentColor, empty }) {
+  if (!items?.length && /Optional|Deferred|Blocked/.test(label || '')) return null
   const c = accentColor || 'rgba(255,255,255,.2)'
   return (
     <div style={{
@@ -215,6 +216,45 @@ function InitiativeBlock({ label, items, accentColor, empty }) {
 }
 
 // ── Indicator strip ───────────────────────────────────────────────────────────
+
+function LensList({ lenses }) {
+  if (!lenses?.length) return null
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 7 }}>
+      {lenses.map((lens, i) => {
+        const title = lens?.name || `Lens ${i + 1}`
+        return (
+          <div key={`${title}-${i}`} style={{
+            background: 'rgba(0,229,180,.05)',
+            border: '1px solid rgba(0,229,180,.16)',
+            borderRadius: 6,
+            padding: '9px 11px',
+          }}>
+            <div style={{
+              fontSize: 8,
+              fontFamily: 'var(--fm)',
+              color: '#00e5b4',
+              textTransform: 'uppercase',
+              letterSpacing: '.06em',
+              marginBottom: 5,
+              fontWeight: 600,
+            }}>
+              {title}
+            </div>
+            {lens?.focus && (
+              <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 6 }}>
+                {lens.focus}
+              </div>
+            )}
+            <BulletList items={lens?.actions} borderColor="rgba(0,229,180,.35)" />
+            <BulletList items={lens?.validation} borderColor="rgba(59,130,246,.35)" />
+            <BulletList items={lens?.risks} borderColor="rgba(248,113,113,.35)" />
+          </div>
+        )
+      })}
+    </div>
+  )
+}
 
 function IndicatorStrip({ plan }) {
   const indicators = [
@@ -276,6 +316,8 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
 
   // Involvement badge color from indicator scores
   const execC = riskColor(plan.executionRisk)
+  const priorityOutcomes = plan.priorityOutcomes?.length ? plan.priorityOutcomes : plan.strategicObjectives
+  const hasMeasurement = plan.leadingIndicators?.length || plan.keySuccessMetrics?.length || plan.failureSignals?.length
 
   return (
     <div style={{
@@ -334,15 +376,23 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
             </div>
           )}
 
-          {/* Strategic objectives */}
-          {plan.strategicObjectives?.length > 0 && (
-            <PlanSection label="Strategic Objectives">
-              <BulletList items={plan.strategicObjectives} borderColor="rgba(59,130,246,.4)" />
+          {plan.strategicRole && (
+            <PlanSection label="Strategic Role">
+              <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.7 }}>
+                {plan.strategicRole}
+              </div>
+            </PlanSection>
+          )}
+
+          {/* Priority outcomes */}
+          {priorityOutcomes?.length > 0 && (
+            <PlanSection label="Priority Outcomes">
+              <BulletList items={priorityOutcomes} borderColor="rgba(59,130,246,.4)" />
             </PlanSection>
           )}
 
           {/* Prioritised initiatives */}
-          <PlanSection label="Prioritised Initiatives">
+          <PlanSection label="Execution Workstreams">
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 7, marginBottom: 2 }}>
               <InitiativeBlock label="🔴 Mission Critical" items={plan.initiativesMissionCritical} accentColor="#f87171" empty="None identified" />
               <InitiativeBlock label="🔵 Optional"         items={plan.initiativesOptional}        accentColor="#3b82f6" empty="None identified" />
@@ -360,6 +410,12 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
                 </div>
               )}
               <BulletList items={plan.keyMilestones} borderColor="rgba(0,229,180,.4)" />
+            </PlanSection>
+          )}
+
+          {plan.executionLenses?.length > 0 && (
+            <PlanSection label="Adaptive Execution Lenses">
+              <LensList lenses={plan.executionLenses} />
             </PlanSection>
           )}
 
@@ -444,6 +500,7 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
           )}
 
           {/* Metrics */}
+          {hasMeasurement && (
           <PlanSection label="Measurement">
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
               <div>
@@ -460,6 +517,7 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
               </div>
             </div>
           </PlanSection>
+          )}
 
           {/* Readiness assessment */}
           {plan.readinessAssessment && (

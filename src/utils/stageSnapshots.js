@@ -285,6 +285,20 @@ export function stage3SnapshotToText(snapshot) {
     }
 
     push('Mission',               plan.mission)
+    push('Strategic Role',        plan.strategicRole)
+    list('Priority Outcomes',     plan.priorityOutcomes)
+    list('Critical Workstreams',  plan.criticalWorkstreams)
+    if (plan.executionLenses?.length) {
+      lines.push('  Execution Lenses:')
+      plan.executionLenses.forEach(lens => {
+        const name = lens?.name || 'Lens'
+        const focus = lens?.focus ? ` - ${lens.focus}` : ''
+        lines.push(`    - ${name}${focus}`)
+        ;(lens?.actions || []).forEach(item => lines.push(`      action: ${item}`))
+        ;(lens?.risks || []).forEach(item => lines.push(`      risk: ${item}`))
+        ;(lens?.validation || []).forEach(item => lines.push(`      validation: ${item}`))
+      })
+    }
     list('Strategic Objectives',  plan.strategicObjectives)
     list('Mission Critical',      plan.initiativesMissionCritical)
     list('Optional',              plan.initiativesOptional)
