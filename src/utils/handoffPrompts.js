@@ -591,9 +591,29 @@ Generate the SME Review Lens for ${bu.name}. Return only the JSON object.`
 }
 
 /**
+ * Convert an SME lens (string or structured object) to a prompt-ready string.
+ * Used by all prompt builders that accept a smeLens argument.
+ */
+export function normalizeSMELensForPrompt(lens) {
+  if (!lens) return null
+  if (typeof lens === 'string') return lens
+  if (typeof lens !== 'object') return String(lens)
+  const parts = []
+  if (lens.summary)           parts.push(lens.summary)
+  if (lens.reviewerProfile)   parts.push(`Reviewer: ${lens.reviewerProfile}`)
+  if (lens.decisionAuthority) parts.push(`Decision authority: ${lens.decisionAuthority}`)
+  if (Array.isArray(lens.challengeAreas)       && lens.challengeAreas.length)       parts.push(`Challenge areas: ${lens.challengeAreas.join('; ')}`)
+  if (Array.isArray(lens.evidenceRequired)      && lens.evidenceRequired.length)      parts.push(`Evidence required: ${lens.evidenceRequired.join('; ')}`)
+  if (Array.isArray(lens.operationalConcerns)   && lens.operationalConcerns.length)   parts.push(`Operational concerns: ${lens.operationalConcerns.join('; ')}`)
+  if (Array.isArray(lens.planFailureConditions) && lens.planFailureConditions.length) parts.push(`Plan failure conditions: ${lens.planFailureConditions.join('; ')}`)
+  return parts.filter(Boolean).join('\n') || null
+}
+
+/**
  * Parse an SME lens response.
- * Accepts: { "SMEReviewLens": "..." } | { "smeReviewLens": "..." } | { "value": "..." }
- * @returns {{ parsedValue: string|null, error: string|null }}
+ * Accepts: { "SMEReviewLens": "..." | {...} } | { "smeReviewLens": ... } | { "value": ... }
+ * parsedValue is string (legacy) or structured object.
+ * @returns {{ parsedValue: string|object|null, error: string|null }}
  */
 export function parseSmeLensResponse(rawText) {
   if (!rawText?.trim()) return { parsedValue: null, error: 'Empty response from API.' }
@@ -612,14 +632,31 @@ export function parseSmeLensResponse(rawText) {
   try { parsed = JSON.parse(jsonStr) }
   catch { return { parsedValue: null, error: 'Could not parse JSON from response.' } }
 
-  const value =
-    typeof parsed?.SMEReviewLens === 'string' ? parsed.SMEReviewLens.trim() :
-    typeof parsed?.smeReviewLens === 'string' ? parsed.smeReviewLens.trim() :
-    typeof parsed?.value         === 'string' ? parsed.value.trim()         :
+  const raw =
+    parsed?.SMEReviewLens !== undefined ? parsed.SMEReviewLens :
+    parsed?.smeReviewLens !== undefined ? parsed.smeReviewLens :
+    parsed?.value         !== undefined ? parsed.value         :
     null
 
-  if (!value) return { parsedValue: null, error: 'Response missing SMEReviewLens value.' }
-  return { parsedValue: value, error: null }
+  if (raw === null || raw === undefined) return { parsedValue: null, error: 'Response missing SMEReviewLens value.' }
+
+  // String — backward compat
+  if (typeof raw === 'string') {
+    const val = raw.trim()
+    return val ? { parsedValue: val, error: null } : { parsedValue: null, error: 'Empty SMEReviewLens string.' }
+  }
+
+  // Structured object
+  if (typeof raw === 'object') {
+    if (raw.summary || raw.reviewerProfile || raw.challengeAreas) {
+      return { parsedValue: raw, error: null }
+    }
+    // Unknown shape — extract any string values
+    const text = Object.values(raw).filter(v => typeof v === 'string').join('\n').trim()
+    return text ? { parsedValue: text, error: null } : { parsedValue: null, error: 'Unrecognizable SMEReviewLens structure.' }
+  }
+
+  return { parsedValue: null, error: 'Unrecognizable SMEReviewLens format.' }
 }
 
 /**
@@ -642,12 +679,25 @@ export function buildSmeLensRefinementMessages(stage1Snapshot, bu, domainOfWork,
 
 Update the SMEReviewLens according to the refinement instruction. Return ONLY valid JSON — no markdown, no prose, no code fences:
 
-{ "SMEReviewLens": "string" }
+{ "SMEReviewLens": <string | structured object> }
+
+SMEReviewLens may be either a detailed string or a structured object:
+{
+  "summary": "one-sentence summary",
+  "reviewerProfile": "who reviews Stage 3 plans for this BU and their expertise",
+  "decisionAuthority": "what decisions they own or influence",
+  "challengeAreas": ["what they would challenge or question"],
+  "evidenceRequired": ["what evidence or analysis they need before accepting the plan"],
+  "operationalConcerns": ["operational details they care about"],
+  "planFailureConditions": ["what would make the Stage 3 plan unusable to them"]
+}
 
 Rules:
-- SMEReviewLens: one concise phrase (3–10 words)
-- Be specific to this BU, its domain, and the strategy
-- Apply targeted changes only — do not rewrite the lens if the instruction does not require it`
+- SMEReviewLens should be specific, readable, and detailed enough to shape downstream handoff structure and item generation
+- Preserve ALL existing detail unless the refinement instruction explicitly asks to shorten or remove it
+- If the instruction asks for readability improvements (paragraphs, bullets, structured format), reformat the existing detail — do not compress or omit substance
+- Apply targeted changes only — do not rewrite content the instruction does not address
+- Be specific to this BU, its strategic role, and the company context`
 
   const userMsg = `Stage 1 Strategy Basis:
 ${stage1Context}

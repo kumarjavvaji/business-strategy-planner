@@ -434,6 +434,7 @@ export default function App() {
         {activeStage === 2 && (
           <Stage2View
             workspace={workspace}
+            workspaceId={fullWorkspace?.id}
             stage1Revisions={stage1Revisions}
             stage1ActiveId={stage1ActiveId}
             stage2Revisions={stage2Revisions}

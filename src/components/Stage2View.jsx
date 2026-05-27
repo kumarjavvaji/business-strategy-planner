@@ -30,6 +30,7 @@ import {
   buildHandoffChildAtomRefinementMessages,
   buildSmeLensMessages, parseSmeLensResponse,
   buildSmeLensRefinementMessages,
+  normalizeSMELensForPrompt,
   CHILD_ATOM_KEYS,
 } from '../utils/handoffPrompts'
 import RevisionHistory    from './RevisionHistory'
@@ -115,6 +116,60 @@ function getThemeKey(theme) {
 const CHILD_ATOM_STATE_DEFAULT = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 const SME_LENS_STATE_DEFAULT   = { status: 'not_started', rawResponse: null, parsedValue: null, parserError: null }
 
+// Renders a string or structured-object SME lens value
+function SmeLensValue({ value }) {
+  if (!value) return null
+  if (typeof value === 'string') {
+    return (
+      <div style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.6 }}>
+        {value}
+      </div>
+    )
+  }
+  if (typeof value === 'object') {
+    const sections = [
+      { key: 'summary',               label: null,                     list: false },
+      { key: 'reviewerProfile',        label: 'Reviewer profile',       list: false },
+      { key: 'decisionAuthority',      label: 'Decision authority',     list: false },
+      { key: 'challengeAreas',         label: 'Challenge areas',        list: true  },
+      { key: 'evidenceRequired',       label: 'Evidence required',      list: true  },
+      { key: 'operationalConcerns',    label: 'Operational concerns',   list: true  },
+      { key: 'planFailureConditions',  label: 'Plan failure conditions', list: true  },
+    ]
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        {sections.map(({ key, label, list }) => {
+          const val = value[key]
+          if (!val || (Array.isArray(val) && !val.length)) return null
+          return (
+            <div key={key}>
+              {label && (
+                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 2 }}>
+                  {label}
+                </div>
+              )}
+              {list && Array.isArray(val) ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {val.map((item, idx) => (
+                    <div key={idx} style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.55, paddingLeft: 8, borderLeft: '2px solid rgba(59,130,246,.3)' }}>
+                      {item}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.6, fontWeight: key === 'summary' ? 600 : 400 }}>
+                  {typeof val === 'string' ? val : JSON.stringify(val)}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+  return null
+}
+
 function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, workspaceId }) {
   const [open,              setOpen]              = useState(false)
   const [isGenerating,      setIsGenerating]      = useState(false)
@@ -135,21 +190,32 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   // ── Draft persistence ───────────────────────────────────────────────────────
   const hasHydrated = useRef(false)
   const storageKey  = workspaceId ? `bsp_v1_handoff_${workspaceId}_${bu.name}` : null
+  const [lastSavedAt, setLastSavedAt] = useState(null)
 
   // Hydrate once on mount
   useEffect(() => {
-    if (!storageKey) { hasHydrated.current = true; return }
+    if (!storageKey) {
+      console.log('[Stage2 Handoff Draft] missing workspaceId — persistence disabled for', bu.name)
+      hasHydrated.current = true
+      return
+    }
     try {
       const raw = localStorage.getItem(storageKey)
       if (raw) {
-        const { parsed: p, itemStates: is, smeLensState: sls, structureIsStale: sis, buHandoff: bh } = JSON.parse(raw)
+        const { parsed: p, itemStates: is, smeLensState: sls, structureIsStale: sis, buHandoff: bh, savedAt } = JSON.parse(raw)
         if (p)   setParsed(p)
         if (is)  setItemStates(is)
         if (sls) setSmeLensState(sls)
         if (sis) setStructureIsStale(sis)
         if (bh)  setBuHandoff(bh)
+        if (savedAt) setLastSavedAt(savedAt)
+        console.log('[Stage2 Handoff Draft] hydrated', bu.name, { hasParsed: !!p, itemCount: Object.keys(is || {}).length, savedAt })
+      } else {
+        console.log('[Stage2 Handoff Draft] no draft found for', bu.name)
       }
-    } catch { /* ignore corrupt data */ }
+    } catch (e) {
+      console.error('[Stage2 Handoff Draft] hydrate failed for', bu.name, e)
+    }
     hasHydrated.current = true
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -158,8 +224,14 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   useEffect(() => {
     if (!hasHydrated.current || !storageKey) return
     try {
-      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates, smeLensState, structureIsStale, buHandoff }))
-    } catch { /* quota errors are non-fatal */ }
+      const savedAt = new Date().toISOString()
+      localStorage.setItem(storageKey, JSON.stringify({ parsed, itemStates, smeLensState, structureIsStale, buHandoff, savedAt }))
+      setLastSavedAt(savedAt)
+      console.log('[Stage2 Handoff Draft] saved', bu.name)
+    } catch (e) {
+      console.error('[Stage2 Handoff Draft] save failed for', bu.name, e)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsed, itemStates, smeLensState, structureIsStale, buHandoff, storageKey])
 
   // ── Structure generation ────────────────────────────────────────────────────
@@ -174,7 +246,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     setStructureRaw(null)
 
     const { messages } = buildHandoffStructureMessages(
-      activeStage1Rev.contentSnapshot, bu, smeLensState.parsedValue, otherBuNames,
+      activeStage1Rev.contentSnapshot, bu, normalizeSMELensForPrompt(smeLensState.parsedValue), otherBuNames,
     )
     const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 2000 })
 
@@ -260,7 +332,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       bu,
       parsed?.domainOfWork || null,
       parsed?.handoffStructure || null,
-      smeLensState.parsedValue,
+      normalizeSMELensForPrompt(smeLensState.parsedValue),
       prompt,
       otherBuNames,
     )
@@ -334,7 +406,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
         activeStage1Rev.contentSnapshot,
         bu,
         parsed.domainOfWork,
-        smeLensState.parsedValue || null,
+        normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
         structureItemContext,
         childKey,
         otherBuNames,
@@ -432,7 +504,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       activeStage1Rev.contentSnapshot,
       bu,
       parsed.domainOfWork,
-      smeLensState.parsedValue || null,
+      normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
       structureItem,
       childKey,
       otherBuNames,
@@ -544,7 +616,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       activeStage1Rev.contentSnapshot,
       bu,
       parsed.domainOfWork,
-      smeLensState.parsedValue || null,
+      normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
       structureItem,
       iState.parsedValue.value,
       prompt,
@@ -582,7 +654,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       activeStage1Rev.contentSnapshot,
       bu,
       parsed.domainOfWork,
-      smeLensState.parsedValue || null,
+      normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
       structureItem,
       childKey,
       cs.parsedValue,
@@ -724,9 +796,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
               </div>
 
               {smeLensState.status === 'complete' && (
-                <div style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
-                  {smeLensState.parsedValue}
-                </div>
+                <SmeLensValue value={smeLensState.parsedValue} />
               )}
               {smeLensState.status === 'generating' && (
                 <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)' }}>Generating…</div>
@@ -1377,6 +1447,12 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
           </div>
 
           {/* ── Assembled BU handoff summary ─────────────────────── */}
+          {lastSavedAt && (
+            <div style={{ marginTop: 8, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', opacity: .6 }}>
+              Draft saved {new Date(lastSavedAt).toLocaleString()}
+            </div>
+          )}
+
           {buHandoff && (
             <div style={{
               marginTop: 9, padding: '8px 10px', borderRadius: 5,
@@ -1727,6 +1803,7 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy, activeStage1Rev,
 
 export default function Stage2View({
   workspace,
+  workspaceId,
   stage1Revisions,
   stage1ActiveId,
   stage2Revisions,
@@ -2178,7 +2255,7 @@ export default function Stage2View({
               activeStage1Rev={activeStage1Rev}
               otherBuNames={businessUnits.filter((_, j) => j !== i).map(b => b.name)}
               onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
-              workspaceId={workspace?.id}
+              workspaceId={workspaceId}
             />
           ))}
         </div>
