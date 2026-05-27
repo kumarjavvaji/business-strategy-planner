@@ -14,18 +14,20 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import {
-  buildStage3Messages,
-  parseStage3Response,
   generateMockStage3,
+  buildStage3CoordinationMessages,
+  parseStage3CoordinationResponse,
+  buildStage3BusinessUnitMessages,
   buildStage3UnitRefinementMessages,
   parseStage3UnitResponse,
-  buildStage3StageRefinementMessages,
 } from '../utils/stage3Prompts'
 import { buildStage3RevisionRecord, stage3SnapshotToText } from '../utils/stageSnapshots'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
+import LearningSignals    from './LearningSignals'
 import RefinementPanel                    from './RefinementPanel'
 import { REFINEMENT_SCOPES }             from './Stage2View'
+import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -252,6 +254,104 @@ function LensList({ lenses }) {
           </div>
         )
       })}
+    </div>
+  )
+}
+
+async function collectStage3LearningSignals(context, useAI) {
+  const heuristic = deriveLearningSignals({ stage: 'Stage 3', ...context })
+  if (!useAI) return heuristic
+  const { messages } = buildLearningSignalMessages({ stage: 'Stage 3', ...context })
+  const { result } = await callAI(messages, { temperature: 0.2, maxTokens: 900, timeoutMs: 15000 })
+  return normalizeLearningSignals([...heuristic, ...parseLearningSignalResponse(result, 'Stage 3')], 'Stage 3')
+}
+
+function CoordinationLayer({ layer }) {
+  if (!layer) return null
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: '1px solid rgba(59,130,246,.25)',
+      borderRadius: 'var(--r)',
+      padding: '13px 15px',
+      marginBottom: 12,
+    }}>
+      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8 }}>Cross-functional Coordination</div>
+      {layer.executionSummary && (
+        <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.65, marginBottom: 10, fontFamily: 'var(--fm)' }}>
+          {layer.executionSummary}
+        </div>
+      )}
+      {layer.sequencingOverview && (
+        <PlanSection label="Sequencing Overview" marginBottom={10}>
+          <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.65 }}>{layer.sequencingOverview}</div>
+        </PlanSection>
+      )}
+      <TwoCol
+        left={<PlanSection label="Critical Path"><BulletList items={layer.criticalExecutionPath} borderColor="rgba(248,113,113,.4)" /></PlanSection>}
+        right={<PlanSection label="Parallel Workstreams"><BulletList items={layer.parallelizableWorkstreams} borderColor="rgba(0,229,180,.35)" /></PlanSection>}
+      />
+      <TwoCol
+        left={<PlanSection label="Governance"><BulletList items={layer.governanceModel} borderColor="rgba(59,130,246,.35)" /></PlanSection>}
+        right={<PlanSection label="Escalation Ownership"><BulletList items={layer.escalationDecisionOwnership} borderColor="rgba(251,146,60,.35)" /></PlanSection>}
+      />
+      <TwoCol
+        left={<PlanSection label="Shared Risks"><BulletList items={layer.sharedRisks} borderColor="rgba(248,113,113,.35)" /></PlanSection>}
+        right={<PlanSection label="Shared Unknowns"><BulletList items={layer.sharedUnknowns} borderColor="rgba(148,163,184,.35)" /></PlanSection>}
+      />
+      {layer.confidenceReadinessAssessment && (
+        <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.65, fontFamily: 'var(--fm)' }}>
+          {layer.confidenceReadinessAssessment}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function GenerationProgress({ generation, onRetry }) {
+  if (!generation?.active && !generation?.failedStep) return null
+  const units = generation.units || []
+  const plans = generation.plans || []
+  const mark = (status) => status === 'complete' ? '✓' : status === 'generating' ? '~' : status === 'failed' ? '!' : '○'
+  return (
+    <div style={{
+      background: 'rgba(59,130,246,.05)',
+      border: '1px solid rgba(59,130,246,.22)',
+      borderRadius: 'var(--r)',
+      padding: '12px 15px',
+      marginBottom: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+        <div style={{ fontSize: 11, fontWeight: 600, flex: 1 }}>Stage 3 generation progress</div>
+        {generation.failedStep && (
+          <button onClick={onRetry} style={{
+            fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+            padding: '4px 12px', borderRadius: 4, cursor: 'pointer',
+            background: 'rgba(251,146,60,.15)', border: '1px solid rgba(251,146,60,.4)', color: '#fb923c',
+          }}>
+            Retry / resume
+          </button>
+        )}
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: generation.coordinationLayer ? '#00e5b4' : generation.failedStep === 'coordination' ? '#f87171' : '#fb923c' }}>
+          {mark(generation.coordinationLayer ? 'complete' : generation.failedStep === 'coordination' ? 'failed' : 'generating')} Coordination layer {generation.coordinationLayer ? 'complete' : generation.failedStep === 'coordination' ? 'failed' : 'generating'}
+        </div>
+        {units.map((unit, i) => {
+          const status = plans[i] ? 'complete' : generation.failedStep === 'unit' && generation.failedIndex === i ? 'failed' : generation.currentIndex === i ? 'generating' : 'pending'
+          const color = status === 'complete' ? '#00e5b4' : status === 'failed' ? '#f87171' : status === 'generating' ? '#fb923c' : 'var(--muted)'
+          return (
+            <div key={`${unit.name}-${i}`} style={{ fontSize: 9, fontFamily: 'var(--fm)', color }}>
+              {mark(status)} {unit.name} {status}
+            </div>
+          )
+        })}
+      </div>
+      {generation.error && (
+        <div style={{ marginTop: 8, fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.5 }}>
+          {generation.error}
+        </div>
+      )}
     </div>
   )
 }
@@ -724,11 +824,16 @@ export default function Stage3View({
   const [showRaw,      setShowRaw]      = useState(false)
   const [compareRevId, setCompareRevId] = useState(null)
   const [isStageRefining, setIsStageRefining] = useState(false)
+  const [generation, setGeneration] = useState(null)
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev      = stage3Revisions.find(r => r.id === stage3ActiveId) ?? null
-  const executionPlans = activeRev?.contentSnapshot?.executionPlans || []
-  const summaryNote    = activeRev?.contentSnapshot?.summaryNote    || ''
+  const savedExecutionPlans = activeRev?.contentSnapshot?.executionPlans || []
+  const savedSummaryNote    = activeRev?.contentSnapshot?.summaryNote    || ''
+  const savedCoordinationLayer = activeRev?.contentSnapshot?.coordinationLayer || null
+  const executionPlans = generation ? (generation.plans || []).filter(Boolean) : savedExecutionPlans
+  const summaryNote    = generation?.summaryNote || savedSummaryNote
+  const coordinationLayer = generation?.coordinationLayer || savedCoordinationLayer
 
   // Active upstream revisions
   const activeStage1Rev = stage1Revisions.find(r => r.id === stage1ActiveId) ?? null
@@ -781,8 +886,8 @@ export default function Stage3View({
   }, [shouldAutoGenerate])
 
   // ── Full Stage 3 generation ─────────────────────────────────────────────────
-  const handleGenerate = useCallback(async () => {
-    if (!activeStage1Rev || !activeStage2Rev) return
+  async function runChunkedStage3({ refinementPrompt = '', impactSummary = '', resume = false } = {}) {
+    if (!activeStage1Rev || !activeStage2Rev) return { error: 'No active upstream revisions.' }
     setIsGenerating(true)
     setGenError(null)
     setRawResponse(null)
@@ -790,52 +895,144 @@ export default function Stage3View({
 
     const s1Snap = activeStage1Rev.contentSnapshot
     const s2Snap = activeStage2Rev.contentSnapshot
-
-    let plans, note, source
+    let plans = resume ? [...(generation?.plans || [])] : []
+    let note = resume ? generation?.summaryNote : ''
+    let coordination = resume ? generation?.coordinationLayer : null
+    let units = resume ? generation?.units || [] : []
+    let parsedCoord = null
+    const source = hasApiKey() ? 'ai' : 'mock'
 
     if (hasApiKey()) {
-      const { messages } = buildStage3Messages(s1Snap, s2Snap)
-      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 10000 })
-
-      if (error) { setGenError(error); setIsGenerating(false); return }
-
-      const parsed = parseStage3Response(result)
-      setRawResponse(result)
-
-      if (parsed.error || !parsed.executionPlans) {
-        setGenError(parsed.error || 'Response parse failed.')
-        setIsGenerating(false)
-        return
+      if (!coordination) {
+        setGeneration({ active: true, units: [], plans: [], currentIndex: -1, coordinationLayer: null, summaryNote: '', refinementPrompt, impactSummary })
+        const { messages } = buildStage3CoordinationMessages(s1Snap, s2Snap, {
+          prompt: refinementPrompt,
+          impactSummary,
+          currentSummary: activeRev?.contentSnapshot?.summaryNote,
+        })
+        const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 3500 })
+        setRawResponse(result)
+        if (error) {
+          setGenError(error)
+          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', error }))
+          setIsGenerating(false)
+          return { error }
+        }
+        parsedCoord = parseStage3CoordinationResponse(result, s2Snap.businessUnits || [])
+        if (parsedCoord.error || !parsedCoord.coordinationLayer) {
+          const parseError = parsedCoord.error || 'Coordination parse failed.'
+          setGenError(parseError)
+          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'coordination', error: parseError }))
+          setIsGenerating(false)
+          return { error: parseError }
+        }
+        coordination = parsedCoord.coordinationLayer
+        units = parsedCoord.executionUnits
+        note = parsedCoord.summaryNote
+        plans = new Array(units.length).fill(null)
+        setGeneration(g => ({
+          ...(g || {}),
+          active: true,
+          coordinationLayer: coordination,
+          units,
+          plans,
+          summaryNote: note,
+          currentIndex: 0,
+          failedStep: null,
+          error: null,
+          refinementClassification: parsedCoord.refinementClassification,
+          structuralImpact: parsedCoord.structuralImpact,
+          refinementPrompt,
+          impactSummary,
+        }))
       }
 
-      plans  = parsed.executionPlans
-      note   = parsed.summaryNote
-      source = 'ai'
-
+      for (let i = 0; i < units.length; i++) {
+        if (plans[i]) continue
+        setGeneration(g => ({ ...(g || {}), active: true, currentIndex: i, failedStep: null, failedIndex: null, error: null }))
+        const { messages } = buildStage3BusinessUnitMessages(s1Snap, s2Snap, units[i], coordination, {
+          prompt: refinementPrompt,
+          impactSummary,
+        })
+        const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 3000 })
+        setRawResponse(result)
+        if (error) {
+          setGenError(error)
+          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'unit', failedIndex: i, error }))
+          setIsGenerating(false)
+          return { error }
+        }
+        const parsedPlan = parseStage3UnitResponse(result)
+        if (parsedPlan.error || !parsedPlan.plan) {
+          const parseError = parsedPlan.error || 'Unit response parse failed.'
+          setGenError(parseError)
+          setGeneration(g => ({ ...(g || {}), active: false, failedStep: 'unit', failedIndex: i, error: parseError }))
+          setIsGenerating(false)
+          return { error: parseError }
+        }
+        plans = plans.map((p, idx) => idx === i ? parsedPlan.plan : p)
+        setGeneration(g => ({ ...(g || {}), plans, currentIndex: i + 1 }))
+      }
     } else {
       const mock = generateMockStage3(s1Snap, s2Snap)
-      plans  = mock.executionPlans
-      note   = mock.summaryNote
-      source = 'mock'
+      plans = mock.executionPlans
+      note = mock.summaryNote
+      coordination = mock.coordinationLayer
+      units = (s2Snap.businessUnits || []).map(u => ({ ...u, sourceStage2Name: u.name }))
+      setGeneration({ active: true, coordinationLayer: coordination, units, plans, summaryNote: note, currentIndex: units.length, refinementPrompt, impactSummary })
     }
+
+    if (plans.some(p => !p)) {
+      const err = 'Stage 3 generation is incomplete; retry the failed unit before saving a revision.'
+      setGenError(err)
+      setIsGenerating(false)
+      return { error: err }
+    }
+
+    const structuralImpact = parsedCoord?.structuralImpact || generation?.structuralImpact || 'none'
+    const refinementClassification = parsedCoord?.refinementClassification || generation?.refinementClassification || null
+    const learningSignals = await collectStage3LearningSignals({
+      source,
+      prompt: refinementPrompt,
+      impactSummary: impactSummary || (refinementPrompt ? 'Regenerated Stage 3 with chunked AI' : `Generated Stage 3 with chunked ${source === 'ai' ? 'AI' : 'mock'} orchestration`),
+      refinementType: refinementPrompt ? 'stage' : null,
+      structuralImpact,
+      refinementClassification,
+      beforeAfterSummary: 'Stage 3 generated through coordination-layer plus per-business-unit execution-plan calls, then assembled into one stage-level revision.',
+      stalenessEvents: [],
+    }, source === 'ai')
 
     const nextNum = stage3Revisions.length + 1
     const record  = buildStage3RevisionRecord({
       executionPlans:        plans,
       summaryNote:           note,
+      coordinationLayer:     coordination,
       revisionNumber:        nextNum,
       sourceBasisRevisionId:  stage1ActiveId,
       sourceStage2RevisionId: stage2ActiveId,
       source,
-      prompt:        '',
-      impactSummary: `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via ${source === 'ai' ? AI_MODEL_LABEL : 'mock generator'}.`,
-      refinementType: null,
+      prompt:        refinementPrompt,
+      impactSummary: impactSummary || `Generated from Stage 1 ${revNum(stage1ActiveId, stage1Revisions)} + Stage 2 ${revNum(stage2ActiveId, stage2Revisions)} via ${source === 'ai' ? AI_MODEL_LABEL + ' chunked orchestration' : 'mock generator'}.`,
+      refinementType: refinementPrompt ? 'stage' : null,
       affectedUnit:   null,
+      structuralImpact,
+      refinementClassification,
+      learningSignals,
     })
 
     onSaveRevision(record)
+    setGeneration(null)
     setIsGenerating(false)
-  }, [activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage1Revisions, stage2Revisions, stage3Revisions.length, onSaveRevision])
+    return { error: null }
+  }
+
+  const handleGenerate = useCallback(async () => runChunkedStage3(), [activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage1Revisions, stage2Revisions, stage3Revisions.length, onSaveRevision])
+
+  const handleRetryGeneration = useCallback(async () => runChunkedStage3({
+    refinementPrompt: generation?.refinementPrompt || '',
+    impactSummary: generation?.impactSummary || '',
+    resume: true,
+  }), [generation, activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage3Revisions.length, onSaveRevision])
 
   // ── Unit-level refinement ───────────────────────────────────────────────────
   const handleUnitRegenerate = useCallback(async (planIndex, refinementPrompt, impactSummary, refinementScope) => {
@@ -858,11 +1055,21 @@ export default function Stage3View({
 
     const updatedPlans = executionPlans.map((p, i) => (i === planIndex ? parsed.plan : p))
     const unitName     = executionPlans[planIndex]?.buName || `Unit ${planIndex + 1}`
+    const learningSignals = await collectStage3LearningSignals({
+      source: 'ai',
+      prompt: refinementPrompt,
+      impactSummary: impactSummary || `Regenerated "${unitName}"`,
+      refinementType: 'unit',
+      refinementScope,
+      affectedUnit: unitName,
+      beforeAfterSummary: 'One Stage 3 business-unit execution plan was regenerated and merged back into the stage-level package.',
+    }, true)
 
     const nextNum = stage3Revisions.length + 1
     const record  = buildStage3RevisionRecord({
       executionPlans:         updatedPlans,
       summaryNote,
+      coordinationLayer,
       revisionNumber:         nextNum,
       sourceBasisRevisionId:  activeRev.sourceBasisRevisionId,
       sourceStage2RevisionId: activeRev.sourceStage2RevisionId,
@@ -872,6 +1079,7 @@ export default function Stage3View({
       refinementType:         'unit',
       affectedUnit:           unitName,
       refinementScope,
+      learningSignals,
     })
 
     onSaveRevision(record)
@@ -886,60 +1094,24 @@ export default function Stage3View({
       if (!activeStage1Rev) return { error: 'No active Stage 1 revision.' }
       if (!activeStage2Rev) return { error: 'No active Stage 2 revision.' }
       setIsStageRefining(true)
-      setGenError(null)
-      setRawResponse(null)
-      setShowRaw(false)
-
-      const { messages } = buildStage3StageRefinementMessages(
-        activeStage1Rev.contentSnapshot,
-        activeStage2Rev.contentSnapshot,
-        activeRev.contentSnapshot,
-        prompt,
-        impactSummary,
-      )
-      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 11000 })
-
-      if (error) {
-        setGenError(error)
-        setIsStageRefining(false)
-        return { error }
-      }
-
-      const parsed = parseStage3Response(result)
-      setRawResponse(result)
-
-      if (parsed.error || !parsed.executionPlans) {
-        const parseError = parsed.error || 'Response parse failed.'
-        setGenError(parseError)
-        setIsStageRefining(false)
-        return { error: parseError }
-      }
-
-      const nextNum = stage3Revisions.length + 1
-      const record  = buildStage3RevisionRecord({
-        executionPlans:         parsed.executionPlans,
-        summaryNote:            parsed.summaryNote,
-        revisionNumber:         nextNum,
-        sourceBasisRevisionId:  stage1ActiveId,
-        sourceStage2RevisionId: stage2ActiveId,
-        source:                 'ai',
-        prompt,
-        impactSummary:          impactSummary || `Regenerated Stage 3 with AI: ${prompt.slice(0, 90)}${prompt.length > 90 ? '...' : ''}`,
-        refinementType:         'stage',
-        affectedUnit:           null,
-        structuralImpact:       parsed.structuralImpact,
-        refinementClassification: parsed.refinementClassification,
-      })
-
-      onSaveRevision(record)
+      const result = await runChunkedStage3({ refinementPrompt: prompt, impactSummary })
       setIsStageRefining(false)
-      return { error: null }
+      return result
     }
 
+    const learningSignals = deriveLearningSignals({
+      stage: 'Stage 3',
+      source: 'manual',
+      prompt,
+      impactSummary,
+      refinementType: 'stage',
+      structuralImpact: 'none',
+    })
     const nextNum = stage3Revisions.length + 1
     const record  = buildStage3RevisionRecord({
       executionPlans: activeRev.contentSnapshot.executionPlans,
       summaryNote:    activeRev.contentSnapshot.summaryNote,
+      coordinationLayer: activeRev.contentSnapshot.coordinationLayer,
       revisionNumber:         nextNum,
       sourceBasisRevisionId:  activeRev.sourceBasisRevisionId,
       sourceStage2RevisionId: activeRev.sourceStage2RevisionId,
@@ -949,6 +1121,7 @@ export default function Stage3View({
       refinementType:         'stage',
       affectedUnit:           null,
       structuralImpact:       'none',
+      learningSignals,
     })
     onSaveRevision(record)
     return { error: null }
@@ -1036,6 +1209,18 @@ export default function Stage3View({
             </div>
           )}
         </div>
+        <GenerationProgress generation={generation} onRetry={handleRetryGeneration} />
+        <CoordinationLayer layer={coordinationLayer} />
+        {executionPlans.map((plan, i) => (
+          <PlanCard
+            key={`${plan.buName}-${i}`}
+            plan={plan}
+            index={i}
+            apiMode={apiMode}
+            globalBusy
+            onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
+          />
+        ))}
       </div>
     )
   }
@@ -1158,6 +1343,9 @@ export default function Stage3View({
       )}
 
       {/* ── Execution plan cards ──────────────────────────────────────────── */}
+      <GenerationProgress generation={generation} onRetry={handleRetryGeneration} />
+      <CoordinationLayer layer={coordinationLayer} />
+
       {executionPlans.length > 0 && (
         <div style={{ marginBottom: 12 }}>
           <div style={{
@@ -1193,6 +1381,8 @@ export default function Stage3View({
       )}
 
       {/* ── Diff viewer ───────────────────────────────────────────────────── */}
+      <LearningSignals signals={activeRev?.contentSnapshot?.learningSignals || activeRev?.learningSignals} />
+
       {compareRevision && activeRev && (
         <RevisionDiffViewer
           revA={compareRevision}

@@ -189,13 +189,13 @@ export function useWorkspace() {
   // ── saveStageRevision ────────────────────────────────────────────────────────
   // stage: 'stage1' | 'stage2' | ...
   // opts:  { prompt: string, impactSummary: string }
-  function saveStageRevision(stage, { prompt, impactSummary } = {}) {
+  function saveStageRevision(stage, { prompt, impactSummary, learningSignals } = {}) {
     setFullWorkspace(prev => {
       if (!prev) return prev
       const existing = prev.stageRevisions[stage] || []
       const nextNum  = existing.length + 1
       const nw       = prev.normalizedWorkspace
-      const newRev   = buildManualRevision(nw, nextNum, prompt, impactSummary)
+      const newRev   = buildManualRevision(nw, nextNum, prompt, impactSummary, learningSignals)
       const updated  = {
         ...prev,
         updatedAt: new Date().toISOString(),

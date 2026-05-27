@@ -144,7 +144,213 @@ DOMAIN-ADAPTIVE EXECUTION RULES:
 8. Delivery/advisory units should emphasize enablement, client trust, field readiness, narrative consistency, escalation routing, and feedback loops.
 9. Sales/marketing units should emphasize positioning, adoption, messaging coordination, and commercialization readiness.
 10. Finance units should emphasize investment posture, ROI assumptions, commercial gating, and operational leverage.
+
+DOMAIN-CONTEXT SPECIFICITY:
+- For each business unit, first infer what domain of work this unit represents, what decisions its SMEs own, what operational realities those SMEs would recognize, which constraints/risks/dependencies/validation needs/success signals are specific to that domain, and what information a real SME would need to trust, correct, and operationalize the plan.
+- Generate the execution plan around that domain-specific operating reality.
+- If the output could apply to almost any business unit, it is too generic and should be regenerated with stronger domain specificity.
 `
+
+function parseJsonObject(rawText, emptyError = 'Empty response from API.') {
+  if (!rawText?.trim()) return { parsed: null, error: emptyError }
+  let jsonStr = rawText.trim()
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (fenceMatch) jsonStr = fenceMatch[1].trim()
+  const firstBrace = jsonStr.indexOf('{')
+  const lastBrace  = jsonStr.lastIndexOf('}')
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    jsonStr = jsonStr.slice(firstBrace, lastBrace + 1)
+  }
+  try {
+    return { parsed: JSON.parse(jsonStr), error: null }
+  } catch {
+    return { parsed: null, error: 'Could not parse JSON from response. See raw output below.' }
+  }
+}
+
+function normaliseCoordinationLayer(c) {
+  return {
+    executionSummary:                 safeStr(c?.executionSummary),
+    sequencingOverview:               safeStr(c?.sequencingOverview),
+    dependencyCoordinationMap:        safeList(c?.dependencyCoordinationMap),
+    governanceModel:                  safeList(c?.governanceModel),
+    organizationalBottlenecks:        safeList(c?.organizationalBottlenecks),
+    sharedRisks:                      safeList(c?.sharedRisks),
+    sharedUnknowns:                   safeList(c?.sharedUnknowns),
+    operationalReadinessOverview:     safeStr(c?.operationalReadinessOverview),
+    crossFunctionalSuccessMetrics:    safeList(c?.crossFunctionalSuccessMetrics),
+    escalationDecisionOwnership:      safeList(c?.escalationDecisionOwnership),
+    criticalExecutionPath:            safeList(c?.criticalExecutionPath),
+    parallelizableWorkstreams:        safeList(c?.parallelizableWorkstreams),
+    confidenceReadinessAssessment:    safeStr(c?.confidenceReadinessAssessment),
+  }
+}
+
+function stage1Summary(stage1Snapshot) {
+  return [
+    `Thesis: ${safeStr(stage1Snapshot?.thesis)}`,
+    `Business problem: ${safeStr(stage1Snapshot?.businessProblem)}`,
+    `Opportunity: ${safeStr(stage1Snapshot?.opportunity)}`,
+    `Direction: ${safeStr(stage1Snapshot?.recommendedDirection)}`,
+    `Posture: ${safeStr(stage1Snapshot?.artifactType)}`,
+    `Target customer: ${safeStr(stage1Snapshot?.targetCustomer)}`,
+    `Unknowns: ${(stage1Snapshot?.unresolvedQuestions || []).slice(0, 4).join('; ')}`,
+  ].filter(line => !line.endsWith(': ')).join('\n')
+}
+
+function businessUnitSummary(unit) {
+  return `Name: ${unit?.name || unit?.buName || 'Unnamed unit'}
+Purpose: ${unit?.purpose || ''}
+Strategic involvement: ${unit?.strategicInvolvement || ''}
+Involvement level: ${unit?.involvementLevel || ''}
+Responsibilities: ${(unit?.keyResponsibilities || []).join('; ')}
+Dependencies: ${(unit?.dependencies || []).join('; ')}
+Risks/unknowns: ${(unit?.risksAndUnknowns || []).join('; ')}
+Success metrics: ${(unit?.keySuccessMetrics || []).join('; ')}`
+}
+
+export function buildStage3CoordinationMessages(stage1Snapshot, stage2Snapshot, refinement = {}) {
+  const s1Context = stage1Summary(stage1Snapshot)
+  const s2Context = stage2SnapshotToText(stage2Snapshot)
+  const refinementBlock = refinement?.prompt
+    ? `\nStage-level refinement: ${refinement.prompt}\nImpact summary: ${refinement.impactSummary || 'none'}\nCurrent Stage 3 summary: ${refinement.currentSummary || 'none'}`
+    : ''
+
+  const systemPrompt = `You are generating the Stage 3 cross-functional coordination layer before any individual business-unit plans are generated.
+
+Stage 3 is domain-adaptive operationalization. Produce the operating spine that the BU plans must align to, not the BU plans themselves.
+
+${DOMAIN_ADAPTIVE_STAGE3_RULES}
+
+If a stage-level refinement implies add/remove/merge/split/reassignment of execution units, return executionUnits in the order they should be generated. Otherwise mirror the Stage 2 business-unit list.
+
+Return ONLY JSON:
+{
+  "coordinationLayer": {
+    "executionSummary": "string",
+    "sequencingOverview": "string",
+    "dependencyCoordinationMap": ["string"],
+    "governanceModel": ["string"],
+    "organizationalBottlenecks": ["string"],
+    "sharedRisks": ["string"],
+    "sharedUnknowns": ["string"],
+    "operationalReadinessOverview": "string",
+    "crossFunctionalSuccessMetrics": ["string"],
+    "escalationDecisionOwnership": ["string"],
+    "criticalExecutionPath": ["string"],
+    "parallelizableWorkstreams": ["string"],
+    "confidenceReadinessAssessment": "string"
+  },
+  "executionUnits": [
+    {
+      "name": "string",
+      "sourceStage2Name": "string or empty",
+      "purpose": "string",
+      "strategicInvolvement": "string",
+      "involvementLevel": "primary | supporting | informed",
+      "keyResponsibilities": ["string"],
+      "dependencies": ["string"],
+      "risksAndUnknowns": ["string"],
+      "keySuccessMetrics": ["string"]
+    }
+  ],
+  "summaryNote": "2-sentence executive execution posture note",
+  "refinementClassification": "string if refinement was provided",
+  "structuralImpact": "none | unit_added | unit_removed | unit_merged | ownership_changed | dependencies_changed"
+}`
+
+  const userPrompt = `Stage 1 summary:
+${s1Context}
+
+Stage 2 business-unit mapping:
+${s2Context}
+${refinementBlock}
+
+Generate the coordination layer and ordered execution units.`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    systemPrompt,
+  }
+}
+
+export function parseStage3CoordinationResponse(rawText, fallbackUnits = []) {
+  const { parsed, error } = parseJsonObject(rawText)
+  if (error) return { coordinationLayer: null, executionUnits: null, summaryNote: '', raw: rawText || '', error }
+  if (!parsed?.coordinationLayer) {
+    return { coordinationLayer: null, executionUnits: null, summaryNote: '', raw: rawText || '', error: 'Response did not contain a coordinationLayer object.' }
+  }
+  const units = Array.isArray(parsed.executionUnits) && parsed.executionUnits.length
+    ? parsed.executionUnits
+    : fallbackUnits
+  return {
+    coordinationLayer: normaliseCoordinationLayer(parsed.coordinationLayer),
+    executionUnits: units.map(u => ({
+      name:                 safeStr(u.name || u.sourceStage2Name) || 'Unnamed unit',
+      sourceStage2Name:     safeStr(u.sourceStage2Name || u.name),
+      purpose:              safeStr(u.purpose),
+      strategicInvolvement: safeStr(u.strategicInvolvement),
+      involvementLevel:     ['primary', 'supporting', 'informed'].includes(u.involvementLevel) ? u.involvementLevel : 'supporting',
+      keyResponsibilities:  safeList(u.keyResponsibilities),
+      dependencies:         safeList(u.dependencies),
+      risksAndUnknowns:     safeList(u.risksAndUnknowns),
+      keySuccessMetrics:    safeList(u.keySuccessMetrics),
+    })),
+    summaryNote: safeStr(parsed.summaryNote),
+    refinementClassification: safeStr(parsed.refinementClassification),
+    structuralImpact: safeStructuralImpact(parsed.structuralImpact),
+    raw: rawText,
+    error: null,
+  }
+}
+
+export function buildStage3BusinessUnitMessages(stage1Snapshot, stage2Snapshot, unit, coordinationLayer, refinement = {}) {
+  const otherUnits = (stage2Snapshot?.businessUnits || [])
+    .filter(u => u.name !== unit?.name && u.name !== unit?.sourceStage2Name)
+    .map(u => `- ${u.name}: ${u.purpose || u.strategicInvolvement || ''}`)
+    .join('\n')
+  const coordinationSummary = JSON.stringify(coordinationLayer || {}, null, 2)
+  const refinementBlock = refinement?.prompt
+    ? `\nRelevant refinement: ${refinement.prompt}\nImpact summary: ${refinement.impactSummary || 'none'}`
+    : ''
+
+  const systemPrompt = `You are generating ONE complete Stage 3 business-unit execution plan. Do not generate any other units.
+
+${DOMAIN_ADAPTIVE_STAGE3_RULES}
+
+Every BU needs a concise universal execution core: mission, strategic role, priority outcomes, critical workstreams, dependencies, constraints, risks/unknowns, success/failure indicators, and readiness/confidence assessment.
+
+Omit irrelevant sections by returning empty arrays or empty strings. Preserve domain-context specificity: a competent SME in this unit should recognize the operating reality and be able to validate, correct, and act on the plan.
+
+Return ONLY JSON:
+${BU_PLAN_SCHEMA}`
+
+  const userPrompt = `Stage 1 summary:
+${stage1Summary(stage1Snapshot)}
+
+Business unit to generate:
+${businessUnitSummary(unit)}
+
+Other units for dependency awareness:
+${otherUnits || 'none'}
+
+Coordination layer:
+${coordinationSummary}
+${refinementBlock}
+
+Generate one domain-specific execution plan for "${unit?.name || unit?.sourceStage2Name}".`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+    systemPrompt,
+  }
+}
 
 // ── Full Stage 3 generation ───────────────────────────────────────────────────
 
@@ -715,9 +921,25 @@ export function generateMockStage3(stage1Snapshot, stage2Snapshot) {
   const executionPlans = bUs.map(bu => makePlan(bu))
   const thesisSnip     = thesis ? ` Thesis: ${cap(thesis, 100)}` : ''
   const oppSnip        = opportunity ? ` Opportunity: ${cap(opportunity, 80)}` : ''
+  const coordinationLayer = {
+    executionSummary: `Mock coordination layer for ${bUs.length} execution unit${bUs.length !== 1 ? 's' : ''} under "${posture}" posture.`,
+    sequencingOverview: 'Phase one resolves governance, dependency, and validation readiness before phase-two scaling decisions.',
+    dependencyCoordinationMap: bUs.slice(0, 4).map(bu => `${bu.name}: coordinate dependencies through the shared gate review`),
+    governanceModel: ['Executive gate owns phase advancement', 'Each BU lead owns its workstream scope and escalation path'],
+    organizationalBottlenecks: ['Dependency bottlenecks between primary units before the go/no-go gate'],
+    sharedRisks: s1Risks.slice(0, 3).map(r => cap(r, 90)),
+    sharedUnknowns: s1Unknowns.slice(0, 3).map(u => cap(u, 90)),
+    operationalReadinessOverview: 'Mock readiness is moderate until BU leads confirm resourcing, validation evidence, and dependency owners.',
+    crossFunctionalSuccessMetrics: ['No primary workstream blocks the gate review', 'Evidence package ready before phase-two commitment'],
+    escalationDecisionOwnership: ['BU leads escalate blockers to executive sponsor within 48 hours', 'Executive sponsor resolves cross-unit tradeoffs'],
+    criticalExecutionPath: ['Confirm governance and validation criteria', 'Resolve primary dependencies', 'Complete evidence package for gate review'],
+    parallelizableWorkstreams: bUs.slice(0, 4).map(bu => `${bu.name} phase-one scoping`),
+    confidenceReadinessAssessment: 'Medium confidence; mock generation should be replaced by AI generation for domain-specific validation.',
+  }
 
   return {
     executionPlans,
+    coordinationLayer,
     summaryNote: `Mock-generated Stage 3 execution plans for ${bUs.length} business unit${bUs.length !== 1 ? 's' : ''} under "${posture}" investment posture.${thesisSnip}${oppSnip} Top cross-cutting risk: dependency bottlenecks between primary units before the go/no-go gate. Add VITE_ANTHROPIC_API_KEY to .env.local and restart the dev server for AI-generated plans.`,
   }
 }

@@ -17,8 +17,8 @@ const STAGES = [
 
 // ── Stage placeholder ─────────────────────────────────────────────────────────
 const STAGE_PLACEHOLDER_COPY = {
-  4: 'Stage 4 will translate Stage 3 execution plans into PDLC strategy, epic-level requirements, acceptance criteria, non-functional requirements, delivery sequencing, and implementation governance.',
-  5: 'Stage 5 will synthesise all stages into a unified strategic deliverable.',
+  4: 'Stage 4 will translate Stage 3 execution plans into PDLC strategy, epic-level requirements, acceptance criteria, non-functional requirements, delivery sequencing, implementation governance, and product-delivery learning signals.',
+  5: 'Stage 5 will synthesize learning signals across Stages 1-4 into reusable strategy patterns, prompt improvements, stage-boundary rules, decision-quality heuristics, refinement heuristics, cross-stage failure modes, and execution-planning patterns.',
 }
 
 function StagePlaceholder({ stage }) {
@@ -307,8 +307,8 @@ export default function App() {
   const stage1ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage1 ?? null
 
   // Manual correction note — snapshot of existing workspace
-  function handleSaveStage1Revision({ prompt, impactSummary }) {
-    saveStageRevision('stage1', { prompt, impactSummary })
+  function handleSaveStage1Revision({ prompt, impactSummary, learningSignals }) {
+    saveStageRevision('stage1', { prompt, impactSummary, learningSignals })
   }
 
   // AI-generated revision — updates normalizedWorkspace + appends revision atomically

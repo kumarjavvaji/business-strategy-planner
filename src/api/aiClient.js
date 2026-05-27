@@ -44,7 +44,7 @@ export function getApiMode() {
  * `system` parameter; remaining messages are sent in the `messages` array.
  *
  * @param {Array<{ role: 'system'|'user'|'assistant', content: string }>} messages
- * @param {{ model?: string, temperature?: number, maxTokens?: number }} options
+ * @param {{ model?: string, temperature?: number, maxTokens?: number, timeoutMs?: number }} options
  * @returns {Promise<{ result: string|null, error: string|null }>}
  */
 export async function callAI(messages, options = {}) {
@@ -60,6 +60,7 @@ export async function callAI(messages, options = {}) {
     model       = DEFAULT_MODEL,
     temperature = 0.3,
     maxTokens   = 2500,
+    timeoutMs   = TIMEOUT_MS,
   } = options
 
   // Extract system prompt; Anthropic requires it at the top level, not in messages[]
@@ -71,7 +72,7 @@ export async function callAI(messages, options = {}) {
   }
 
   const controller = new AbortController()
-  const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS)
+  const timer      = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const body = {
@@ -116,7 +117,7 @@ export async function callAI(messages, options = {}) {
   } catch (err) {
     clearTimeout(timer)
     if (err.name === 'AbortError') {
-      return { result: null, error: `Request timed out after ${TIMEOUT_MS / 1000} seconds.` }
+      return { result: null, error: `Request timed out after ${timeoutMs / 1000} seconds.` }
     }
     return { result: null, error: err?.message || 'Network error — check your connection.' }
   }

@@ -107,6 +107,7 @@ export function stageSnapshotToText(snapshot) {
   push('Stage 3 Synthesis', snapshot.stage3Synthesis)
   push('Source Stage',      snapshot.sourceStage)
   push('Lineage Notes',     snapshot.lineageNotes)
+  pushList('Learning Signals', (snapshot.learningSignals || []).map(s => `[${s.category}] ${s.text}`))
 
   return lines.join('\n')
 }
@@ -116,10 +117,11 @@ export function stageSnapshotToText(snapshot) {
 /**
  * Captures Stage 2 business-unit content as a plain serialisable object.
  */
-export function buildStage2Snapshot(businessUnits, summaryNote) {
+export function buildStage2Snapshot(businessUnits, summaryNote, learningSignals) {
   return {
     businessUnits: (businessUnits || []).map(u => ({ ...u })),
     summaryNote:   summaryNote || '',
+    learningSignals: cleanLearningSignals(learningSignals),
   }
 }
 
@@ -129,6 +131,10 @@ export function buildStage2Snapshot(businessUnits, summaryNote) {
 export function stage2SnapshotToText(snapshot) {
   const lines = []
   if (snapshot?.summaryNote) lines.push(`[Summary] ${snapshot.summaryNote}`)
+  if (snapshot?.learningSignals?.length) {
+    lines.push('[Learning Signals]')
+    snapshot.learningSignals.forEach(s => lines.push(`  - [${s.category}] ${s.text}`))
+  }
   ;(snapshot?.businessUnits || []).forEach((bu, i) => {
     lines.push(`\n[BU ${i + 1}: ${bu.name}]`)
     if (bu.purpose)              lines.push(`  Purpose: ${bu.purpose}`)
@@ -153,13 +159,25 @@ function revisionId() {
   return 'rev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7)
 }
 
+function cleanLearningSignals(signals) {
+  return (Array.isArray(signals) ? signals : [])
+    .map(s => ({
+      stage:    s?.stage    || '',
+      category: s?.category || 'Refinement patterns',
+      text:     s?.text     || '',
+      source:   s?.source   || 'heuristic',
+    }))
+    .filter(s => s.text)
+}
+
 /**
  * Creates a Stage 1 AI-generated revision record.
  * Takes an already-normalised snapshot (from buildStage1Snapshot applied to a patched workspace).
  * source: 'ai'
  * refinementType: 'stage' (full-document refinement)
  */
-export function buildStage1AIRevision(snapshot, revisionNumber, prompt, impactSummary) {
+export function buildStage1AIRevision(snapshot, revisionNumber, prompt, impactSummary, learningSignals) {
+  const signals = cleanLearningSignals(learningSignals)
   return {
     id:             revisionId(),
     revisionNumber,
@@ -169,7 +187,8 @@ export function buildStage1AIRevision(snapshot, revisionNumber, prompt, impactSu
     createdAt:      new Date().toISOString(),
     source:         'ai',
     refinementType: 'stage',
-    contentSnapshot: snapshot,
+    learningSignals: signals,
+    contentSnapshot: { ...snapshot, learningSignals: signals },
   }
 }
 
@@ -186,15 +205,17 @@ export function buildInitialRevision(normalizedWorkspace) {
     impactSummary:  'Created from imported DomainIQ Strategy Basis Package.',
     createdAt:      new Date().toISOString(),
     source:         'import',
-    contentSnapshot: snapshot,
+    learningSignals: [],
+    contentSnapshot: { ...snapshot, learningSignals: [] },
   }
 }
 
 /**
  * Creates a subsequent manual revision for a stage.
  */
-export function buildManualRevision(normalizedWorkspace, revisionNumber, prompt, impactSummary) {
+export function buildManualRevision(normalizedWorkspace, revisionNumber, prompt, impactSummary, learningSignals) {
   const snapshot = buildStage1Snapshot(normalizedWorkspace)
+  const signals = cleanLearningSignals(learningSignals)
   return {
     id:             revisionId(),
     revisionNumber,
@@ -203,7 +224,8 @@ export function buildManualRevision(normalizedWorkspace, revisionNumber, prompt,
     impactSummary:  impactSummary  || '',
     createdAt:      new Date().toISOString(),
     source:         'manual',
-    contentSnapshot: snapshot,
+    learningSignals: signals,
+    contentSnapshot: { ...snapshot, learningSignals: signals },
   }
 }
 
@@ -230,8 +252,10 @@ export function buildStage2RevisionRecord({
   refinementScope,   // 'auto'|'wording'|'ownership'|'cross-fn'|'execution'|'kpi'|null
   structuralImpact,  // 'none'|'unit_added'|'unit_removed'|'unit_merged'|'ownership_changed'|'dependencies_changed'|null
   refinementClassification,
+  learningSignals,
 }) {
   const isFirst = revisionNumber === 1
+  const signals = cleanLearningSignals(learningSignals)
   return {
     id:                   revisionId(),
     revisionNumber,
@@ -246,7 +270,8 @@ export function buildStage2RevisionRecord({
     refinementScope:      (refinementScope && refinementScope !== 'auto') ? refinementScope : null,
     structuralImpact:     structuralImpact || null,
     refinementClassification: refinementClassification || null,
-    contentSnapshot:      buildStage2Snapshot(businessUnits, summaryNote),
+    learningSignals:      signals,
+    contentSnapshot:      buildStage2Snapshot(businessUnits, summaryNote, signals),
   }
 }
 
@@ -256,10 +281,12 @@ export function buildStage2RevisionRecord({
  * Captures Stage 3 execution-plan content as a plain serialisable object.
  * Each executionPlan corresponds to one Stage 2 business unit.
  */
-export function buildStage3Snapshot(executionPlans, summaryNote) {
+export function buildStage3Snapshot(executionPlans, summaryNote, coordinationLayer, learningSignals) {
   return {
     executionPlans: (executionPlans || []).map(p => ({ ...p })),
     summaryNote:    summaryNote || '',
+    coordinationLayer: coordinationLayer ? { ...coordinationLayer } : null,
+    learningSignals: cleanLearningSignals(learningSignals),
   }
 }
 
@@ -269,6 +296,34 @@ export function buildStage3Snapshot(executionPlans, summaryNote) {
 export function stage3SnapshotToText(snapshot) {
   const lines = []
   if (snapshot?.summaryNote) lines.push(`[Summary] ${snapshot.summaryNote}`)
+  const coord = snapshot?.coordinationLayer
+  if (coord) {
+    lines.push('\n[Coordination Layer]')
+    const pushCoord = (label, val) => { if (val) lines.push(`  ${label}: ${val}`) }
+    const listCoord = (label, arr) => {
+      if (arr?.length) {
+        lines.push(`  ${label}:`)
+        arr.forEach(item => lines.push(`    - ${item}`))
+      }
+    }
+    pushCoord('Execution Summary', coord.executionSummary)
+    pushCoord('Sequencing Overview', coord.sequencingOverview)
+    listCoord('Dependency Map', coord.dependencyCoordinationMap)
+    listCoord('Governance Model', coord.governanceModel)
+    listCoord('Bottlenecks', coord.organizationalBottlenecks)
+    listCoord('Shared Risks', coord.sharedRisks)
+    listCoord('Shared Unknowns', coord.sharedUnknowns)
+    pushCoord('Readiness Overview', coord.operationalReadinessOverview)
+    listCoord('Cross-functional Metrics', coord.crossFunctionalSuccessMetrics)
+    listCoord('Escalation Ownership', coord.escalationDecisionOwnership)
+    listCoord('Critical Path', coord.criticalExecutionPath)
+    listCoord('Parallel Workstreams', coord.parallelizableWorkstreams)
+    pushCoord('Confidence Assessment', coord.confidenceReadinessAssessment)
+  }
+  if (snapshot?.learningSignals?.length) {
+    lines.push('\n[Learning Signals]')
+    snapshot.learningSignals.forEach(s => lines.push(`  - [${s.category}] ${s.text}`))
+  }
 
   ;(snapshot?.executionPlans || []).forEach((plan, i) => {
     lines.push(`\n[Plan ${i + 1}: ${plan.buName}]`)
@@ -340,6 +395,7 @@ export function stage3SnapshotToText(snapshot) {
 export function buildStage3RevisionRecord({
   executionPlans,
   summaryNote,
+  coordinationLayer,
   revisionNumber,
   sourceBasisRevisionId,
   sourceStage2RevisionId,
@@ -351,8 +407,10 @@ export function buildStage3RevisionRecord({
   refinementScope,   // 'auto'|'wording'|'ownership'|'cross-fn'|'execution'|'kpi'|null
   structuralImpact,  // 'none'|'unit_added'|'unit_removed'|'unit_merged'|'ownership_changed'|'dependencies_changed'|null
   refinementClassification,
+  learningSignals,
 }) {
   const isFirst = revisionNumber === 1
+  const signals = cleanLearningSignals(learningSignals)
   return {
     id:                     revisionId(),
     revisionNumber,
@@ -368,6 +426,7 @@ export function buildStage3RevisionRecord({
     refinementScope:        (refinementScope && refinementScope !== 'auto') ? refinementScope : null,
     structuralImpact:       structuralImpact || null,
     refinementClassification: refinementClassification || null,
-    contentSnapshot:        buildStage3Snapshot(executionPlans, summaryNote),
+    learningSignals:        signals,
+    contentSnapshot:        buildStage3Snapshot(executionPlans, summaryNote, coordinationLayer, signals),
   }
 }

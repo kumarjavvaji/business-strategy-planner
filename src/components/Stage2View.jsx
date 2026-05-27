@@ -25,6 +25,8 @@ import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageS
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
 import RefinementPanel    from './RefinementPanel'
+import LearningSignals    from './LearningSignals'
+import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
 
 // ── Involvement level styles ──────────────────────────────────────────────────
 const LEVEL_COLORS = {
@@ -71,6 +73,14 @@ function SubList({ label, items, borderColor }) {
       </div>
     </div>
   )
+}
+
+async function collectStage2LearningSignals(context, useAI) {
+  const heuristic = deriveLearningSignals({ stage: 'Stage 2', ...context })
+  if (!useAI) return heuristic
+  const { messages } = buildLearningSignalMessages({ stage: 'Stage 2', ...context })
+  const { result } = await callAI(messages, { temperature: 0.2, maxTokens: 900, timeoutMs: 15000 })
+  return normalizeLearningSignals([...heuristic, ...parseLearningSignalResponse(result, 'Stage 2')], 'Stage 2')
 }
 
 // ── Refinement scope options (shared Stage 2 + Stage 3) ──────────────────────
@@ -476,6 +486,14 @@ export default function Stage2View({
       source = 'mock'
     }
 
+    const learningSignals = await collectStage2LearningSignals({
+      source,
+      prompt: '',
+      impactSummary: `Generated from Stage 1 revision v${activeStage1Rev.revisionNumber}.`,
+      refinementType: null,
+      beforeAfterSummary: 'Stage 2 organizational capability map generated from the active Stage 1 strategy basis.',
+      stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+    }, source === 'ai')
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
       businessUnits:        buList,
@@ -485,6 +503,7 @@ export default function Stage2View({
       source,
       prompt:        '',
       impactSummary: `Generated from Stage 1 revision v${activeStage1Rev.revisionNumber} via ${source === 'ai' ? AI_MODEL_LABEL : 'mock generator'}.`,
+      learningSignals,
       // refinementType and affectedUnit intentionally omitted (null) for full regeneration
     })
 
@@ -513,6 +532,16 @@ export default function Stage2View({
 
     const updatedBUs = businessUnits.map((bu, i) => (i === buIndex ? parsed.unit : bu))
     const unitName   = businessUnits[buIndex]?.name || `Unit ${buIndex + 1}`
+    const learningSignals = await collectStage2LearningSignals({
+      source: 'ai',
+      prompt: refinementPrompt,
+      impactSummary: impactSummary || `Regenerated "${unitName}"`,
+      refinementType: 'unit',
+      refinementScope,
+      affectedUnit: unitName,
+      beforeAfterSummary: 'One Stage 2 business unit was regenerated and merged back into the stage-level mapping.',
+      stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+    }, true)
 
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
@@ -526,6 +555,7 @@ export default function Stage2View({
       refinementType:        'unit',
       affectedUnit:          unitName,
       refinementScope,
+      learningSignals,
     })
 
     onSaveRevision(record)
@@ -569,6 +599,16 @@ export default function Stage2View({
         return { error: parseError }
       }
 
+      const learningSignals = await collectStage2LearningSignals({
+        source: 'ai',
+        prompt,
+        impactSummary: impactSummary || 'Regenerated Stage 2 with AI',
+        refinementType: 'stage',
+        structuralImpact: parsed.structuralImpact,
+        refinementClassification: parsed.refinementClassification,
+        beforeAfterSummary: 'Full Stage 2 organizational capability map regenerated after a stage-level refinement.',
+        stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+      }, true)
       const nextNum = stage2Revisions.length + 1
       const record  = buildStage2RevisionRecord({
         businessUnits:        parsed.businessUnits,
@@ -582,6 +622,7 @@ export default function Stage2View({
         affectedUnit:         null,
         structuralImpact:     parsed.structuralImpact,
         refinementClassification: parsed.refinementClassification,
+        learningSignals,
       })
 
       onSaveRevision(record)
@@ -589,6 +630,15 @@ export default function Stage2View({
       return { error: null }
     }
 
+    const learningSignals = deriveLearningSignals({
+      stage: 'Stage 2',
+      source: 'manual',
+      prompt,
+      impactSummary,
+      refinementType: 'stage',
+      structuralImpact: 'none',
+      stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+    })
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
       businessUnits: activeRev.contentSnapshot.businessUnits,
@@ -601,6 +651,7 @@ export default function Stage2View({
       refinementType:        'stage',
       affectedUnit:          null,
       structuralImpact:      'none',
+      learningSignals,
     })
     onSaveRevision(record)
     return { error: null }
@@ -787,6 +838,8 @@ export default function Stage2View({
       )}
 
       {/* ── Diff viewer ────────────────────────────────────────────────── */}
+      <LearningSignals signals={activeRev?.contentSnapshot?.learningSignals || activeRev?.learningSignals} />
+
       {compareRevision && activeRev && (
         <RevisionDiffViewer
           revA={compareRevision}

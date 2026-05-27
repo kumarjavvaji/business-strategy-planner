@@ -14,9 +14,11 @@
 import React, { useState, useCallback } from 'react'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
+import LearningSignals    from './LearningSignals'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import { buildStage1Messages, parseStage1Response, applyStage1PatchToWorkspace } from '../utils/stage1Prompts'
 import { buildStage1Snapshot, buildStage1AIRevision } from '../utils/stageSnapshots'
+import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
 
 // ── Posture colour map ────────────────────────────────────────────────────────
 const POSTURE_COLORS = {
@@ -104,6 +106,14 @@ function Section({ title, label, children, defaultOpen = true }) {
   )
 }
 
+async function collectStage1LearningSignals(context, useAI) {
+  const heuristic = deriveLearningSignals({ stage: 'Stage 1', ...context })
+  if (!useAI) return heuristic
+  const { messages } = buildLearningSignalMessages({ stage: 'Stage 1', ...context })
+  const { result } = await callAI(messages, { temperature: 0.2, maxTokens: 900, timeoutMs: 15000 })
+  return normalizeLearningSignals([...heuristic, ...parseLearningSignalResponse(result, 'Stage 1')], 'Stage 1')
+}
+
 // ── Stage 1 Refinement Panel ──────────────────────────────────────────────────
 // Handles both AI-assisted regeneration (when key is present) and manual
 // correction notes (when no key). Owned by Stage1View to keep AI state local.
@@ -167,7 +177,15 @@ function Stage1RefinementPanel({
       const newSnapshot      = buildStage1Snapshot(patchedWorkspace)
       const nextRevNum       = (stageRevisions?.length || 0) + 1
       const autoImpact       = i || `AI refinement: ${p.slice(0, 100)}${p.length > 100 ? '…' : ''}`
-      const record           = buildStage1AIRevision(newSnapshot, nextRevNum, p, autoImpact)
+      const learningSignals  = await collectStage1LearningSignals({
+        source: 'ai',
+        prompt: p,
+        impactSummary: autoImpact,
+        refinementType: 'stage',
+        beforeAfterSummary: 'Stage 1 strategy basis refined with AI; Stage 2 becomes stale through source revision lineage.',
+        stalenessEvents: ['Stage 2'],
+      }, true)
+      const record           = buildStage1AIRevision(newSnapshot, nextRevNum, p, autoImpact, learningSignals)
 
       onSaveRawRevision(record, patchedWorkspace)
 
@@ -179,7 +197,15 @@ function Stage1RefinementPanel({
 
     } else {
       // Manual correction note — saves snapshot of current workspace
-      onSaveRevision({ prompt: p, impactSummary: i })
+      const learningSignals = deriveLearningSignals({
+        stage: 'Stage 1',
+        source: 'manual',
+        prompt: p,
+        impactSummary: i,
+        refinementType: 'stage',
+        stalenessEvents: ['Stage 2'],
+      })
+      onSaveRevision({ prompt: p, impactSummary: i, learningSignals })
       setPrompt('')
       setImpact('')
       setSavedCount(c => c + 1)
@@ -655,6 +681,8 @@ export default function Stage1View({
       </Section>
 
       {/* ── Diff viewer (shown when a prior revision is selected for compare) */}
+      <LearningSignals signals={currentRevision?.contentSnapshot?.learningSignals || currentRevision?.learningSignals} />
+
       {compareRevision && currentRevision && (
         <RevisionDiffViewer
           revA={compareRevision}
