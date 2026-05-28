@@ -4,6 +4,8 @@ export const ATOM_STATUSES = {
   RUNNING: 'running',
   COMPLETE: 'complete',
   FAILED: 'failed',
+  API_RATE_LIMITED: 'api_rate_limited',
+  RETRY_PENDING: 'retry_pending',
   PARTIAL: 'partial',
   STALE: 'stale',
 }
@@ -103,6 +105,8 @@ export function shouldRetryAtom(atom) {
     ATOM_STATUSES.NOT_STARTED,
     ATOM_STATUSES.PENDING,
     ATOM_STATUSES.FAILED,
+    ATOM_STATUSES.API_RATE_LIMITED,
+    ATOM_STATUSES.RETRY_PENDING,
     ATOM_STATUSES.STALE,
   ].includes(atom.status)
 }
@@ -112,6 +116,8 @@ export function summarizeAtoms(atoms = []) {
     total: atoms.length,
     complete: 0,
     failed: 0,
+    api_rate_limited: 0,
+    retry_pending: 0,
     partial: 0,
     stale: 0,
     running: 0,
@@ -122,8 +128,8 @@ export function summarizeAtoms(atoms = []) {
     const status = atom?.status || ATOM_STATUSES.NOT_STARTED
     summary[status] = (summary[status] || 0) + 1
   }
-  summary.done = summary.complete + summary.failed + summary.partial
-  summary.hasFailures = summary.failed > 0
+  summary.done = summary.complete + summary.failed + summary.api_rate_limited + summary.partial
+  summary.hasFailures = summary.failed > 0 || summary.api_rate_limited > 0
   summary.hasStale = summary.stale > 0
   summary.allComplete = summary.total > 0 && summary.complete === summary.total
   return summary

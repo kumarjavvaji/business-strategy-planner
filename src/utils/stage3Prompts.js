@@ -627,6 +627,7 @@ function valueToText(value) {
 
 export function buildStage3ExecutionAtomMessages(stage1Snapshot, s2Unit, handoffItem, generationMode, otherUnitNames) {
   const planningContext = s2Unit?.stage3PlanningContext || {}
+  const brief = planningContext.stage2ToStage3HandoffBrief || planningContext.handoffBrief || {}
   const sectionName = safeStr(handoffItem?.label || handoffItem?.elementName || handoffItem?.key || 'Execution section')
   const handoffContext = safeStr(handoffItem?.detail || handoffItem?.text || valueToText(handoffItem?.parsedValue))
   const modeNote = generationMode === 'full'
@@ -661,6 +662,27 @@ Return ONLY JSON:
   "stage4DeliveryImplications": ["string"]
 }`
 
+  const briefLines = brief && Object.keys(brief).length
+    ? `Stage 2 to Stage 3 compact handoff brief:
+Brief id: ${safeStr(brief.id)}
+Business unit: ${safeStr(brief.businessUnitName)}
+Planning purpose: ${safeStr(brief.planningPurpose)}
+Decision basis: ${safeStr(brief.decisionBasisSummary)}
+Key implications: ${safeList(brief.keyImplications).join('; ')}
+Execution constraints: ${safeList(brief.executionConstraints).join('; ')}
+Dependencies: ${safeList(brief.dependencies).join('; ')}
+Risks or contradictions: ${safeList(brief.risksOrContradictions).join('; ')}
+Unresolved questions: ${safeList(brief.unresolvedQuestions).join('; ')}
+Readiness status: ${safeStr(brief.readinessStatus)}
+Source section ids: ${safeList(brief.sourceStage2SectionIds).join(', ')}
+Source section titles: ${safeList(brief.sourceSectionTitles).join('; ')}
+
+Full Stage 2 handoff detail is intentionally excluded from this generation payload. Use evidenceRefs/source section ids for traceability only.`
+    : `Stage 2 planning handoff:
+Domain of work: ${safeStr(planningContext.domainOfWork)}
+SME review lens: ${typeof planningContext.SMEReviewLens === 'string' ? safeStr(planningContext.SMEReviewLens) : safeStr(planningContext.SMEReviewLens?.summary || planningContext.SMEReviewLens?.reviewerProfile)}
+Handoff status: ${safeStr(planningContext.handoffStatus)}`
+
   const userPrompt = `Stage 1 summary:
 ${stage1Summary(stage1Snapshot)}
 
@@ -670,14 +692,11 @@ ${businessUnitSummary(s2Unit)}
 Other business units:
 ${otherUnitNames || 'none'}
 
-Stage 2 planning handoff:
-Domain of work: ${safeStr(planningContext.domainOfWork)}
-SME review lens: ${typeof planningContext.SMEReviewLens === 'string' ? safeStr(planningContext.SMEReviewLens) : safeStr(planningContext.SMEReviewLens?.summary || planningContext.SMEReviewLens?.reviewerProfile)}
-Handoff status: ${safeStr(planningContext.handoffStatus)}
+${briefLines}
 
 Execution atom to generate:
 Name: ${sectionName}
-Handoff detail:
+Compact handoff item:
 ${handoffContext || 'No generated handoff detail is available; use Stage 1 and Stage 2 core context and mark assumptions clearly.'}
 
 Generate this one execution section for "${s2Unit?.name || s2Unit?.buName}".`
