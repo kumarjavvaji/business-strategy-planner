@@ -72,6 +72,9 @@ export async function runGenerationQueue({
                 rawResponseText: err?.rawResponseText || err?.result || null,
                 status: err?.status,
                 rateLimited: err?.rateLimited,
+                usage: err?.usage || null,
+                stopReason: err?.stopReason || null,
+                model: err?.model || null,
               }
             }
 
@@ -84,6 +87,9 @@ export async function runGenerationQueue({
                 failureLabel: failure.label,
                 retryAttempt: attemptIndex,
                 nextRetryAt: waitMs ? new Date(Date.now() + waitMs).toISOString() : null,
+                usage: err?.usage || null,
+                stopReason: err?.stopReason || null,
+                model: err?.model || null,
               },
             })
             results.set(atom.id, retryPending)
@@ -94,10 +100,18 @@ export async function runGenerationQueue({
             onAtomUpdate?.(running, Array.from(results.values()))
           }
         }
-        const completed = markAtomComplete(running, {
-          rawResponseText: result?.rawResponseText,
-          parsedValue: result?.parsedValue,
-        })
+        const completed = {
+          ...markAtomComplete(running, {
+            rawResponseText: result?.rawResponseText,
+            parsedValue: result?.parsedValue,
+          }),
+          metadata: {
+            ...(running?.metadata || {}),
+            usage: result?.usage || null,
+            stopReason: result?.stopReason || null,
+            model: result?.model || null,
+          },
+        }
         results.set(atom.id, completed)
         onAtomUpdate?.(completed, Array.from(results.values()))
       } catch (err) {
@@ -106,7 +120,12 @@ export async function runGenerationQueue({
           rawResponseText: err?.rawResponseText || err?.result || null,
           parserError: failure.message,
           status: failure.label === 'rate_limited' ? ATOM_STATUSES.API_RATE_LIMITED : ATOM_STATUSES.FAILED,
-          metadata: { failureLabel: failure.label },
+          metadata: {
+            failureLabel: failure.label,
+            usage: err?.usage || null,
+            stopReason: err?.stopReason || null,
+            model: err?.model || null,
+          },
         })
         results.set(atom.id, failed)
         onAtomUpdate?.(failed, Array.from(results.values()))

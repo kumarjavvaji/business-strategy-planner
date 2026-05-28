@@ -45,7 +45,7 @@ export function getApiMode() {
  *
  * @param {Array<{ role: 'system'|'user'|'assistant', content: string }>} messages
  * @param {{ model?: string, temperature?: number, maxTokens?: number, timeoutMs?: number }} options
- * @returns {Promise<{ result: string|null, error: string|null, status?: number, rateLimited?: boolean, stopReason?: string }>}
+ * @returns {Promise<{ result: string|null, error: string|null, status?: number, rateLimited?: boolean, stopReason?: string, usage?: object, model?: string }>}
  */
 export async function callAI(messages, options = {}) {
   const key = import.meta.env.VITE_ANTHROPIC_API_KEY
@@ -109,6 +109,7 @@ export async function callAI(messages, options = {}) {
         error: msg,
         status: response.status,
         rateLimited: response.status === 429,
+        model,
       }
     }
 
@@ -116,8 +117,22 @@ export async function callAI(messages, options = {}) {
 
     // Anthropic response shape: { content: [{ type: 'text', text: '...' }] }
     const text = data?.content?.find?.(c => c.type === 'text')?.text ?? null
-    if (!text) return { result: null, error: 'Anthropic API returned an empty response.', stopReason: data?.stop_reason }
-    return { result: text, error: null, stopReason: data?.stop_reason }
+    if (!text) {
+      return {
+        result: null,
+        error: 'Anthropic API returned an empty response.',
+        stopReason: data?.stop_reason,
+        usage: data?.usage || null,
+        model: data?.model || model,
+      }
+    }
+    return {
+      result: text,
+      error: null,
+      stopReason: data?.stop_reason,
+      usage: data?.usage || null,
+      model: data?.model || model,
+    }
 
   } catch (err) {
     clearTimeout(timer)

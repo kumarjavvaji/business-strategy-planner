@@ -20,8 +20,6 @@ import {
   buildBUSectionMessages,
   parseBUSectionResponse,
   assembleBUPlan,
-  buildStage3ExecutionAtomMessages,
-  parseStage3ExecutionAtomResponse,
   buildStage3CoordinationSynthesisMessages,
   parseStage3CoordinationSynthesisResponse,
   buildStage3UnitRefinementMessages,
@@ -36,7 +34,16 @@ import RefinementPanel                    from './RefinementPanel'
 import { REFINEMENT_SCOPES }             from './Stage2View'
 import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
 import { ATOM_STATUSES, createGenerationAtom, summarizeAtoms } from '../utils/generationAtoms'
-import { runGenerationQueue } from '../utils/generationQueue'
+import {
+  LIFECYCLE_STATES,
+  atomIsValidDraft,
+  buildGenerationDiagnostics,
+  deriveLifecycleState,
+  estimateMessageBytes,
+  estimateTextBytes,
+  renderingEligibleAtoms,
+  runGenerationLifecycle,
+} from '../utils/generationLifecycle'
 import { stage3ExecutiveLeadershipFixture } from '../fixtures/stage3ExecutiveLeadershipFixture'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
@@ -54,6 +61,25 @@ const READINESS_COLORS = {
 
 const STAGE3_QUEUE_DELAY_MS = 850
 const STAGE3_DRAFT_PLAN_VERSION = 1
+const STAGE3_PILOT_BU_NAME = 'Product Management'
+const STAGE3_FIELD_ATOM_KEYS = [
+  'objective',
+  'executionStrategy',
+  'decisionsRequired',
+  'sequencingAndGates',
+  'dependencies',
+  'risks',
+  'validationSignals',
+]
+const STAGE3_FIELD_ATOM_LABELS = {
+  objective: 'Objective',
+  executionStrategy: 'Execution Strategy',
+  decisionsRequired: 'Decisions Required',
+  sequencingAndGates: 'Sequencing and Gates',
+  dependencies: 'Dependencies',
+  risks: 'Risks',
+  validationSignals: 'Validation Signals',
+}
 const EXECUTIVE_TRACE_PATTERN = /executive leadership|strategic governance|executive/i
 const DEBUG_STAGE3_TRACE = import.meta.env?.VITE_STAGE3_TRACE === 'true'
 const USE_STAGE3_EXECUTIVE_FIXTURE = import.meta.env?.VITE_USE_STAGE3_FIXTURE === 'true'
@@ -123,6 +149,88 @@ function writeJsonStorage(key, value) {
   } catch {}
 }
 
+function hasRenderableStage3Draft(draft) {
+  return !!(
+    draft?.plan?.buName ||
+    draft?.plan?.executionSections?.length ||
+    draft?.executionAtoms?.length ||
+    draft?.plan?.failedSections?.length
+  )
+}
+
+function normalizeLegacyStage3Draft(draft, storageKey) {
+  if (!draft || draft.version === STAGE3_DRAFT_PLAN_VERSION) return draft
+  const executionAtoms = draft.executionAtoms || []
+  const hasPlanSections = !!draft?.plan?.executionSections?.length
+  const hasValidAtoms = renderingEligibleAtoms(executionAtoms).length > 0
+  const hasFailures = executionAtoms.some(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom?.status)) || !!draft?.plan?.failedSections?.length
+  return {
+    ...draft,
+    version: STAGE3_DRAFT_PLAN_VERSION,
+    source: draft.source || 'legacy',
+    storageKey,
+    legacyStorageKey: storageKey,
+    lifecycle: {
+      ...(draft.lifecycle || {}),
+      status: hasPlanSections || hasValidAtoms
+        ? LIFECYCLE_STATES.DRAFT_GENERATED
+        : hasFailures
+          ? LIFECYCLE_STATES.GENERATION_FAILED
+          : draft.lifecycle?.status || LIFECYCLE_STATES.NOT_STARTED,
+    },
+    diagnostics: {
+      ...(draft.diagnostics || {}),
+      recoveredFromLegacyStorageKey: storageKey,
+      recoveredSections: draft?.plan?.executionSections?.length || 0,
+      recoveredFieldAtoms: executionAtoms.length || 0,
+      failedOrTruncatedAtoms: (draft?.plan?.failedSections?.length || 0) + executionAtoms.filter(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom?.status)).length,
+    },
+  }
+}
+
+function findLegacyStage3DraftForBU(buName, exactKey = null) {
+  if (!buName || typeof localStorage === 'undefined') return null
+  const safeBu = storageSafeName(buName)
+  const candidates = []
+  for (let i = 0; i < localStorage.length; i += 1) {
+    const key = localStorage.key(i)
+    if (!key?.startsWith('bsp_v1_stage3_bu_plan_')) continue
+    const keyLooksRelevant = key.endsWith(`_${safeBu}`) || key.includes(safeBu)
+    const draft = readJsonStorage(key)
+    const draftBu = draft?.businessUnitName || draft?.plan?.buName || draft?.plan?.businessUnitName
+    const dataLooksRelevant = draftBu === buName || draftBu === safeBu
+    if (!keyLooksRelevant && !dataLooksRelevant) continue
+    if (!hasRenderableStage3Draft(draft)) continue
+    const normalized = normalizeLegacyStage3Draft(draft, key)
+    candidates.push({
+      key,
+      draft: normalized,
+      score: [
+        key === exactKey ? 1000 : 0,
+        normalized?.plan?.executionSections?.length ? 100 : 0,
+        normalized?.executionAtoms?.length ? 50 : 0,
+        normalized?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED ? 25 : 0,
+        Date.parse(normalized?.lastSavedAt || normalized?.updatedAt || normalized?.createdAt || '') || 0,
+      ].reduce((sum, value) => sum + value, 0),
+    })
+  }
+  candidates.sort((a, b) => b.score - a.score)
+  return candidates[0]?.draft || null
+}
+
+function findAllLegacyStage3Drafts() {
+  if (typeof localStorage === 'undefined') return []
+  const drafts = []
+  for (let i = 0; i < localStorage.length; i += 1) {
+    const key = localStorage.key(i)
+    if (!key?.startsWith('bsp_v1_stage3_bu_plan_')) continue
+    const draft = readJsonStorage(key)
+    if (!hasRenderableStage3Draft(draft)) continue
+    drafts.push(normalizeLegacyStage3Draft(draft, key))
+  }
+  return drafts
+}
+
 function valueToSearchText(value) {
   if (!value) return ''
   if (typeof value === 'string') return value
@@ -143,6 +251,10 @@ function stage3TraceHash(value) {
 
 function isExecutiveTraceUnit(unit) {
   return EXECUTIVE_TRACE_PATTERN.test(unit?.name || unit?.buName || '')
+}
+
+function isStage3PilotUnit(unit) {
+  return String(unit?.name || unit?.buName || '').toLowerCase() === STAGE3_PILOT_BU_NAME.toLowerCase()
 }
 
 function logExecutiveBoundary(unit, label, value) {
@@ -170,6 +282,14 @@ function listFromValue(value) {
   return valueToSearchText(value) ? [valueToSearchText(value)] : []
 }
 
+function safeStr(value) {
+  return typeof value === 'string' ? value.trim() : String(value ?? '').trim()
+}
+
+function safeList(value) {
+  return Array.isArray(value) ? value.map(safeStr).filter(Boolean) : []
+}
+
 function byteSize(value) {
   try {
     return new Blob([JSON.stringify(value || {})]).size
@@ -187,6 +307,23 @@ function compactHandoffText(value) {
 
 function compactArray(values, maxItems = 6) {
   return listFromValue(values).map(compactHandoffText).filter(Boolean).slice(0, maxItems)
+}
+
+function jsonParseObject(rawText) {
+  if (!rawText?.trim()) return { parsed: null, error: 'Empty response from API.' }
+  let jsonStr = rawText.trim()
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (fenceMatch) jsonStr = fenceMatch[1].trim()
+  const firstBrace = jsonStr.indexOf('{')
+  const lastBrace = jsonStr.lastIndexOf('}')
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    jsonStr = jsonStr.slice(firstBrace, lastBrace + 1)
+  }
+  try {
+    return { parsed: JSON.parse(jsonStr), error: null }
+  } catch {
+    return { parsed: null, error: 'Could not parse valid JSON from response.' }
+  }
 }
 
 function handoffItemTitle(key, state = {}, idx = 0) {
@@ -302,37 +439,139 @@ function isMeaningfulStage3Value(value) {
   return !/^(none identified|not specified|n\/a|none|null|undefined)$/i.test(text)
 }
 
-function validateExecutiveStage3Atom(section) {
-  if (!section || typeof section !== 'object') {
-    return { pass: false, reason: 'Parsed section is missing.' }
+function normalizeStage3FieldValue(fieldKey, rawValue) {
+  if (fieldKey === 'objective') return compactHandoffText(rawValue).slice(0, 700)
+  return listFromValue(rawValue).map(compactHandoffText).filter(Boolean).slice(0, 5)
+}
+
+function validateStage3FieldAtom(fieldKey, value) {
+  if (fieldKey === 'objective') {
+    const text = valueToSearchText(value).trim()
+    if (!isMeaningfulStage3Value(text)) return { pass: false, reason: 'Objective is missing or empty.' }
+    if (text.split(/\s+/).length > 80) return { pass: false, reason: 'Objective exceeds the 80-word target.' }
+    return { pass: true, reason: null }
   }
-  if (!isMeaningfulStage3Value(section.sectionName)) {
-    return { pass: false, reason: 'Section name is missing.' }
-  }
-  if (!isMeaningfulStage3Value(section.objective)) {
-    return { pass: false, reason: 'Objective is missing.' }
-  }
-  const evidenceKeys = [
-    'executionStrategy',
-    'decisionsRequired',
-    'sequencingAndGates',
-    'dependencies',
-    'risks',
-    'constraints',
-    'unknowns',
-    'validationReadinessChecks',
-    'ownershipGovernance',
-    'successIndicators',
-    'failureSignals',
-    'stage4DeliveryImplications',
-  ]
-  const evidenceCount = evidenceKeys.reduce((count, key) => (
-    count + listFromValue(section[key]).filter(isMeaningfulStage3Value).length
-  ), 0)
-  if (evidenceCount < 2) {
-    return { pass: false, reason: 'Section lacks concrete execution detail.' }
-  }
+  const items = listFromValue(value).filter(isMeaningfulStage3Value)
+  if (items.length < 3) return { pass: false, reason: `${STAGE3_FIELD_ATOM_LABELS[fieldKey] || fieldKey} returned fewer than 3 usable bullets.` }
+  if (items.length > 5) return { pass: false, reason: `${STAGE3_FIELD_ATOM_LABELS[fieldKey] || fieldKey} returned more than 5 bullets.` }
   return { pass: true, reason: null }
+}
+
+function parseStage3FieldAtomResponse(rawText, fieldKey) {
+  const { parsed, error } = jsonParseObject(rawText)
+  if (error) return { value: null, error }
+  const rawValue = parsed?.[fieldKey] !== undefined ? parsed[fieldKey] : parsed?.value
+  const value = normalizeStage3FieldValue(fieldKey, rawValue)
+  const validation = validateStage3FieldAtom(fieldKey, value)
+  if (!validation.pass) return { value: null, error: validation.reason }
+  return { value, error: null }
+}
+
+function compactStage1SummaryForStage3(stage1Snapshot) {
+  return [
+    `Thesis: ${safeStr(stage1Snapshot?.thesis)}`,
+    `Business problem: ${safeStr(stage1Snapshot?.businessProblem)}`,
+    `Opportunity: ${safeStr(stage1Snapshot?.opportunity)}`,
+    `Direction: ${safeStr(stage1Snapshot?.recommendedDirection)}`,
+    `Posture: ${safeStr(stage1Snapshot?.artifactType)}`,
+    `Target customer: ${safeStr(stage1Snapshot?.targetCustomer)}`,
+    `Unknowns: ${safeList(stage1Snapshot?.unresolvedQuestions).slice(0, 4).join('; ')}`,
+  ].filter(line => !line.endsWith(': ')).join('\n')
+}
+
+function compactBusinessUnitSummaryForStage3(unit) {
+  return [
+    `Name: ${unit?.name || unit?.buName || 'Unnamed unit'}`,
+    `Purpose: ${safeStr(unit?.purpose)}`,
+    `Strategic involvement: ${safeStr(unit?.strategicInvolvement)}`,
+    `Responsibilities: ${safeList(unit?.keyResponsibilities).slice(0, 5).join('; ')}`,
+    `Dependencies: ${safeList(unit?.dependencies).slice(0, 5).join('; ')}`,
+    `Risks/unknowns: ${safeList(unit?.risksAndUnknowns).slice(0, 5).join('; ')}`,
+    `Success metrics: ${safeList(unit?.keySuccessMetrics).slice(0, 5).join('; ')}`,
+  ].filter(line => !line.endsWith(': ')).join('\n')
+}
+
+function buildStage3FieldAtomMessages(stage1Snapshot, s2Unit, handoffItem, fieldKey, generationMode, otherUnitNames) {
+  const planningContext = s2Unit?.stage3PlanningContext || {}
+  const brief = planningContext.stage2ToStage3HandoffBrief || planningContext.handoffBrief || {}
+  const sectionName = handoffItem?.label || handoffItem?.elementName || handoffItem?.key || 'Execution section'
+  const sourceRefId = handoffItem?.sourceRefId || handoffItem?.key || ''
+  const fieldLabel = STAGE3_FIELD_ATOM_LABELS[fieldKey] || fieldKey
+  const valueContract = fieldKey === 'objective'
+    ? `"${fieldKey}": "one string, max 80 words"`
+    : `"${fieldKey}": ["3 to 5 concise bullets"]`
+
+  const systemPrompt = `You are generating one small Stage 3 execution-planning field atom.
+
+Return raw JSON only. No markdown fences. No prose before or after JSON.
+
+JSON contract:
+{ ${valueContract} }
+
+Keep output short and reviewable. Do not include fields other than "${fieldKey}".`
+
+  const userPrompt = `Business unit: ${s2Unit?.name || s2Unit?.buName}
+Generation mode: ${generationMode}
+Stage 1 summary:
+${compactStage1SummaryForStage3(stage1Snapshot)}
+
+BU summary:
+${compactBusinessUnitSummaryForStage3(s2Unit)}
+
+Compact Stage 2 to Stage 3 handoff brief:
+Brief id: ${safeStr(brief.id)}
+Planning purpose: ${safeStr(brief.planningPurpose)}
+Decision basis: ${safeStr(brief.decisionBasisSummary)}
+Constraints: ${safeList(brief.executionConstraints).slice(0, 5).join('; ')}
+Dependencies: ${safeList(brief.dependencies).slice(0, 5).join('; ')}
+Risks/questions: ${[...safeList(brief.risksOrContradictions).slice(0, 3), ...safeList(brief.unresolvedQuestions).slice(0, 3)].join('; ')}
+Source section ids: ${safeList(brief.sourceStage2SectionIds).join(', ')}
+
+Execution section:
+Section id: ${sourceRefId}
+Section name: ${sectionName}
+
+Field atom to generate: ${fieldLabel} (${fieldKey})
+Other business units for dependency awareness only: ${otherUnitNames || 'none'}`
+
+  return {
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+  }
+}
+
+function buildStage3Progress({ unit, mode, atoms = [], currentAtom = null, lifecycleState = 'queued', skippedCount = null, latestFailureReason = null, latestUsage = null } = {}) {
+  const atom = currentAtom || atoms.find(a => a.status === ATOM_STATUSES.RUNNING) || atoms.find(a => a.status === ATOM_STATUSES.PENDING) || atoms[0]
+  const sectionKeys = [...new Set(atoms.map(a => a.metadata?.sectionKey || a.elementName || a.id))]
+  const currentSectionKey = atom?.metadata?.sectionKey || atom?.elementName || null
+  const currentSectionIndex = Math.max(0, sectionKeys.indexOf(currentSectionKey))
+  const sectionAtoms = atoms.filter(a => (a.metadata?.sectionKey || a.elementName || a.id) === currentSectionKey)
+  const currentAtomIndex = Math.max(0, sectionAtoms.findIndex(a => a.id === atom?.id))
+  const resolvedSkippedCount = skippedCount ?? 0
+  const failedAtoms = atoms.filter(a => STAGE3_FAILED_ATOM_STATUSES.has(a.status))
+  return {
+    buId: unit?.id || unit?.name || null,
+    buName: unit?.name || '',
+    mode,
+    currentSectionId: currentSectionKey,
+    currentSectionName: atom?.metadata?.sectionName || atom?.elementName || '',
+    currentSectionIndex: currentSectionIndex + 1,
+    totalSections: sectionKeys.length,
+    currentAtomId: atom?.id || null,
+    currentAtomName: atom?.metadata?.fieldName || atom?.childKey || '',
+    currentAtomIndex: currentAtomIndex + 1,
+    totalAtomsForSection: sectionAtoms.length || STAGE3_FIELD_ATOM_KEYS.length,
+    lifecycleState,
+    skippedCount: resolvedSkippedCount,
+    generatedCount: atoms.filter(atomIsValidDraft).length,
+    failedCount: failedAtoms.length,
+    latestFailureReason: latestFailureReason || failedAtoms[failedAtoms.length - 1]?.parserError || null,
+    latestUsage,
+    startedAt: atoms.find(a => a.startedAt)?.startedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }
 }
 
 function normalizeStructureItems(structure) {
@@ -343,6 +582,7 @@ function normalizeStructureItems(structure) {
     }
     const label = item?.label || item?.name || item?.title || `Handoff item ${idx + 1}`
     return {
+      ...item,
       key: item?.key || label.toLowerCase().replace(/[^a-z0-9]+/g, '_'),
       label,
       text: valueToSearchText(item),
@@ -528,13 +768,16 @@ function summarizeHandoffReadiness(bu, draft) {
   const brief = finalizeHandoffBrief(createStage2ToStage3HandoffBrief(bu, draft))
   const domainOfWork = parsed.domainOfWork || draft?.domainOfWork || compiled.domainOfWork || ''
   const smeLens = getSmeLensFromDraft(draft, compiled)
-  const structureItems = brief.sourceSectionTitles.map((title, idx) => ({
-    key: brief.sourceStage2SectionIds[idx] || storageSafeName(title),
-    label: title,
-    text: brief.keyImplications[idx] || brief.planningPurpose || title,
-    required: true,
-    sourceRefId: brief.sourceStage2SectionIds[idx] || null,
-  }))
+  const draftStructureItems = normalizeStructureItems(draft?.handoffStructure || [])
+  const structureItems = draftStructureItems.length
+    ? draftStructureItems
+    : brief.sourceSectionTitles.map((title, idx) => ({
+        key: brief.sourceStage2SectionIds[idx] || storageSafeName(title),
+        label: title,
+        text: brief.keyImplications[idx] || brief.planningPurpose || title,
+        required: true,
+        sourceRefId: brief.sourceStage2SectionIds[idx] || null,
+      }))
   const itemStates = extractDraftItemStates(draft)
   const exists = !!(domainOfWork || smeLens || structureItems.length || itemStates.length || draft?.buHandoff || draft?.assembledBuHandoff || Object.keys(compiled).length)
   const handoff = {
@@ -635,40 +878,77 @@ function buildExecutionAtomsForBU(unit, readiness, priorDraft, mode) {
     }
   }).filter(item => mode === 'stage1_2_only' || item.parsedValue || item.text || item.status === 'complete')
 
-  const fallbackItems = [
-    { key: 'stage1_2_priorities', label: 'Stage 1/2 Execution Priorities', text: 'Draft from Stage 1 strategy and Stage 2 core BU responsibilities.' },
-    { key: 'stage1_2_dependencies', label: 'Stage 1/2 Dependencies and Constraints', text: 'Draft dependencies, constraints, and unknowns from Stage 2 core BU data.' },
-    { key: 'stage1_2_validation', label: 'Stage 1/2 Validation and Readiness', text: 'Draft validation needs, readiness checks, and success/failure signals from available source data.' },
-  ]
-
-  const items = sourceItems.length ? sourceItems : fallbackItems
-  return items.map((item, idx) => {
-    const id = `stage3:${storageSafeName(unit.name)}:${storageSafeName(item.key || item.label || idx)}`
-    return priorById.get(id) || createGenerationAtom({
-      id,
-      stage: 'stage3',
-      phase: 'executionPlanAtom',
-      parentId: unit.name,
-      businessUnitName: unit.name,
-      elementName: item.label || item.elementName || item.key,
-      childKey: item.key || String(idx),
-      status: ATOM_STATUSES.PENDING,
-      metadata: { handoffItem: item, generationMode: mode },
+  return sourceItems.flatMap((item, sectionIdx) => (
+    STAGE3_FIELD_ATOM_KEYS.map((fieldKey, fieldIdx) => {
+      const sectionKey = item.key || item.label || String(sectionIdx)
+      const id = `stage3:${storageSafeName(unit.name)}:${storageSafeName(sectionKey)}:${fieldKey}`
+      return priorById.get(id) || createGenerationAtom({
+        id,
+        stage: 'stage3',
+        phase: 'executionPlanFieldAtom',
+        parentId: unit.name,
+        businessUnitName: unit.name,
+        elementName: item.label || item.elementName || item.key,
+        childKey: fieldKey,
+        status: ATOM_STATUSES.PENDING,
+        metadata: {
+          handoffItem: item,
+          generationMode: mode,
+          sectionKey,
+          sectionName: item.label || item.elementName || item.key,
+          sectionIndex: sectionIdx,
+          fieldKey,
+          fieldName: STAGE3_FIELD_ATOM_LABELS[fieldKey] || fieldKey,
+          fieldIndex: fieldIdx,
+          totalFieldsForSection: STAGE3_FIELD_ATOM_KEYS.length,
+        },
+      })
     })
-  })
+  ))
 }
 
 function assembleAtomizedBUPlan(unit, readiness, atoms, mode) {
-  const completedAtoms = atoms.filter(atom => atom.status === ATOM_STATUSES.COMPLETE && atom.parsedValue)
+  const completedAtoms = renderingEligibleAtoms(atoms)
   const failedAtoms = atoms.filter(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom.status))
   const pendingAtoms = atoms.filter(atom => ![
     ATOM_STATUSES.COMPLETE,
     ...STAGE3_FAILED_ATOM_STATUSES,
   ].includes(atom.status))
-  const sections = completedAtoms.map(atom => ({
-    ...atom.parsedValue,
-    atomId: atom.id,
-    sourceHandoffItem: atom.elementName,
+  const sectionMap = new Map()
+  for (const atom of completedAtoms) {
+    const sectionKey = atom.metadata?.sectionKey || atom.elementName || atom.id
+    const current = sectionMap.get(sectionKey) || {
+      sectionName: atom.metadata?.sectionName || atom.elementName || sectionKey,
+      atomIds: [],
+      sourceHandoffItem: atom.elementName,
+      executionStrategy: [],
+      decisionsRequired: [],
+      sequencingAndGates: [],
+      dependencies: [],
+      risks: [],
+      constraints: [],
+      unknowns: [],
+      validationReadinessChecks: [],
+      ownershipGovernance: [],
+      successIndicators: [],
+      failureSignals: [],
+      stage4DeliveryImplications: [],
+    }
+    current.atomIds.push(atom.id)
+    const fieldKey = atom.metadata?.fieldKey || atom.childKey
+    if (fieldKey === 'validationSignals') {
+      current.validationReadinessChecks = listFromValue(atom.parsedValue)
+      current.successIndicators = listFromValue(atom.parsedValue)
+    } else if (fieldKey === 'objective') {
+      current.objective = atom.parsedValue
+    } else {
+      current[fieldKey] = listFromValue(atom.parsedValue)
+    }
+    sectionMap.set(sectionKey, current)
+  }
+  const sections = Array.from(sectionMap.values()).map(section => ({
+    ...section,
+    atomId: section.atomIds.join('|'),
   }))
   const flat = key => sections.flatMap(section => section[key] || [])
   const planStatus = failedAtoms.length
@@ -1661,6 +1941,7 @@ function HandoffItemRow({ item, unitName, onStage2Action }) {
     failed: '#f87171',
     stale: '#f87171',
     running: '#fb923c',
+    generating: '#fb923c',
     not_started: 'var(--muted)',
   }[status] || 'var(--muted)'
   const detail = item.parsedValue
@@ -1748,9 +2029,301 @@ function Stage3HandoffBriefCard({ brief, unitName, onStage2Action }) {
   )
 }
 
+function buildExecutionDraftSectionsFromAtoms(atoms = [], fallbackSections = []) {
+  const validAtoms = renderingEligibleAtoms(atoms)
+  if (!validAtoms.length) return fallbackSections || []
+  const sectionMap = new Map()
+  for (const atom of validAtoms) {
+    const sectionKey = atom.metadata?.sectionKey || atom.elementName || atom.id
+    const current = sectionMap.get(sectionKey) || {
+      sectionName: atom.metadata?.sectionName || atom.elementName || sectionKey,
+      atomIds: [],
+      fields: {},
+    }
+    const fieldKey = atom.metadata?.fieldKey || atom.childKey
+    current.atomIds.push(atom.id)
+    current.fields[fieldKey] = atom.parsedValue
+    sectionMap.set(sectionKey, current)
+  }
+  return Array.from(sectionMap.values())
+}
+
+function migrateLegacyExecutionPlanToAtoms(plan, sourceLabel = 'legacy execution plan') {
+  const sections = Array.isArray(plan?.executionSections) ? plan.executionSections : []
+  const atoms = []
+  sections.forEach((section, sectionIdx) => {
+    const sectionKey = storageSafeName(section?.sectionName || section?.atomId || `section_${sectionIdx + 1}`)
+    const fieldValues = {
+      objective: section?.objective,
+      executionStrategy: section?.executionStrategy,
+      decisionsRequired: section?.decisionsRequired,
+      sequencingAndGates: section?.sequencingAndGates,
+      dependencies: section?.dependencies,
+      risks: section?.risks,
+      validationSignals: section?.validationSignals || section?.validationReadinessChecks || section?.successIndicators,
+      acceptanceCriteria: section?.acceptanceCriteria,
+    }
+    Object.entries(fieldValues).forEach(([fieldKey, value], fieldIdx) => {
+      const hasValue = fieldKey === 'objective'
+        ? isMeaningfulStage3Value(value)
+        : listFromValue(value).filter(isMeaningfulStage3Value).length > 0
+      if (!hasValue) return
+      atoms.push({
+        id: `legacy:${storageSafeName(plan?.buName || 'bu')}:${sectionKey}:${fieldKey}`,
+        stage: 'stage3',
+        phase: 'legacyExecutionPlanFieldAtom',
+        parentId: plan?.buName || null,
+        businessUnitName: plan?.buName || '',
+        elementName: section?.sectionName || `Execution section ${sectionIdx + 1}`,
+        childKey: fieldKey,
+        status: ATOM_STATUSES.COMPLETE,
+        parsedValue: value,
+        rawResponseText: null,
+        completedAt: plan?.generatedAt || plan?.lastSavedAt || plan?.updatedAt || null,
+        metadata: {
+          migratedFromLegacy: true,
+          sourceLabel,
+          sourcePlanStatus: plan?.planStatus || null,
+          sourceAtomId: section?.atomId || null,
+          sourceHandoffItem: section?.sourceHandoffItem || null,
+          sectionKey,
+          sectionName: section?.sectionName || `Execution section ${sectionIdx + 1}`,
+          sectionIndex: sectionIdx,
+          fieldKey,
+          fieldName: STAGE3_FIELD_ATOM_LABELS[fieldKey] || fieldKey,
+          fieldIndex: fieldIdx,
+          totalFieldsForSection: Object.keys(fieldValues).length,
+        },
+      })
+    })
+  })
+
+  const failedSections = Array.isArray(plan?.failedSections)
+    ? plan.failedSections
+    : plan?.failedSections
+      ? [plan.failedSections]
+      : []
+  const failedAtoms = failedSections.map((failed, idx) => {
+    const label = failed?.sectionName || failed?.elementName || failed?.sectionKey || valueToSearchText(failed) || `Failed section ${idx + 1}`
+    const failureReason = failed?.reason || failed?.parserError || failed?.failureReason || failed?.error || 'Legacy execution section failed or was incomplete.'
+    const rawExcerpt = failed?.rawResponseText || failed?.rawExcerpt || failed?.responseText || null
+    const isTruncated = /max.?tokens|truncat|incomplete/i.test(`${failureReason} ${rawExcerpt || ''}`)
+    return {
+      id: `legacy:${storageSafeName(plan?.buName || 'bu')}:failed:${storageSafeName(label)}:${idx}`,
+      stage: 'stage3',
+      phase: 'legacyExecutionPlanFieldAtom',
+      parentId: plan?.buName || null,
+      businessUnitName: plan?.buName || '',
+      elementName: label,
+      childKey: 'legacyFailure',
+      status: ATOM_STATUSES.FAILED,
+      parsedValue: null,
+      rawResponseText: rawExcerpt,
+      parserError: isTruncated
+        ? 'Model output exceeded max_tokens before returning valid JSON.'
+        : failureReason,
+      metadata: {
+        migratedFromLegacy: true,
+        sourceLabel,
+        failureLabel: isTruncated ? 'max_tokens' : 'legacy_failed',
+        sectionName: label,
+        fieldName: 'legacy failure',
+      },
+    }
+  })
+
+  return {
+    atoms: [...atoms, ...failedAtoms],
+    recoveredSections: sections.length,
+    recoveredFieldAtoms: atoms.length,
+    failedOrTruncatedAtoms: failedAtoms.length,
+  }
+}
+
+function resolveExecutionDraftSource(draft, legacyPlan) {
+  const canonicalAtoms = draft?.executionAtoms || []
+  if (renderingEligibleAtoms(canonicalAtoms).length || canonicalAtoms.some(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom?.status))) {
+    return {
+      source: 'canonical executionAtoms',
+      atoms: canonicalAtoms,
+      recoveredSections: buildExecutionDraftSectionsFromAtoms(canonicalAtoms).length,
+      recoveredFieldAtoms: renderingEligibleAtoms(canonicalAtoms).length,
+      failedOrTruncatedAtoms: canonicalAtoms.filter(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom?.status)).length,
+    }
+  }
+
+  if (draft?.plan?.executionSections?.length || draft?.plan?.failedSections?.length) {
+    return {
+      source: 'migrated legacy draft plan',
+      ...migrateLegacyExecutionPlanToAtoms(draft.plan, 'stage3DraftPlans[].plan'),
+    }
+  }
+
+  if (legacyPlan?.executionSections?.length || legacyPlan?.failedSections?.length) {
+    return {
+      source: 'migrated legacy Stage 3 revision',
+      ...migrateLegacyExecutionPlanToAtoms(legacyPlan, 'active Stage 3 executionPlans[]'),
+    }
+  }
+
+  return {
+    source: 'empty',
+    atoms: [],
+    recoveredSections: 0,
+    recoveredFieldAtoms: 0,
+    failedOrTruncatedAtoms: 0,
+  }
+}
+
+function ExecutionField({ label, value }) {
+  const items = listFromValue(value).filter(isMeaningfulStage3Value)
+  if (!items.length) return null
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: '.05em' }}>
+        {label}
+      </div>
+      {items.length === 1 ? (
+        <div style={{ fontSize: 9, color: 'var(--muted2)', lineHeight: 1.55 }}>
+          {items[0]}
+        </div>
+      ) : (
+        <BulletList items={items} borderColor="rgba(59,130,246,.32)" />
+      )}
+    </div>
+  )
+}
+
+function Stage3ExecutionPlanDraft({ draft, legacyPlan }) {
+  const resolved = resolveExecutionDraftSource(draft, legacyPlan)
+  const atoms = resolved.atoms || []
+  const failedAtoms = atoms.filter(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom?.status))
+  const sections = buildExecutionDraftSectionsFromAtoms(atoms, [])
+
+  const sectionFieldValue = (section, key) => {
+    if (section.fields) return section.fields[key]
+    if (key === 'validationSignals') return section.validationSignals || section.validationReadinessChecks || section.successIndicators
+    return section[key]
+  }
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 7 }}>
+        <SectionLabel>Execution Plan Draft</SectionLabel>
+        {resolved.source !== 'empty' && (
+          <Badge color={resolved.source === 'canonical executionAtoms' ? '#00e5b4' : '#3b82f6'} small>
+            {resolved.source}
+          </Badge>
+        )}
+        {resolved.source !== 'empty' && (
+          <Badge color="var(--muted)" small>
+            {resolved.recoveredSections} sections / {resolved.recoveredFieldAtoms} atoms
+          </Badge>
+        )}
+      </div>
+      {!sections.length && (
+        <div style={{
+          fontSize: 9,
+          fontFamily: 'var(--fm)',
+          color: 'var(--muted)',
+          fontStyle: 'italic',
+          padding: '8px 9px',
+          border: '1px solid var(--border)',
+          borderRadius: 6,
+          background: 'var(--s2)',
+        }}>
+          No execution-plan atoms generated yet.
+        </div>
+      )}
+      {sections.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {sections.map((section, sectionIdx) => (
+            <div key={section.atomIds?.join('|') || section.atomId || sectionIdx} style={{
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+              padding: '10px 11px',
+              background: 'var(--s2)',
+            }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text)', marginBottom: 7 }}>
+                {section.sectionName || `Execution section ${sectionIdx + 1}`}
+              </div>
+              <ExecutionField label="objective" value={sectionFieldValue(section, 'objective')} />
+              <ExecutionField label="executionStrategy" value={sectionFieldValue(section, 'executionStrategy')} />
+              <ExecutionField label="decisionsRequired" value={sectionFieldValue(section, 'decisionsRequired')} />
+              <ExecutionField label="sequencingAndGates" value={sectionFieldValue(section, 'sequencingAndGates')} />
+              <ExecutionField label="dependencies" value={sectionFieldValue(section, 'dependencies')} />
+              <ExecutionField label="risks" value={sectionFieldValue(section, 'risks')} />
+              <ExecutionField label="validationSignals" value={sectionFieldValue(section, 'validationSignals')} />
+              <ExecutionField label="acceptanceCriteria" value={sectionFieldValue(section, 'acceptanceCriteria')} />
+            </div>
+          ))}
+        </div>
+      )}
+      {failedAtoms.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <SectionLabel>Failed Atoms</SectionLabel>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {failedAtoms.map(atom => (
+              <div key={atom.id} style={{
+                border: '1px solid rgba(248,113,113,.35)',
+                borderRadius: 5,
+                padding: '7px 9px',
+                background: 'rgba(248,113,113,.06)',
+              }}>
+                <div style={{ fontSize: 9, fontWeight: 700, color: '#f87171', marginBottom: 3 }}>
+                  {atom.metadata?.sectionName || atom.elementName || 'Execution section'} - {atom.metadata?.fieldName || atom.childKey || 'atom'}
+                </div>
+                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.45 }}>
+                  {atom.parserError || 'Generation failed.'}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Stage3BuGenerationProgress({ progress }) {
+  if (!progress) return null
+  const usage = progress.latestUsage
+  return (
+    <div style={{ marginTop: 8, padding: '8px 9px', border: '1px solid var(--border)', borderRadius: 5, background: 'var(--surface)' }}>
+      {progress && (
+        <>
+          <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.5, marginBottom: 5 }}>
+            Generating {progress.buName} - section {progress.currentSectionIndex}/{progress.totalSections}: {progress.currentSectionName || 'queued'} - atom {progress.currentAtomIndex}/{progress.totalAtomsForSection}: {progress.currentAtomName || 'queued'}
+          </div>
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: progress.latestFailureReason || usage ? 5 : 0 }}>
+            <Badge color={progress.lifecycleState === 'failed' ? '#f87171' : progress.lifecycleState === 'persisted' ? '#00e5b4' : '#fb923c'} small>
+              {progress.lifecycleState}
+            </Badge>
+            <Badge color="var(--muted)" small>{progress.mode}</Badge>
+            <Badge color="#00e5b4" small>{progress.generatedCount} generated</Badge>
+            <Badge color="var(--muted)" small>{progress.skippedCount} skipped</Badge>
+            <Badge color={progress.failedCount ? '#f87171' : 'var(--muted)'} small>{progress.failedCount} failed</Badge>
+          </div>
+        </>
+      )}
+      {progress?.latestFailureReason && (
+        <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.45, marginBottom: 4 }}>
+          {progress.latestFailureReason}
+        </div>
+      )}
+      {usage && (
+        <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+          tokens in {usage.input_tokens || 0} / out {usage.output_tokens || 0} - stop {usage.stop_reason || 'n/a'} - {usage.model || 'model n/a'}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Stage3ReadinessPanels({
   rows,
   planDrafts,
+  legacyExecutionPlans = [],
   planGeneration,
   draftOptIns,
   onOptIntoStage12Draft,
@@ -1795,6 +2368,11 @@ function Stage3ReadinessPanels({
           <Badge color={completedCount === rows.length && rows.length ? '#00e5b4' : '#fb923c'} small>
             {completedCount}/{rows.length} plans
           </Badge>
+          {legacyExecutionPlans.length > 0 && (
+            <Badge color="#3b82f6" small>
+              {legacyExecutionPlans.length} legacy recovered
+            </Badge>
+          )}
         </div>
       </div>
 
@@ -1802,15 +2380,24 @@ function Stage3ReadinessPanels({
         const unit = row.unit
         const readiness = row.readiness
         const draft = planDrafts[unit.name]
+        const legacyPlan = legacyExecutionPlans.find(plan => plan?.buName === unit.name || plan?.businessUnitName === unit.name)
         const gen = planGeneration[unit.name]
         const isExecutiveFixtureMode = isExecutiveTraceUnit(unit)
+        const isPilotUnit = isStage3PilotUnit(unit)
         const isOpen = open[unit.name] ?? idx === 0
         const hasPlan = !!draft?.plan
-        const hasRetryableAtoms = isExecutiveTraceUnit(unit) && (draft?.executionAtoms || []).some(atom => (
+        const lifecycleState = gen?.lifecycleState || draft?.lifecycle?.status || LIFECYCLE_STATES.NOT_STARTED
+        const hasRetryableAtoms = isPilotUnit && (draft?.executionAtoms || []).some(atom => (
           STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status) && atom?.status !== ATOM_STATUSES.COMPLETE
         ))
         const executionStatus = gen?.error
           ? 'failed'
+          : lifecycleState === LIFECYCLE_STATES.ACCEPTED
+            ? 'accepted'
+          : lifecycleState === LIFECYCLE_STATES.DRAFT_GENERATED
+            ? 'draft'
+          : lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED
+            ? 'failed'
           : hasPlan
             ? (draft.plan?.planStatus === 'complete'
               ? (draft.planGenerationMode === 'full' ? 'generated' : 'draft')
@@ -1824,14 +2411,16 @@ function Stage3ReadinessPanels({
               ? 'ready'
               : 'partial'
         const mode = modeFor(readiness, !!draftOptIns[unit.name])
-        const ctaLabel = isExecutiveFixtureMode
-          ? (USE_STAGE3_EXECUTIVE_FIXTURE
-            ? (hasPlan ? 'Preview dev fixture plan' : 'Load dev fixture plan')
-            : (hasPlan ? 'Regenerate Executive Leadership Plan' : 'Generate Executive Leadership Plan'))
+        const ctaLabel = !isPilotUnit
+          ? 'Locked during PM pilot'
           : hasRetryableAtoms
             ? 'Retry failed sections'
+            : lifecycleState === LIFECYCLE_STATES.DRAFT_GENERATED
+              ? 'Regenerate Product Management'
+              : lifecycleState === LIFECYCLE_STATES.ACCEPTED
+                ? 'Accepted'
             : mode.cta
-        const actionEnabled = isExecutiveFixtureMode || mode.enabled
+        const actionEnabled = isPilotUnit && mode.enabled && lifecycleState !== LIFECYCLE_STATES.ACCEPTED
         const handoffItems = readiness.structureItems.map(item => {
           const match = readiness.itemStates.find(state => state.key === item.key || state.key === String(readiness.structureItems.indexOf(item)))
           return { ...item, ...(match || {}) }
@@ -1886,7 +2475,7 @@ function Stage3ReadinessPanels({
               <Badge color={handoffStatus === 'ready' ? '#00e5b4' : handoffStatus === 'missing' ? 'var(--muted)' : '#fb923c'} small>
                 handoff {handoffStatus}
               </Badge>
-              <Badge color={executionStatus === 'generated' ? '#00e5b4' : executionStatus === 'failed' ? '#f87171' : executionStatus === 'draft' ? '#fb923c' : 'var(--muted)'} small>
+              <Badge color={executionStatus === 'accepted' || executionStatus === 'generated' ? '#00e5b4' : executionStatus === 'failed' ? '#f87171' : executionStatus === 'draft' ? '#fb923c' : 'var(--muted)'} small>
                 plan {executionStatus}
               </Badge>
               <span style={{ fontSize: 9, color: 'var(--muted)' }}>{isOpen ? '▲' : '▼'}</span>
@@ -1923,27 +2512,21 @@ function Stage3ReadinessPanels({
                           <Badge color="#3b82f6">dev fixture</Badge>
                         </span>
                       )}
+                      {!isPilotUnit && (
+                        <span style={{ marginLeft: 6 }}>
+                          <Badge color="var(--muted)">pilot locked</Badge>
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55, marginBottom: 9 }}>
-                      {isExecutiveFixtureMode && USE_STAGE3_EXECUTIVE_FIXTURE
-                        ? 'Live generation disabled in dev fixture mode.'
-                        : isExecutiveFixtureMode
-                          ? 'Uses the real Stage 2 Executive handoff context to generate a structured execution cockpit.'
+                      {!isPilotUnit
+                        ? `Stage 3 generation is locked to ${STAGE3_PILOT_BU_NAME} until the lifecycle is proven.`
                         : readiness.completion === 'full'
-                        ? 'Complete handoff exists; full BU execution plan generation is available.'
-                        : readiness.completion === 'none'
-                          ? 'No handoff exists. Use Stage 2 to build the handoff, or explicitly opt into a Stage 1/2-only draft.'
-                          : 'Partial or stale handoff exists; limited draft generation should carry warnings.'}
+                          ? 'Generating one BU only: Product Management. Existing valid atoms will be skipped; failed/missing/stale atoms only will run.'
+                          : readiness.completion === 'none'
+                            ? 'No Product Management handoff exists. Build the Stage 2 handoff before generating Stage 3.'
+                            : 'Retry mode is partial: only failed, missing, or stale Product Management atoms will run.'}
                     </div>
-                    {readiness.completion === 'none' && !draftOptIns[unit.name] && (
-                      <button
-                        onClick={() => onOptIntoStage12Draft(unit.name)}
-                        disabled={disabled}
-                        style={secondaryButtonStyle}
-                      >
-                        Enable Stage 1/2-only draft
-                      </button>
-                    )}
                     <button
                       onClick={() => actionEnabled ? onGenerateBUPlan(unit, readiness) : onStage2Action(unit.name, null, 'review')}
                       disabled={disabled || gen?.running || (!isExecutiveFixtureMode && readiness.completion === 'none' && !draftOptIns[unit.name] && mode.label !== 'Pending')}
@@ -1957,6 +2540,24 @@ function Stage3ReadinessPanels({
                     >
                       {gen?.running ? (isExecutiveFixtureMode ? 'Loading fixture...' : 'Generating...') : ctaLabel}
                     </button>
+                    {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && isPilotUnit && (
+                      <button
+                        onClick={() => onGenerateBUPlan(unit, { ...readiness, acceptOnly: true })}
+                        disabled={disabled || gen?.running}
+                        style={{ ...secondaryButtonStyle, marginTop: 6 }}
+                      >
+                        Accept Product Management draft
+                      </button>
+                    )}
+                    {(gen?.diagnostics || draft?.diagnostics) && (
+                      <div style={{ marginTop: 8, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+                        {(() => {
+                          const d = gen?.diagnostics || draft?.diagnostics
+                          return `${d.retryMode || 'partial'} · requested ${d.atomCountRequested || 0}, skipped ${d.atomsSkippedAlreadyValid || 0}, generated ${d.atomsGenerated || 0}, failed ${d.atomsFailed || 0}, input ${d.inputTokens || 0} tokens, output ${d.outputTokens || 0} tokens`
+                        })()}
+                      </div>
+                    )}
+                    <Stage3BuGenerationProgress progress={gen?.progress || draft?.progress} />
                     {gen?.error && (
                       <div style={{ marginTop: 7, fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.45 }}>
                         {gen.error}
@@ -1993,6 +2594,11 @@ function Stage3ReadinessPanels({
                     No Stage 2 handoff items generated yet.
                   </div>
                 )}
+
+                <Stage3ExecutionPlanDraft
+                  draft={draft}
+                  legacyPlan={legacyPlan}
+                />
               </div>
             )}
           </div>
@@ -2630,6 +3236,7 @@ export default function Stage3View({
   const [isStageRefining, setIsStageRefining] = useState(false)
   const [generation, setGeneration] = useState(null)
   const [stage3DraftPlans, setStage3DraftPlans] = useState({})
+  const [legacyStage3DraftPlans, setLegacyStage3DraftPlans] = useState({})
   const [buPlanGeneration, setBuPlanGeneration] = useState({})
   const [stage12DraftOptIns, setStage12DraftOptIns] = useState({})
   const [coordinationDraft, setCoordinationDraft] = useState(null)
@@ -2640,7 +3247,13 @@ export default function Stage3View({
   const savedExecutionPlans = activeRev?.contentSnapshot?.executionPlans || []
   const savedSummaryNote    = activeRev?.contentSnapshot?.summaryNote    || ''
   const savedCoordinationLayer = activeRev?.contentSnapshot?.coordinationLayer || null
-  const persistedExecutionPlans = Object.values(stage3DraftPlans).map(d => d?.plan).filter(Boolean)
+  const persistedExecutionPlans = Object.values(stage3DraftPlans)
+    .filter(d => [LIFECYCLE_STATES.DRAFT_GENERATED, LIFECYCLE_STATES.ACCEPTED].includes(d?.lifecycle?.status))
+    .map(d => d?.plan)
+    .filter(Boolean)
+  const recoveredLegacyExecutionPlans = Object.values(legacyStage3DraftPlans)
+    .map(d => d?.plan)
+    .filter(Boolean)
   const executionPlans = generation
     ? (generation.buStates || []).map(bs => bs?.plan).filter(p => p && !p._error)
     : mergePlansByBuName(savedExecutionPlans, persistedExecutionPlans)
@@ -2679,6 +3292,7 @@ export default function Stage3View({
   useEffect(() => {
     if (!effectiveWorkspaceId || !stage1ActiveId || !stage2ActiveId || !stage2BUs.length) {
       setStage3DraftPlans({})
+      setLegacyStage3DraftPlans({})
       setCoordinationDraft(null)
       return
     }
@@ -2688,9 +3302,18 @@ export default function Stage3View({
       const draft = readJsonStorage(key)
       if (draft?.version === STAGE3_DRAFT_PLAN_VERSION && draft?.plan?.buName) {
         hydrated[bu.name] = draft
+      } else {
+        const legacyDraft = findLegacyStage3DraftForBU(bu.name, key)
+        if (legacyDraft) hydrated[bu.name] = legacyDraft
       }
     }
     setStage3DraftPlans(hydrated)
+    const recovered = {}
+    for (const draft of findAllLegacyStage3Drafts()) {
+      const name = draft?.businessUnitName || draft?.plan?.buName
+      if (name && !hydrated[name]) recovered[name] = draft
+    }
+    setLegacyStage3DraftPlans(recovered)
     const coordination = readJsonStorage(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId))
     setCoordinationDraft(coordination?.version === 1 ? coordination : null)
   }, [effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, activeStage2Rev?.id])
@@ -2731,7 +3354,7 @@ export default function Stage3View({
     if (!activeStage1Rev || !activeStage2Rev || autoGenConsumedRef.current) return
     autoGenConsumedRef.current = true
     onAutoGenerateComplete?.()
-    handleGenerate()
+    setGenError(`All-BU Stage 3 generation is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven. Generate that BU from the readiness panel instead.`)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldAutoGenerate])
 
@@ -3035,7 +3658,7 @@ export default function Stage3View({
   }), [generation, activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage3Revisions.length, onSaveRevision])
 
   // ── Unit-level refinement ───────────────────────────────────────────────────
-  function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = []) {
+  function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = [], lifecycle = {}, diagnostics = null, progress = null) {
     const now = new Date().toISOString()
     const draft = {
       version: STAGE3_DRAFT_PLAN_VERSION,
@@ -3055,6 +3678,13 @@ export default function Stage3View({
         staleCount: readiness.staleCount,
         failedCount: readiness.failedCount,
       },
+      lifecycle: {
+        status: lifecycle.status || deriveLifecycleState({ atoms: executionAtoms }),
+        acceptedAt: lifecycle.acceptedAt || null,
+        failureReason: lifecycle.failureReason || null,
+      },
+      diagnostics,
+      progress: progress ? { ...progress, lifecycleState: progress.lifecycleState === 'generating' ? 'interrupted' : progress.lifecycleState } : null,
       source,
       lastSavedAt: now,
     }
@@ -3066,6 +3696,9 @@ export default function Stage3View({
 
   async function handleGenerateBUPlan(unit, readiness) {
     if (!activeStage1Rev || !activeStage2Rev) return { error: 'No active upstream revisions.' }
+    if (!isStage3PilotUnit(unit)) {
+      return { error: `Stage 3 generation is locked to ${STAGE3_PILOT_BU_NAME} until the pilot lifecycle is proven.` }
+    }
     const s1Snap = activeStage1Rev.contentSnapshot
     const enrichedUnit = { ...unit, stage3PlanningContext: readiness.planningContext }
     const otherNames = orderedStage2BUs.filter(u => u.name !== unit.name).map(u => u.name).join(', ')
@@ -3089,132 +3722,214 @@ export default function Stage3View({
     })
     logExecutiveBoundary(unit, 'B. stage2HandoffInput', stage2HandoffInput)
     logExecutiveBoundary(unit, 'C. normalizedStage3Input', enrichedUnit)
-    const modeLabel = readiness.completion === 'full'
-      ? 'full'
-      : readiness.completion === 'none'
-        ? 'Stage 1/2-only draft'
-        : 'limited draft'
-
     setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: true, error: null } }))
     setGenError(null)
 
     try {
+      const priorDraft = stage3DraftPlans[unit.name] || null
+      if (readiness.acceptOnly) {
+        if (priorDraft?.lifecycle?.status !== LIFECYCLE_STATES.DRAFT_GENERATED || !priorDraft?.plan) {
+          throw new Error('No validated Product Management draft is ready to accept.')
+        }
+        persistBuPlanDraft(
+          unit,
+          priorDraft.plan,
+          readiness,
+          priorDraft.source || 'ai',
+          priorDraft.executionAtoms || [],
+          { status: LIFECYCLE_STATES.ACCEPTED, acceptedAt: new Date().toISOString() },
+          priorDraft.diagnostics || null,
+        )
+        setBuPlanGeneration(prev => ({
+          ...prev,
+          [unit.name]: { running: false, error: null, lifecycleState: LIFECYCLE_STATES.ACCEPTED, diagnostics: priorDraft.diagnostics || null },
+        }))
+        return { error: null }
+      }
+
       const mode = readiness.completion === 'full'
         ? 'full'
         : readiness.completion === 'none'
           ? 'stage1_2_only'
           : 'limited'
-      const isExecutiveGeneration = isExecutiveTraceUnit(unit)
-      const priorDraft = stage3DraftPlans[unit.name] || null
+      if (mode === 'stage1_2_only') {
+        throw new Error('Product Management needs a compact Stage 2 handoff before Stage 3 generation. Stage 1/2-only fallback output is disabled.')
+      }
       let atoms = buildExecutionAtomsForBU(unit, readiness, priorDraft, mode)
+      if (!atoms.length) {
+        throw new Error('No validated Stage 2 handoff atoms are available for Product Management.')
+      }
       logExecutiveBoundary(unit, 'C2. executionAtoms', atoms)
 
-      if (isExecutiveGeneration && USE_STAGE3_EXECUTIVE_FIXTURE) {
-        const fixturePlan = buildExecutiveLeadershipFixturePlan(unit, readiness)
-        const fixtureAtoms = atoms.map(atom => ({
-          ...atom,
-          status: ATOM_STATUSES.COMPLETE,
-          parsedValue: {
-            sectionName: atom.elementName,
-            objective: 'Fixture-backed Executive Leadership vertical slice. Live AI generation is intentionally disabled for this slice until the structured UI is reviewable.',
-          },
-          completedAt: new Date().toISOString(),
-          metadata: { ...(atom.metadata || {}), fixture: true },
-        }))
-        logExecutiveBoundary(unit, 'Fixture. structuredExecutivePlan', fixturePlan)
-        persistBuPlanDraft(unit, fixturePlan, readiness, 'fixture', fixtureAtoms)
-        setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null, atomSummary: summarizeAtoms(fixtureAtoms) } }))
-        return { error: null }
-      }
-
       if (!hasApiKey()) {
-        atoms = atoms.map(atom => ({
-          ...atom,
-          status: ATOM_STATUSES.COMPLETE,
-          parsedValue: {
-            sectionName: atom.elementName,
-            objective: `${unit.name} drafts ${atom.elementName} from available Stage 1/2 context.`,
-            executionStrategy: [atom.metadata?.handoffItem?.detail || atom.metadata?.handoffItem?.text || 'Use available strategy and BU context.'],
-            decisionsRequired: [],
-            sequencingAndGates: [],
-            dependencies: unit.dependencies || [],
-            risks: unit.risksAndUnknowns || [],
-            constraints: [],
-            unknowns: readiness.completion === 'none' ? ['Stage 2 handoff context has not been generated.'] : [],
-            validationReadinessChecks: unit.keySuccessMetrics || [],
-            ownershipGovernance: unit.keyResponsibilities || [],
-            successIndicators: unit.keySuccessMetrics || [],
-            failureSignals: [],
-            stage4DeliveryImplications: [],
-          },
-          completedAt: new Date().toISOString(),
-        }))
-        const plan = assembleAtomizedBUPlan(unit, readiness, atoms, mode)
-        persistBuPlanDraft(unit, plan, readiness, 'mock', atoms)
-        setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null } }))
-        return { error: null }
+        throw new Error('Anthropic API key is required for Product Management Stage 3 generation. Mock placeholder output is disabled for this pilot.')
       }
 
-      const updatedAtoms = await runGenerationQueue({
+      const runnableAtoms = atoms.filter(atom => STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status))
+      const retryMode = atoms.some(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom.status))
+        ? 'retry failed only'
+        : runnableAtoms.length < atoms.length
+          ? 'resume missing'
+          : 'full'
+      const startingDiagnostics = buildGenerationDiagnostics({
+        buName: unit.name,
+        requestedAtoms: atoms,
+        runnableAtoms,
+        retryMode,
+        model: AI_MODEL_LABEL,
+      })
+      setBuPlanGeneration(prev => ({
+        ...prev,
+        [unit.name]: {
+          running: true,
+          error: null,
+          lifecycleState: LIFECYCLE_STATES.GENERATING,
+          diagnostics: startingDiagnostics,
+          progress: buildStage3Progress({
+            unit,
+            mode: startingDiagnostics.retryMode,
+            atoms,
+            currentAtom: runnableAtoms[0] || atoms[0],
+            lifecycleState: runnableAtoms.length ? 'queued' : 'skipped',
+            skippedCount: startingDiagnostics.atomsSkippedAlreadyValid,
+            latestUsage: null,
+          }),
+          atomSummary: summarizeAtoms(atoms),
+        },
+      }))
+
+      const lifecycleResult = await runGenerationLifecycle({
+        buName: unit.name,
         atoms,
-        concurrency: 1,
-        delayMs: isExecutiveGeneration ? EXECUTIVE_STAGE3_QUEUE_DELAY_MS : STAGE3_QUEUE_DELAY_MS,
+        delayMs: STAGE3_QUEUE_DELAY_MS,
         retryFailedOnly: true,
-        retry: isExecutiveGeneration ? EXECUTIVE_STAGE3_RETRY : null,
-        onAtomUpdate: (atom, allAtoms) => {
-          const plan = assembleAtomizedBUPlan(unit, readiness, allAtoms, mode)
-          persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms)
+        model: AI_MODEL_LABEL,
+        retryMode,
+        onUpdate: ({ lifecycleState, atomLifecycleState, currentAtom, atoms: allAtoms, diagnostics }) => {
+          const eligibleAtoms = renderingEligibleAtoms(allAtoms)
+          const plan = eligibleAtoms.length ? assembleAtomizedBUPlan(unit, readiness, allAtoms, mode) : null
+          const progress = buildStage3Progress({
+            unit,
+            mode: diagnostics?.retryMode || 'partial',
+            atoms: allAtoms,
+            currentAtom,
+            lifecycleState: atomLifecycleState || lifecycleState,
+            skippedCount: diagnostics?.atomsSkippedAlreadyValid || 0,
+            latestFailureReason: currentAtom?.parserError || null,
+            latestUsage: diagnostics?.latestUsage || null,
+          })
+          persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms, { status: lifecycleState }, diagnostics, progress)
           setBuPlanGeneration(prev => ({
             ...prev,
-            [unit.name]: { running: true, error: null, atomSummary: summarizeAtoms(allAtoms) },
+            [unit.name]: { running: true, error: null, lifecycleState, diagnostics, progress, atomSummary: summarizeAtoms(allAtoms) },
           }))
         },
         worker: async (atom) => {
-          console.log(`[Stage3 API] BU execution atom start: ${unit.name} / ${atom.elementName}`)
-          const { messages } = buildStage3ExecutionAtomMessages(
+          console.log(`[Stage3 API] BU field atom start: ${unit.name} / ${atom.elementName} / ${atom.childKey}`)
+          const { messages } = buildStage3FieldAtomMessages(
             s1Snap,
             enrichedUnit,
             atom.metadata?.handoffItem || { key: atom.childKey, label: atom.elementName },
+            atom.metadata?.fieldKey || atom.childKey,
             mode,
             otherNames,
           )
           logExecutiveBoundary(unit, `D. stage3PromptPayload / ${atom.childKey}`, messages)
-          const response = await callAI(messages, { temperature: 0.3, maxTokens: 1300 })
+          const promptBytes = estimateMessageBytes(messages)
+          const response = await callAI(messages, { temperature: 0.3, maxTokens: 650 })
           logExecutiveBoundary(unit, `E. rawModelResponse / ${atom.childKey}`, response.result || response.error)
           if (response.error) {
             const message = isRateLimitedAIResponse(response)
               ? `Rate limited while generating ${unit.name} / ${atom.elementName}. Retry this atom after cooldown.`
               : response.error
-            throw { message, rawResponseText: response.result || null, status: response.status, rateLimited: response.rateLimited }
+            throw { message, rawResponseText: response.result || null, status: response.status, rateLimited: response.rateLimited, usage: response.usage || null, stopReason: response.stopReason || null, model: response.model || null }
           }
-          const parsed = parseStage3ExecutionAtomResponse(response.result)
-          logExecutiveBoundary(unit, `F. parsedStage3Result / ${atom.childKey}`, parsed)
-          if (parsed.error || !parsed.section) {
-            throw { message: parsed.error || 'Execution atom parse failed.', rawResponseText: response.result || null }
-          }
-          const validation = isExecutiveGeneration
-            ? validateExecutiveStage3Atom(parsed.section)
-            : { pass: true, reason: null }
-          logExecutiveBoundary(unit, `G. atomValidationResults / ${atom.childKey}`, {
-            atomKey: atom.childKey,
-            parsedValue: parsed.section,
-            validationPass: validation.pass,
-            failureReason: validation.reason,
-          })
-          if (!validation.pass) {
+          if (response.stopReason === 'max_tokens') {
             throw {
-              message: `Execution atom validation failed: ${validation.reason}`,
+              message: 'Model output exceeded max_tokens before returning valid JSON.',
               rawResponseText: response.result || null,
-              failureLabel: 'validation_failed',
+              failureLabel: 'max_tokens',
+              stopReason: response.stopReason,
+              usage: response.usage || null,
+              model: response.model || null,
             }
           }
-          return { rawResponseText: response.result, parsedValue: parsed.section }
+          setBuPlanGeneration(prev => ({
+            ...prev,
+            [unit.name]: {
+              ...(prev[unit.name] || {}),
+              running: true,
+              lifecycleState: LIFECYCLE_STATES.GENERATING,
+              progress: buildStage3Progress({
+                unit,
+                mode: retryMode,
+                atoms,
+                currentAtom: atom,
+                lifecycleState: 'validating',
+                skippedCount: startingDiagnostics.atomsSkippedAlreadyValid,
+                latestUsage: response.usage
+                  ? {
+                      atomId: atom.id,
+                      input_tokens: response.usage.input_tokens || 0,
+                      output_tokens: response.usage.output_tokens || 0,
+                      stop_reason: response.stopReason || null,
+                      model: response.model || AI_MODEL_LABEL,
+                      timestamp: new Date().toISOString(),
+                    }
+                  : null,
+              }),
+            },
+          }))
+          const fieldKey = atom.metadata?.fieldKey || atom.childKey
+          const parsed = parseStage3FieldAtomResponse(response.result, fieldKey)
+          logExecutiveBoundary(unit, `F. parsedStage3Result / ${atom.childKey}`, parsed)
+          if (parsed.error) {
+            throw {
+              message: parsed.error || 'Execution field atom parse failed.',
+              rawResponseText: response.result || null,
+              failureLabel: 'validation_failed',
+              usage: response.usage || null,
+              stopReason: response.stopReason || null,
+              model: response.model || null,
+            }
+          }
+          return {
+            rawResponseText: response.result,
+            parsedValue: parsed.value,
+            promptBytes,
+            outputBytes: estimateTextBytes(response.result || ''),
+            usage: response.usage || null,
+            stopReason: response.stopReason || null,
+            model: response.model || null,
+          }
         },
       })
 
-      const plan = assembleAtomizedBUPlan(unit, readiness, updatedAtoms, mode)
-      persistBuPlanDraft(unit, plan, readiness, 'ai', updatedAtoms)
-      setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null } }))
+      const updatedAtoms = lifecycleResult.atoms
+      const plan = lifecycleResult.lifecycleState === LIFECYCLE_STATES.DRAFT_GENERATED
+        ? assembleAtomizedBUPlan(unit, readiness, updatedAtoms, mode)
+        : null
+      const finalProgress = buildStage3Progress({
+        unit,
+        mode: lifecycleResult.diagnostics?.retryMode || 'partial',
+        atoms: updatedAtoms,
+        lifecycleState: lifecycleResult.lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED ? 'failed' : 'persisted',
+        skippedCount: lifecycleResult.diagnostics?.atomsSkippedAlreadyValid || 0,
+        latestFailureReason: lifecycleResult.lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED ? 'One or more field atoms failed.' : null,
+        latestUsage: lifecycleResult.diagnostics?.latestUsage || null,
+      })
+      persistBuPlanDraft(unit, plan, readiness, 'ai', updatedAtoms, { status: lifecycleResult.lifecycleState }, lifecycleResult.diagnostics, finalProgress)
+      setBuPlanGeneration(prev => ({
+        ...prev,
+        [unit.name]: {
+          running: false,
+          error: lifecycleResult.lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED ? 'One or more Product Management atoms failed validation or generation.' : null,
+          lifecycleState: lifecycleResult.lifecycleState,
+          diagnostics: lifecycleResult.diagnostics,
+          progress: finalProgress,
+          atomSummary: lifecycleResult.atomSummary,
+        },
+      }))
       return { error: null }
     } catch (err) {
       const message = err?.message || String(err)
@@ -3403,6 +4118,7 @@ export default function Stage3View({
         <Stage3ReadinessPanels
           rows={readinessRows}
           planDrafts={stage3DraftPlans}
+          legacyExecutionPlans={executionPlans}
           planGeneration={buPlanGeneration}
           draftOptIns={stage12DraftOptIns}
           onOptIntoStage12Draft={buName => setStage12DraftOptIns(prev => ({ ...prev, [buName]: true }))}
@@ -3426,9 +4142,7 @@ export default function Stage3View({
           <div style={{ fontSize: 24, opacity: .15, marginBottom: 16, lineHeight: 1 }}>▦</div>
           <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Execution Planning</div>
           <div style={{ fontSize: 11, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.7, maxWidth: 460, margin: '0 auto 24px' }}>
-            {apiMode === 'ai'
-              ? `Generate AI execution plans for all ${stage2BUs.length} Stage 2 business units. Plans will include prioritised initiatives, sequencing, dependencies, constraints, unknowns, and measurement.`
-              : `Generate mock execution plans for ${stage2BUs.length} Stage 2 business units. Add VITE_ANTHROPIC_API_KEY to .env.local and restart for AI generation.`}
+            All-BU Stage 3 generation is disabled while the Product Management lifecycle is being proven. Use the Product Management row above to generate one BU only.
           </div>
 
           {(!activeStage1Rev || !activeStage2Rev) && (
@@ -3443,7 +4157,8 @@ export default function Stage3View({
 
           <GenerateButton
             apiMode={apiMode} isGenerating={isGenerating} isRegenerate={false}
-            onGenerate={handleGenerate} disabled={!activeStage1Rev || !activeStage2Rev} large
+            onGenerate={() => setGenError(`All-BU Stage 3 generation is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven.`)}
+            disabled large
           />
           <div style={{ marginTop: 10 }}>
             <ApiModeStatus apiMode={apiMode} />
@@ -3541,7 +4256,8 @@ export default function Stage3View({
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
           <GenerateButton
             apiMode={apiMode} isGenerating={isGenerating} isRegenerate
-            onGenerate={handleGenerate} disabled={!activeStage1Rev || !activeStage2Rev}
+            onGenerate={() => setGenError(`All-BU Stage 3 regeneration is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven.`)}
+            disabled
           />
           <ApiModeStatus apiMode={apiMode} />
         </div>
@@ -3550,6 +4266,7 @@ export default function Stage3View({
       <Stage3ReadinessPanels
         rows={readinessRows}
         planDrafts={stage3DraftPlans}
+        legacyExecutionPlans={executionPlans}
         planGeneration={buPlanGeneration}
         draftOptIns={stage12DraftOptIns}
         onOptIntoStage12Draft={buName => setStage12DraftOptIns(prev => ({ ...prev, [buName]: true }))}
@@ -3581,12 +4298,12 @@ export default function Stage3View({
             </div>
             <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.6 }}>
               {staleReason} has changed since this Stage 3 was generated.
-              Regenerate to re-align the execution plans, or keep the existing plans.
+              Product Management can be regenerated from its BU row. All-BU regeneration is disabled during the Stage 3 pilot.
             </div>
           </div>
           <button
-            onClick={handleGenerate}
-            disabled={isGenerating || !activeStage1Rev || !activeStage2Rev}
+            onClick={() => setGenError(`All-BU Stage 3 regeneration is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven.`)}
+            disabled
             style={{
               flexShrink: 0, fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
               padding: '5px 14px', borderRadius: 5, cursor: 'pointer',
