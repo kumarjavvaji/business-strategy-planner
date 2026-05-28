@@ -37,6 +37,7 @@ import { REFINEMENT_SCOPES }             from './Stage2View'
 import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
 import { ATOM_STATUSES, createGenerationAtom, summarizeAtoms } from '../utils/generationAtoms'
 import { runGenerationQueue } from '../utils/generationQueue'
+import { stage3ExecutiveLeadershipFixture } from '../fixtures/stage3ExecutiveLeadershipFixture'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -53,6 +54,27 @@ const READINESS_COLORS = {
 
 const STAGE3_QUEUE_DELAY_MS = 850
 const STAGE3_DRAFT_PLAN_VERSION = 1
+const EXECUTIVE_TRACE_PATTERN = /executive leadership|strategic governance|executive/i
+const DEBUG_STAGE3_TRACE = import.meta.env?.VITE_STAGE3_TRACE === 'true'
+const USE_STAGE3_EXECUTIVE_FIXTURE = import.meta.env?.VITE_USE_STAGE3_FIXTURE === 'true'
+const EXECUTIVE_STAGE3_QUEUE_DELAY_MS = 2500
+const EXECUTIVE_STAGE3_RETRY = {
+  maxAttempts: 4,
+  baseDelayMs: 2500,
+  maxDelayMs: 20000,
+}
+const STAGE3_FAILED_ATOM_STATUSES = new Set([
+  ATOM_STATUSES.FAILED,
+  ATOM_STATUSES.API_RATE_LIMITED,
+])
+const STAGE3_RETRYABLE_ATOM_STATUSES = new Set([
+  ATOM_STATUSES.FAILED,
+  ATOM_STATUSES.API_RATE_LIMITED,
+  ATOM_STATUSES.RETRY_PENDING,
+  ATOM_STATUSES.STALE,
+  ATOM_STATUSES.PENDING,
+  ATOM_STATUSES.NOT_STARTED,
+])
 
 function riskColor(level)      { return RISK_COLORS[level]     || '#fb923c' }
 function readyColor(level)     { return READINESS_COLORS[level] || '#fb923c' }
@@ -109,6 +131,28 @@ function valueToSearchText(value) {
   return String(value)
 }
 
+function stage3TraceHash(value) {
+  const text = JSON.stringify(value || {})
+  let hash = 0
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash).toString(36)
+}
+
+function isExecutiveTraceUnit(unit) {
+  return EXECUTIVE_TRACE_PATTERN.test(unit?.name || unit?.buName || '')
+}
+
+function logExecutiveBoundary(unit, label, value) {
+  if (!DEBUG_STAGE3_TRACE) return
+  if (!isExecutiveTraceUnit(unit)) return
+  console.groupCollapsed(`[Stage3 Executive Boundary Trace] ${label}`)
+  console.log(value)
+  console.groupEnd()
+}
+
 function listFromValue(value) {
   if (!value) return []
   if (Array.isArray(value)) {
@@ -124,6 +168,171 @@ function listFromValue(value) {
   }
   if (typeof value === 'string') return value ? [value] : []
   return valueToSearchText(value) ? [valueToSearchText(value)] : []
+}
+
+function byteSize(value) {
+  try {
+    return new Blob([JSON.stringify(value || {})]).size
+  } catch {
+    return valueToSearchText(value).length
+  }
+}
+
+function compactHandoffText(value) {
+  const text = valueToSearchText(value).replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  const sentence = text.match(/^.{1,280}?[.!?](\s|$)/)?.[0]?.trim()
+  return sentence || (text.length > 280 ? `${text.slice(0, 277).trim()}...` : text)
+}
+
+function compactArray(values, maxItems = 6) {
+  return listFromValue(values).map(compactHandoffText).filter(Boolean).slice(0, maxItems)
+}
+
+function handoffItemTitle(key, state = {}, idx = 0) {
+  const parsed = state?.parsedValue
+  if (parsed?.name || parsed?.label || parsed?.title) return parsed.name || parsed.label || parsed.title
+  return state?.label || key || `handoff-section-${idx + 1}`
+}
+
+function createStage2ToStage3HandoffBrief(unit, draft) {
+  const compiled = unit?.stage3PlanningContext || {}
+  const parsed = draft?.parsed || {}
+  const itemStates = draft?.itemStates || draft?.handoffItems || draft?.generatedItems || {}
+  const structureItems = normalizeStructureItems(
+    parsed.handoffStructure || draft?.handoffStructure || compiled.handoffStructure || compiled.likelyExecutionSections,
+  )
+  const itemEntries = Object.entries(itemStates)
+  // structureItems are the canonical section labels; itemEntries hold generated content for those
+  // same sections. Combining both creates duplicate entries (6 themes + 6 item-state rows = 12).
+  // Use structure items when they exist; fall back to item-entry keys only if no structure yet.
+  const sourceSectionTitles = (
+    structureItems.length
+      ? structureItems.map(item => item.label)
+      : itemEntries.map(([key, state], idx) => handoffItemTitle(key, state, idx))
+  ).filter(Boolean)
+  const sourceStage2SectionIds = (
+    structureItems.length
+      ? structureItems.map(item => item.key)
+      : itemEntries.map(([key]) => key)
+  ).filter(Boolean)
+  const sourceRefs = sourceStage2SectionIds.map((id, idx) => ({
+    id,
+    title: sourceSectionTitles[idx] || id,
+    stage: 2,
+    businessUnitName: unit?.name || '',
+    pointer: `stage2:${unit?.name || 'unknown'}:${id}`,
+  }))
+  const textFor = (patterns, maxItems = 6) => {
+    const rx = new RegExp(patterns.join('|'), 'i')
+    return itemEntries
+      .filter(([key, state]) => rx.test(key) || rx.test(valueToSearchText(state?.parsedValue)) || rx.test(valueToSearchText(state?.childAtoms)))
+      .flatMap(([, state]) => compactArray(state?.parsedValue || state?.childAtoms, 3))
+      .slice(0, maxItems)
+  }
+  const smeLens = getSmeLensFromDraft(draft, compiled)
+  const domainOfWork = parsed.domainOfWork || draft?.domainOfWork || compiled.domainOfWork || ''
+  const readinessStatus = draft?.handoffStatus || draft?.buHandoff?.handoffStatus || compiled.handoffStatus || (sourceRefs.length ? 'partial' : 'not_started')
+  const now = new Date().toISOString()
+
+  return {
+    id: `stage2-stage3-brief:${storageSafeName(unit?.name || 'unknown')}`,
+    businessUnitId: unit?.id || unit?.name || null,
+    businessUnitName: unit?.name || '',
+    sourceStage2SectionIds,
+    sourceSectionTitles,
+    planningPurpose: compactHandoffText(domainOfWork || unit?.purpose || compiled.domainOfWork),
+    decisionBasisSummary: compactHandoffText(
+      typeof smeLens === 'string'
+        ? smeLens
+        : smeLens?.summary || smeLens?.reviewerProfile || unit?.strategicInvolvement || unit?.purpose,
+    ),
+    keyImplications: compactArray([
+      ...(compiled.stage4DeliveryImplications || []),
+      ...(compiled.priorRefinementsToPreserve || []),
+      ...textFor(['implication', 'outcome', 'decision', 'execution'], 4),
+    ], 8),
+    executionConstraints: compactArray([
+      ...(compiled.constraintsToCarryForward || []),
+      ...(unit?.risksAndUnknowns || []),
+      ...textFor(['constraint', 'capacity', 'limit'], 4),
+    ], 8),
+    dependencies: compactArray([
+      ...(compiled.criticalDependenciesToExplore || []),
+      ...(unit?.dependencies || []),
+      ...textFor(['depend', 'coordination', 'handoff', 'input', 'output'], 4),
+    ], 8),
+    risksOrContradictions: compactArray([
+      ...(compiled.riskThemesToExplore || []),
+      ...(unit?.risksAndUnknowns || []),
+      ...textFor(['risk', 'contradiction', 'tradeoff'], 4),
+    ], 8),
+    unresolvedQuestions: compactArray([
+      ...(compiled.unresolvedQuestionsForStage3 || []),
+      ...textFor(['question', 'unknown', 'unresolved'], 4),
+    ], 8),
+    readinessStatus,
+    metadata: {
+      isStale: !!(draft?.structureIsStale || draft?.statuses?.structureIsStale || draft?.staleFlags?.structureIsStale),
+      sourceDraftVersion: draft?.version || null,
+      fullDraftSizeBytes: byteSize(draft),
+      briefSizeBytes: 0,
+      sourceDetailExcludedFromStage3Generation: true,
+    },
+    evidenceRefs: sourceRefs,
+    createdAt: draft?.createdAt || draft?.lastSavedAt || now,
+    updatedAt: draft?.lastSavedAt || draft?.updatedAt || now,
+    regeneratedAt: draft?.regeneratedAt || draft?.lastGeneratedAt || null,
+  }
+}
+
+function finalizeHandoffBrief(brief) {
+  return {
+    ...brief,
+    metadata: {
+      ...(brief?.metadata || {}),
+      briefSizeBytes: byteSize({ ...brief, metadata: { ...(brief?.metadata || {}), briefSizeBytes: 0 } }),
+    },
+  }
+}
+
+function isMeaningfulStage3Value(value) {
+  const text = valueToSearchText(value).trim()
+  if (!text) return false
+  return !/^(none identified|not specified|n\/a|none|null|undefined)$/i.test(text)
+}
+
+function validateExecutiveStage3Atom(section) {
+  if (!section || typeof section !== 'object') {
+    return { pass: false, reason: 'Parsed section is missing.' }
+  }
+  if (!isMeaningfulStage3Value(section.sectionName)) {
+    return { pass: false, reason: 'Section name is missing.' }
+  }
+  if (!isMeaningfulStage3Value(section.objective)) {
+    return { pass: false, reason: 'Objective is missing.' }
+  }
+  const evidenceKeys = [
+    'executionStrategy',
+    'decisionsRequired',
+    'sequencingAndGates',
+    'dependencies',
+    'risks',
+    'constraints',
+    'unknowns',
+    'validationReadinessChecks',
+    'ownershipGovernance',
+    'successIndicators',
+    'failureSignals',
+    'stage4DeliveryImplications',
+  ]
+  const evidenceCount = evidenceKeys.reduce((count, key) => (
+    count + listFromValue(section[key]).filter(isMeaningfulStage3Value).length
+  ), 0)
+  if (evidenceCount < 2) {
+    return { pass: false, reason: 'Section lacks concrete execution detail.' }
+  }
+  return { pass: true, reason: null }
 }
 
 function normalizeStructureItems(structure) {
@@ -144,15 +353,26 @@ function normalizeStructureItems(structure) {
 
 function extractDraftItemStates(draft) {
   const states = draft?.itemStates || draft?.handoffItems || draft?.generatedItems || {}
-  return Object.entries(states).map(([key, state]) => ({
-    key,
-    status: state?.status || draft?.statuses?.handoffItems?.[key]?.status || 'not_started',
-    isStale: !!(state?.isStale || draft?.staleFlags?.handoffItems?.[key]),
-    parsedValue: state?.parsedValue || draft?.parsedValues?.handoffItems?.[key] || null,
-    parserError: state?.parserError || draft?.parserErrors?.handoffItems?.[key]?.parserError || null,
-    childAtoms: state?.childAtoms || draft?.childAtoms?.[key] || {},
-    text: `${key} ${valueToSearchText(state?.parsedValue || draft?.parsedValues?.handoffItems?.[key])} ${valueToSearchText(state?.childAtoms || draft?.childAtoms?.[key])}`,
-  }))
+  return Object.entries(states).map(([key, state], idx) => {
+    const parsedValue = state?.parsedValue || draft?.parsedValues?.handoffItems?.[key] || null
+    const childAtoms = state?.childAtoms || draft?.childAtoms?.[key] || {}
+    const title = handoffItemTitle(key, { ...state, parsedValue }, idx)
+    return {
+      key,
+      label: title,
+      status: state?.status || draft?.statuses?.handoffItems?.[key]?.status || 'not_started',
+      isStale: !!(state?.isStale || draft?.staleFlags?.handoffItems?.[key]),
+      parsedValue: compactHandoffText(parsedValue),
+      parserError: state?.parserError || draft?.parserErrors?.handoffItems?.[key]?.parserError || null,
+      childAtoms: Object.fromEntries(Object.entries(childAtoms).map(([childKey, child]) => [childKey, {
+        status: child?.status || 'not_started',
+        parserError: child?.parserError || null,
+        parsedValue: compactHandoffText(child?.parsedValue),
+      }])),
+      text: `${key} ${title} ${compactHandoffText(parsedValue)}`,
+      sourceRefId: key,
+    }
+  })
 }
 
 function getSmeLensFromDraft(draft, compiled = {}) {
@@ -168,53 +388,51 @@ function getSmeLensFromDraft(draft, compiled = {}) {
 function buildPlanningContextFromDraft(unit, draft) {
   const compiled = unit?.stage3PlanningContext || {}
   const parsed = draft?.parsed || {}
-  const structureItems = normalizeStructureItems(
-    parsed.handoffStructure || draft?.handoffStructure || compiled.handoffStructure || compiled.likelyExecutionSections,
-  )
-  const itemStates = extractDraftItemStates(draft)
-  const assembled = draft?.buHandoff || draft?.assembledBuHandoff || null
-  const textFor = (patterns) => {
-    const rx = new RegExp(patterns.join('|'), 'i')
-    return itemStates
-      .filter(item => rx.test(item.key) || rx.test(item.text))
-      .flatMap(item => listFromValue(item.parsedValue))
-      .slice(0, 8)
-  }
+  const brief = finalizeHandoffBrief(createStage2ToStage3HandoffBrief(unit, draft))
+  const sourceSections = brief.sourceSectionTitles.map((title, idx) => ({
+    name: title,
+    purpose: brief.keyImplications[idx] || brief.planningPurpose || '',
+    whyThisSectionMatters: brief.decisionBasisSummary || title,
+    required: true,
+    sourceRefId: brief.sourceStage2SectionIds[idx] || null,
+  }))
   return {
-    ...compiled,
+    handoffBrief: brief,
+    stage2ToStage3HandoffBrief: brief,
     domainOfWork: parsed.domainOfWork || draft?.domainOfWork || compiled.domainOfWork || '',
     SMEReviewLens: getSmeLensFromDraft(draft, compiled),
-    handoffStructure: structureItems,
+    handoffStructure: sourceSections,
     likelyExecutionSections: compiled.likelyExecutionSections?.length
       ? compiled.likelyExecutionSections
-      : structureItems.map(item => ({
-          name: item.label,
-          purpose: '',
-          whyThisSectionMatters: item.text,
+      : sourceSections.map(item => ({
+          name: item.name,
+          purpose: item.purpose,
+          whyThisSectionMatters: item.whyThisSectionMatters,
           required: item.required,
+          sourceRefId: item.sourceRefId,
         })),
     criticalDependenciesToExplore: compiled.criticalDependenciesToExplore?.length
       ? compiled.criticalDependenciesToExplore
-      : textFor(['depend', 'coordination', 'handoff', 'input', 'output']),
+      : brief.dependencies,
     riskThemesToExplore: compiled.riskThemesToExplore?.length
       ? compiled.riskThemesToExplore
-      : textFor(['risk', 'constraint', 'unknown', 'assumption']),
+      : brief.risksOrContradictions,
     constraintsToCarryForward: compiled.constraintsToCarryForward?.length
       ? compiled.constraintsToCarryForward
-      : textFor(['constraint', 'capacity', 'limit']),
+      : brief.executionConstraints,
     unresolvedQuestionsForStage3: compiled.unresolvedQuestionsForStage3?.length
       ? compiled.unresolvedQuestionsForStage3
-      : textFor(['question', 'unknown', 'unresolved']),
+      : brief.unresolvedQuestions,
     validationNeedsForStage3: compiled.validationNeedsForStage3?.length
       ? compiled.validationNeedsForStage3
-      : textFor(['validation', 'evidence', 'review', 'metric', 'readiness']),
+      : compactArray([brief.decisionBasisSummary, ...brief.keyImplications], 6),
     stage4DeliveryImplications: compiled.stage4DeliveryImplications?.length
       ? compiled.stage4DeliveryImplications
-      : textFor(['stage 4', 'delivery', 'epic', 'acceptance', 'requirement', 'implementation']),
+      : brief.keyImplications,
     priorRefinementsToPreserve: compiled.priorRefinementsToPreserve?.length
       ? compiled.priorRefinementsToPreserve
-      : listFromValue(assembled?.priorRefinementsToPreserve || draft?.refinementPrompts).slice(0, 6),
-    handoffStatus: draft?.handoffStatus || assembled?.handoffStatus || compiled.handoffStatus || 'not_started',
+      : compactArray(draft?.refinementPrompts, 6),
+    handoffStatus: brief.readinessStatus,
   }
 }
 
@@ -307,11 +525,16 @@ function assessReadinessCell(column, handoff) {
 function summarizeHandoffReadiness(bu, draft) {
   const compiled = bu?.stage3PlanningContext || {}
   const parsed = draft?.parsed || {}
+  const brief = finalizeHandoffBrief(createStage2ToStage3HandoffBrief(bu, draft))
   const domainOfWork = parsed.domainOfWork || draft?.domainOfWork || compiled.domainOfWork || ''
   const smeLens = getSmeLensFromDraft(draft, compiled)
-  const structureItems = normalizeStructureItems(
-    parsed.handoffStructure || draft?.handoffStructure || compiled.handoffStructure || compiled.likelyExecutionSections,
-  )
+  const structureItems = brief.sourceSectionTitles.map((title, idx) => ({
+    key: brief.sourceStage2SectionIds[idx] || storageSafeName(title),
+    label: title,
+    text: brief.keyImplications[idx] || brief.planningPurpose || title,
+    required: true,
+    sourceRefId: brief.sourceStage2SectionIds[idx] || null,
+  }))
   const itemStates = extractDraftItemStates(draft)
   const exists = !!(domainOfWork || smeLens || structureItems.length || itemStates.length || draft?.buHandoff || draft?.assembledBuHandoff || Object.keys(compiled).length)
   const handoff = {
@@ -323,6 +546,7 @@ function summarizeHandoffReadiness(bu, draft) {
     structureIsStale: !!(draft?.structureIsStale || draft?.statuses?.structureIsStale || draft?.staleFlags?.structureIsStale),
     smeLensStale: !!(draft?.SMEReviewLensAtom?.isStale || draft?.smeLensState?.isStale || draft?.staleFlags?.SMEReviewLens),
     status: draft?.handoffStatus || draft?.buHandoff?.handoffStatus || compiled.handoffStatus || (exists ? 'partial' : 'not_started'),
+    handoffBrief: brief,
   }
   const cells = Object.fromEntries(READINESS_COLUMNS.map(col => [col.key, assessReadinessCell(col, handoff)]))
   const readyCount = Object.values(cells).filter(c => c.status === 'ready').length
@@ -335,7 +559,10 @@ function summarizeHandoffReadiness(bu, draft) {
     item.parsedValue ||
     Object.keys(item.childAtoms || {}).length
   )).length
-  const totalItemCount = structureItems.length || itemStates.length
+  // Use itemStates as the denominator: completedItemCount is also counted from itemStates,
+  // so both numerator and denominator must come from the same source. Fall back to
+  // structureItems only when no items have been generated yet.
+  const totalItemCount = itemStates.length || structureItems.length
   const completion = !exists
     ? 'none'
     : staleCount || failedCount
@@ -433,8 +660,11 @@ function buildExecutionAtomsForBU(unit, readiness, priorDraft, mode) {
 
 function assembleAtomizedBUPlan(unit, readiness, atoms, mode) {
   const completedAtoms = atoms.filter(atom => atom.status === ATOM_STATUSES.COMPLETE && atom.parsedValue)
-  const failedAtoms = atoms.filter(atom => atom.status === ATOM_STATUSES.FAILED)
-  const pendingAtoms = atoms.filter(atom => ![ATOM_STATUSES.COMPLETE, ATOM_STATUSES.FAILED].includes(atom.status))
+  const failedAtoms = atoms.filter(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom.status))
+  const pendingAtoms = atoms.filter(atom => ![
+    ATOM_STATUSES.COMPLETE,
+    ...STAGE3_FAILED_ATOM_STATUSES,
+  ].includes(atom.status))
   const sections = completedAtoms.map(atom => ({
     ...atom.parsedValue,
     atomId: atom.id,
@@ -455,7 +685,12 @@ function assembleAtomizedBUPlan(unit, readiness, atoms, mode) {
     criticalWorkstreams: sections.map(section => section.sectionName).filter(Boolean),
     executionSections: sections,
     missingSections: pendingAtoms.map(atom => atom.elementName),
-    failedSections: failedAtoms.map(atom => ({ name: atom.elementName, error: atom.parserError })),
+    failedSections: failedAtoms.map(atom => ({
+      name: atom.elementName,
+      status: atom.status,
+      error: atom.parserError,
+      failureLabel: atom.metadata?.failureLabel || null,
+    })),
     planStatus,
     generationMode: mode,
     sourceHandoffStatus: readiness.status,
@@ -490,6 +725,143 @@ function assembleAtomizedBUPlan(unit, readiness, atoms, mode) {
     dependencyComplexity: flat('dependencies').length > 4 ? 'high' : 'medium',
     confidenceLevel: planStatus === 'complete' && mode === 'full' ? 'medium' : 'low',
     organizationalReadiness: planStatus === 'complete' ? 'medium' : 'low',
+  }
+}
+
+function buildExecutiveLeadershipFixturePlan(unit, readiness) {
+  const fixture = JSON.parse(JSON.stringify(stage3ExecutiveLeadershipFixture))
+  const planningContext = readiness?.planningContext || unit?.stage3PlanningContext || {}
+  const handoffItems = readiness?.structureItems || []
+  const activeSourceBasis = {
+    businessUnitName: unit?.name || 'Executive Leadership & Strategic Governance',
+    stage2Purpose: unit?.purpose || '',
+    strategicInvolvement: unit?.strategicInvolvement || '',
+    domainOfWork: planningContext.domainOfWork || 'Executive governance, strategic decision authority, resource allocation, and escalation control.',
+    SMEReviewLens: planningContext.SMEReviewLens || planningContext.smeReviewLens || null,
+    handoffItemNames: handoffItems.map(item => item.label || item.name || item.key).filter(Boolean),
+    keyResponsibilities: unit?.keyResponsibilities || [],
+    dependencies: unit?.dependencies || [],
+    risksAndUnknowns: unit?.risksAndUnknowns || [],
+    keySuccessMetrics: unit?.keySuccessMetrics || [],
+  }
+
+  return {
+    ...fixture,
+    buName: unit?.name || 'Executive Leadership & Strategic Governance',
+    sourceHandoffStatus: readiness?.status || 'fixture',
+    confidenceLevel: readiness?.completion === 'full' ? 'medium' : 'low',
+    organizationalReadiness: readiness?.completion === 'full' ? 'medium' : 'low',
+    readiness: {
+      ...fixture.readiness,
+      status: readiness?.completion === 'full' ? 'ready_for_review' : 'draft_from_available_context',
+    },
+    sourceBasis: {
+      ...fixture.sourceBasis,
+      activeStage2Context: activeSourceBasis,
+    },
+  }
+}
+
+function buildExecutiveSectionReviewStates(source = 'ai') {
+  const base = source === 'fixture'
+    ? 'Fixture scaffold for reviewing the cockpit shape.'
+    : 'Generated from Stage 2 handoff context; review before treating as accepted.'
+  return {
+    readiness: { status: 'draft', operatorNote: base, sourceBasis: ['Stage 2 handoff', 'Generated Stage 3 plan'], failureReason: null },
+    decisionOwnership: { status: 'draft', operatorNote: base, sourceBasis: ['Decision rights', 'Ownership fields'], failureReason: null },
+    executionWorkstreams: { status: 'draft', operatorNote: base, sourceBasis: ['Generated execution sections'], failureReason: null },
+    crossFunctionalDependencies: { status: 'draft', operatorNote: base, sourceBasis: ['Generated dependencies'], failureReason: null },
+    requiredCapabilities: { status: 'draft', operatorNote: base, sourceBasis: ['Generated capabilities'], failureReason: null },
+    staffingAndOwnership: { status: 'draft', operatorNote: base, sourceBasis: ['Generated ownership/governance'], failureReason: null },
+    systemsAndTools: { status: 'draft', operatorNote: base, sourceBasis: ['Generated systems/tools'], failureReason: null },
+    governanceCadence: { status: 'draft', operatorNote: base, sourceBasis: ['Generated governance cadence'], failureReason: null },
+    decisionRights: { status: 'draft', operatorNote: base, sourceBasis: ['Generated decisions required'], failureReason: null },
+    riskConstraintUnknownRegister: { status: 'draft', operatorNote: base, sourceBasis: ['Generated risks, constraints, unknowns'], failureReason: null },
+    sourceBasis: { status: 'draft', operatorNote: 'Collapsed by default to keep the cockpit usable.', sourceBasis: ['Stage 2 handoff', 'Stage 3 generation state'], failureReason: null },
+  }
+}
+
+function toExecutiveCockpitPlan(plan) {
+  if (plan?.planFormat === 'executive_stage3_fixture_v1') return plan
+  const sections = plan?.executionSections || []
+  const firstMeaningful = (...values) => values.flat().filter(Boolean)[0] || ''
+  const asList = value => listFromValue(value).filter(Boolean)
+  const workstreams = sections.length
+    ? sections.map((section, idx) => ({
+      name: section.sectionName || `Execution workstream ${idx + 1}`,
+      objective: section.objective || 'Review generated section objective.',
+      accountableOwner: firstMeaningful(section.ownershipGovernance, plan.staffingOwnership, plan.buName),
+      dependentFunctions: asList(section.dependencies),
+      decisionNeeded: firstMeaningful(section.decisionsRequired, section.sequencingAndGates, 'Review required decision.'),
+      riskConstraintUnknown: firstMeaningful(section.risks, section.constraints, section.unknowns, 'Review generated risk, constraint, or unknown.'),
+      nextAction: firstMeaningful(section.executionStrategy, section.validationReadinessChecks, 'Review generated execution strategy.'),
+      sourceBasis: section.sourceHandoffItem || section.atomId || 'Generated Stage 3 execution atom.',
+      reviewStatus: 'draft',
+    }))
+    : asList(plan?.criticalWorkstreams).map((name, idx) => ({
+      name,
+      objective: asList(plan?.priorityOutcomes)[idx] || 'Review generated workstream objective.',
+      accountableOwner: firstMeaningful(plan?.staffingOwnership, plan?.buName),
+      dependentFunctions: asList(plan?.crossFunctionalDependencies),
+      decisionNeeded: firstMeaningful(plan?.decisionRights, 'Review required decision.'),
+      riskConstraintUnknown: firstMeaningful(plan?.risks, plan?.constraints, plan?.unresolvedUnknowns),
+      nextAction: firstMeaningful(plan?.initiativesMissionCritical, plan?.initiativesOptional),
+      sourceBasis: 'Generated Stage 3 plan fields.',
+      reviewStatus: 'draft',
+    }))
+
+  const dependencies = asList(plan?.crossFunctionalDependencies).map((dependency, idx) => ({
+    name: `Dependency ${idx + 1}`,
+    sourceFunction: plan?.buName || 'Executive Leadership & Strategic Governance',
+    receivingFunction: dependency,
+    whyItMatters: dependency,
+    blocking: idx < 2,
+    requiredCoordination: dependency,
+    openQuestion: asList(plan?.unresolvedUnknowns)[idx] || '',
+  }))
+
+  return {
+    planFormat: 'executive_stage3_cockpit_v1',
+    buName: plan?.buName || 'Executive Leadership & Strategic Governance',
+    planStatus: plan?.planStatus || 'partial',
+    generationMode: plan?.generationMode || 'ai',
+    sourceHandoffStatus: plan?.sourceHandoffStatus,
+    executionRisk: plan?.executionRisk,
+    dependencyComplexity: plan?.dependencyComplexity,
+    confidenceLevel: plan?.confidenceLevel,
+    organizationalReadiness: plan?.organizationalReadiness,
+    readiness: {
+      status: plan?.planStatus === 'complete' ? 'ready_for_review' : 'needs_review',
+      rationale: plan?.readinessAssessment || 'Generated Stage 3 plan requires operator review.',
+      ready: asList(plan?.priorityOutcomes).slice(0, 4),
+      needsReview: asList(plan?.handoffWarnings).concat(asList(plan?.missingSections)).slice(0, 5),
+      blocked: asList(plan?.failedSections).map(item => valueToSearchText(item)).slice(0, 4),
+    },
+    decisionOwnership: {
+      primaryOwner: plan?.buName || 'Executive Leadership & Strategic Governance',
+      accountableDecisions: asList(plan?.decisionRights),
+      escalationTriggers: asList(plan?.risks).slice(0, 4),
+      delegatedAuthorities: asList(plan?.staffingOwnership).slice(0, 5),
+    },
+    executionWorkstreams: workstreams,
+    crossFunctionalDependencies: dependencies,
+    requiredCapabilities: asList(plan?.requiredCapabilities),
+    staffingAndOwnership: asList(plan?.staffingOwnership),
+    systemsAndTools: asList(plan?.systemsTools),
+    governanceCadence: asList(plan?.governanceCadence),
+    decisionRights: asList(plan?.decisionRights),
+    risks: asList(plan?.risks),
+    constraints: asList(plan?.constraints),
+    unknowns: asList(plan?.unresolvedUnknowns || plan?.unknowns),
+    sourceBasis: {
+      source: 'generated_stage3_plan',
+      sourceHandoffStatus: plan?.sourceHandoffStatus || '',
+      generationMode: plan?.generationMode || '',
+      sourceHandoffWarnings: plan?.handoffWarnings || [],
+      executionAtomCount: sections.length,
+      rationale: 'Structured cockpit view adapted from persisted Stage 3 plan state.',
+    },
+    sectionReviewStates: buildExecutiveSectionReviewStates(plan?.generationMode || 'ai'),
   }
 }
 
@@ -616,6 +988,187 @@ function PlanSection({ label, children, marginBottom = 12 }) {
 }
 
 // ── Assumption badge ──────────────────────────────────────────────────────────
+
+function ReviewMeta({ state }) {
+  if (!state) return null
+  const palette = { draft: '#fb923c', accepted: '#00e5b4', needs_refinement: '#f87171', failed: '#f87171' }
+  const color = palette[state.status] || 'var(--muted)'
+  return (
+    <div style={{ display: 'flex', gap: 7, alignItems: 'flex-start', flexWrap: 'wrap', marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+      <Badge color={color} small>{state.status || 'draft'}</Badge>
+      {state.operatorNote && (
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45, flex: '1 1 240px' }}>
+          {state.operatorNote}
+        </span>
+      )}
+      {state.failureReason && (
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.45 }}>{state.failureReason}</span>
+      )}
+    </div>
+  )
+}
+
+function CockpitCard({ title, children, reviewState: state, accent = 'var(--accent)' }) {
+  return (
+    <div style={{ border: '1px solid var(--border)', borderRadius: 6, background: 'var(--s2)', padding: '10px 11px', boxShadow: `inset 3px 0 0 ${accent}` }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text)', marginBottom: 7 }}>{title}</div>
+      {children}
+      <ReviewMeta state={state} />
+    </div>
+  )
+}
+
+function ExecutiveWorkstreamCard({ workstream }) {
+  const review = {
+    status: workstream.reviewStatus || 'draft',
+    operatorNote: workstream.sourceBasis,
+    sourceBasis: workstream.sourceBasis ? [workstream.sourceBasis] : [],
+    failureReason: null,
+  }
+  return (
+    <CockpitCard title={workstream.name} accent="#3b82f6" reviewState={review}>
+      <Field label="objective" value={workstream.objective} />
+      <Field label="accountable owner / function" value={workstream.accountableOwner || workstream.owner} />
+      <Field label="dependent functions" value={workstream.dependentFunctions} />
+      <Field label="decision needed" value={workstream.decisionNeeded || workstream.decisionGate} />
+      <Field label="risk / constraint / unknown" value={workstream.riskConstraintUnknown} />
+      <Field label="next action" value={workstream.nextAction} />
+      <Field label="source basis / rationale" value={workstream.sourceBasis} />
+    </CockpitCard>
+  )
+}
+
+function ExecutiveDependencyCard({ dependency }) {
+  return (
+    <CockpitCard title={dependency.name || dependency.to || dependency.dependency} accent="#8b5cf6">
+      <Field label="source function / team" value={dependency.sourceFunction || dependency.from} />
+      <Field label="receiving function / team" value={dependency.receivingFunction || dependency.to} />
+      <Field label="why it matters" value={dependency.whyItMatters || dependency.executiveUse || dependency.dependency} />
+      <Field label="blocking" value={dependency.blocking ? 'Blocking' : 'Non-blocking'} />
+      <Field label="required coordination" value={dependency.requiredCoordination} />
+      <Field label="open question" value={dependency.openQuestion} />
+    </CockpitCard>
+  )
+}
+
+function SourceBasisDetails({ sourceBasis, reviewState: state }) {
+  if (!sourceBasis) return null
+  const entries = Object.entries(sourceBasis).filter(([, value]) => {
+    if (Array.isArray(value)) return value.length > 0
+    return value !== null && value !== undefined && value !== ''
+  })
+  return (
+    <details style={{ border: '1px solid var(--border)', borderRadius: 6, background: 'var(--s2)', padding: '9px 11px', marginBottom: 12 }}>
+      <summary style={{ cursor: 'pointer', fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
+        Source Basis
+      </summary>
+      <div style={{ marginTop: 10 }}>
+        {entries.map(([key, value]) => (
+          <Field key={key} label={key} value={Array.isArray(value) ? value : valueToSearchText(value)} />
+        ))}
+        <ReviewMeta state={state} />
+      </div>
+    </details>
+  )
+}
+
+function ExecutivePlanCockpit({ plan, index }) {
+  const cockpitPlan = toExecutiveCockpitPlan(plan)
+  const reviews = cockpitPlan.sectionReviewStates || {}
+  const isFixture = cockpitPlan.generationMode === 'fixture'
+  return (
+    <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 'var(--r)', marginBottom: 8, overflow: 'hidden' }}>
+      <div style={{ padding: '12px 14px', display: 'flex', gap: 10, alignItems: 'flex-start', borderBottom: '1px solid var(--border)' }}>
+        <span style={{ flexShrink: 0, width: 22, height: 22, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 700, background: 'rgba(59,130,246,.14)', border: '1px solid rgba(59,130,246,.35)', color: '#3b82f6' }}>
+          {index + 1}
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 5 }}>{cockpitPlan.buName}</div>
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+            {isFixture && <Badge color="#3b82f6" small>dev fixture</Badge>}
+            <Badge color={cockpitPlan.planStatus === 'complete' ? '#00e5b4' : '#fb923c'} small>{cockpitPlan.planStatus}</Badge>
+            <Badge color="#fb923c" small>{cockpitPlan.readiness?.status || 'draft'}</Badge>
+          </div>
+        </div>
+      </div>
+
+      {isFixture && (
+        <div style={{ padding: '8px 14px', borderBottom: '1px solid var(--border)', background: 'rgba(59,130,246,.06)', fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+          Live generation disabled in dev fixture mode.
+        </div>
+      )}
+
+      <div style={{ padding: 14 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+          <CockpitCard title="Readiness" reviewState={reviews.readiness} accent="#00e5b4">
+            <Field label="status" value={cockpitPlan.readiness?.status} />
+            <Field label="rationale" value={cockpitPlan.readiness?.rationale} />
+            <PlanSection label="Ready" marginBottom={8}>
+              <BulletList items={cockpitPlan.readiness?.ready} borderColor="rgba(0,229,180,.4)" />
+            </PlanSection>
+            <PlanSection label="Needs Review" marginBottom={8}>
+              <BulletList items={cockpitPlan.readiness?.needsReview} borderColor="rgba(251,146,60,.4)" />
+            </PlanSection>
+            <PlanSection label="Blocked" marginBottom={0}>
+              <BulletList items={cockpitPlan.readiness?.blocked} borderColor="rgba(248,113,113,.4)" />
+            </PlanSection>
+          </CockpitCard>
+          <CockpitCard title="Decision Ownership" reviewState={reviews.decisionOwnership} accent="#fb923c">
+            <Field label="primary owner" value={cockpitPlan.decisionOwnership?.primaryOwner} />
+            <PlanSection label="Accountable Decisions" marginBottom={8}>
+              <BulletList items={cockpitPlan.decisionOwnership?.accountableDecisions} borderColor="rgba(251,146,60,.4)" />
+            </PlanSection>
+            <PlanSection label="Escalation Triggers" marginBottom={0}>
+              <BulletList items={cockpitPlan.decisionOwnership?.escalationTriggers} borderColor="rgba(248,113,113,.4)" />
+            </PlanSection>
+          </CockpitCard>
+        </div>
+
+        <PlanSection label="Execution Workstreams">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
+            {(cockpitPlan.executionWorkstreams || []).map((workstream, i) => (
+              <ExecutiveWorkstreamCard key={workstream.name || i} workstream={workstream} />
+            ))}
+          </div>
+          <ReviewMeta state={reviews.executionWorkstreams} />
+        </PlanSection>
+
+        <PlanSection label="Cross-functional Dependencies">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
+            {(cockpitPlan.crossFunctionalDependencies || []).map((dependency, i) => (
+              <ExecutiveDependencyCard key={`${dependency.to || dependency.dependency}-${i}`} dependency={dependency} />
+            ))}
+          </div>
+          <ReviewMeta state={reviews.crossFunctionalDependencies} />
+        </PlanSection>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+          <CockpitCard title="Required Capabilities" reviewState={reviews.requiredCapabilities} accent="#3b82f6"><BulletList items={cockpitPlan.requiredCapabilities} borderColor="rgba(59,130,246,.4)" /></CockpitCard>
+          <CockpitCard title="Staffing & Ownership" reviewState={reviews.staffingAndOwnership} accent="#fb923c"><BulletList items={cockpitPlan.staffingAndOwnership} borderColor="rgba(251,146,60,.4)" /></CockpitCard>
+          <CockpitCard title="Systems & Tools" reviewState={reviews.systemsAndTools} accent="#94a3b8"><BulletList items={cockpitPlan.systemsAndTools} borderColor="rgba(148,163,184,.4)" /></CockpitCard>
+          <CockpitCard title="Governance Cadence" reviewState={reviews.governanceCadence} accent="#00e5b4"><BulletList items={cockpitPlan.governanceCadence} borderColor="rgba(0,229,180,.4)" /></CockpitCard>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <CockpitCard title="Decision Rights" reviewState={reviews.decisionRights} accent="#fb923c">
+            <BulletList items={cockpitPlan.decisionRights} borderColor="rgba(251,146,60,.4)" />
+          </CockpitCard>
+        </div>
+
+        <PlanSection label="Risks, Constraints, Unknowns">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+            <CockpitCard title="Risks" accent="#f87171"><BulletList items={cockpitPlan.risks} borderColor="rgba(248,113,113,.45)" /></CockpitCard>
+            <CockpitCard title="Constraints" accent="#fb923c"><BulletList items={cockpitPlan.constraints} borderColor="rgba(251,146,60,.45)" /></CockpitCard>
+            <CockpitCard title="Unknowns" accent="#94a3b8"><BulletList items={cockpitPlan.unknowns} borderColor="rgba(148,163,184,.45)" /></CockpitCard>
+          </div>
+          <ReviewMeta state={reviews.riskConstraintUnknownRegister} />
+        </PlanSection>
+
+        <SourceBasisDetails sourceBasis={cockpitPlan.sourceBasis} reviewState={reviews.sourceBasis} />
+      </div>
+    </div>
+  )
+}
 
 function Field({ label, value }) {
   if (value === null || value === undefined || value === '') return null
@@ -989,19 +1542,24 @@ function Stage3ReadinessMatrix({
               const readiness = row.readiness
               const draft = planDrafts[unit.name]
               const gen = planGeneration[unit.name]
+              const isExecutiveFixtureMode = isExecutiveTraceUnit(unit)
               const hasPlan = !!draft?.plan
               const noHandoff = readiness.completion === 'none'
               const optIn = !!draftOptIns[unit.name]
-              const canGenerate = !disabled && !gen?.running && (!noHandoff || optIn)
-              const cta = hasPlan
-                ? 'Regenerate BU plan'
-                : readiness.completion === 'full'
-                  ? 'Generate full exec plan'
-                  : readiness.completion === 'partial' || readiness.completion === 'limited'
-                    ? 'Generate limited draft'
-                    : optIn
-                      ? 'Generate from Stage 1/2 only'
-                      : 'Pending handoff'
+              const canGenerate = !disabled && !gen?.running && (isExecutiveFixtureMode || !noHandoff || optIn)
+              const cta = isExecutiveFixtureMode
+                ? (USE_STAGE3_EXECUTIVE_FIXTURE
+                  ? (hasPlan ? 'Preview dev fixture plan' : 'Load dev fixture plan')
+                  : (hasPlan ? 'Regenerate Executive Leadership Plan' : 'Generate Executive Leadership Plan'))
+                : hasPlan
+                  ? 'Regenerate BU plan'
+                  : readiness.completion === 'full'
+                    ? 'Generate full exec plan'
+                    : readiness.completion === 'partial' || readiness.completion === 'limited'
+                      ? 'Generate limited draft'
+                      : optIn
+                        ? 'Generate from Stage 1/2 only'
+                        : 'Pending handoff'
 
               return (
                 <tr key={unit.name || idx} style={{ borderTop: '1px solid var(--border)' }}>
@@ -1013,6 +1571,7 @@ function Stage3ReadinessMatrix({
                       <Badge color={readiness.completion === 'full' ? '#00e5b4' : readiness.completion === 'none' ? 'var(--muted)' : '#fb923c'} small>
                         {readiness.completion === 'full' ? 'complete handoff' : readiness.completion === 'none' ? 'no handoff' : 'partial handoff'}
                       </Badge>
+                      {isExecutiveFixtureMode && USE_STAGE3_EXECUTIVE_FIXTURE && <Badge color="#3b82f6" small>dev fixture</Badge>}
                       {hasPlan && (
                         <Badge color={draft.planGenerationMode === 'full' ? '#00e5b4' : '#fb923c'} small>
                           {draft.planGenerationMode === 'full' ? 'full plan saved' : 'draft plan saved'}
@@ -1048,7 +1607,7 @@ function Stage3ReadinessMatrix({
                         width: '100%',
                       }}
                     >
-                      {gen?.running ? 'Generating...' : cta}
+                      {gen?.running ? (isExecutiveFixtureMode ? 'Loading fixture...' : 'Generating...') : cta}
                     </button>
                     {noHandoff && !optIn && (
                       <button
@@ -1152,6 +1711,43 @@ function HandoffItemRow({ item, unitName, onStage2Action }) {
   )
 }
 
+function Stage3HandoffBriefCard({ brief, unitName, onStage2Action }) {
+  if (!brief) return null
+  return (
+    <div style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '10px 11px', background: 'var(--s2)', marginBottom: 12 }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 8 }}>
+        <div style={{ flex: 1 }}>
+          <SectionLabel>Stage 2 to Stage 3 Handoff Brief</SectionLabel>
+          <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+            Compact planning input. Full Stage 2 handoff detail remains in Stage 2.
+          </div>
+        </div>
+        <Badge color={brief.readinessStatus === 'complete' ? '#00e5b4' : '#fb923c'} small>
+          {brief.readinessStatus || 'brief'}
+        </Badge>
+      </div>
+      <Field label="planning purpose" value={brief.planningPurpose} />
+      <Field label="decision basis" value={brief.decisionBasisSummary} />
+      <Field label="key implications" value={brief.keyImplications} />
+      <Field label="execution constraints" value={brief.executionConstraints} />
+      <Field label="dependencies" value={brief.dependencies} />
+      <Field label="risks / contradictions" value={brief.risksOrContradictions} />
+      <Field label="unresolved questions" value={brief.unresolvedQuestions} />
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+        <Badge color="#3b82f6" small>{brief.metadata?.briefSizeBytes || 0}b brief</Badge>
+        <Badge color="var(--muted)" small>{brief.metadata?.fullDraftSizeBytes || 0}b source</Badge>
+        <Badge color="#00e5b4" small>{(brief.sourceStage2SectionIds || []).length} source refs</Badge>
+      </div>
+      <button
+        onClick={() => onStage2Action(unitName, null, 'review')}
+        style={{ ...secondaryButtonStyle, marginTop: 9 }}
+      >
+        View source detail in Stage 2
+      </button>
+    </div>
+  )
+}
+
 function Stage3ReadinessPanels({
   rows,
   planDrafts,
@@ -1207,12 +1803,18 @@ function Stage3ReadinessPanels({
         const readiness = row.readiness
         const draft = planDrafts[unit.name]
         const gen = planGeneration[unit.name]
+        const isExecutiveFixtureMode = isExecutiveTraceUnit(unit)
         const isOpen = open[unit.name] ?? idx === 0
         const hasPlan = !!draft?.plan
+        const hasRetryableAtoms = isExecutiveTraceUnit(unit) && (draft?.executionAtoms || []).some(atom => (
+          STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status) && atom?.status !== ATOM_STATUSES.COMPLETE
+        ))
         const executionStatus = gen?.error
           ? 'failed'
           : hasPlan
-            ? (draft.planGenerationMode === 'full' ? 'generated' : 'draft')
+            ? (draft.plan?.planStatus === 'complete'
+              ? (draft.planGenerationMode === 'full' ? 'generated' : 'draft')
+              : draft.plan?.planStatus || 'partial')
             : 'not started'
         const handoffStatus = readiness.completion === 'none'
           ? 'missing'
@@ -1222,6 +1824,14 @@ function Stage3ReadinessPanels({
               ? 'ready'
               : 'partial'
         const mode = modeFor(readiness, !!draftOptIns[unit.name])
+        const ctaLabel = isExecutiveFixtureMode
+          ? (USE_STAGE3_EXECUTIVE_FIXTURE
+            ? (hasPlan ? 'Preview dev fixture plan' : 'Load dev fixture plan')
+            : (hasPlan ? 'Regenerate Executive Leadership Plan' : 'Generate Executive Leadership Plan'))
+          : hasRetryableAtoms
+            ? 'Retry failed sections'
+            : mode.cta
+        const actionEnabled = isExecutiveFixtureMode || mode.enabled
         const handoffItems = readiness.structureItems.map(item => {
           const match = readiness.itemStates.find(state => state.key === item.key || state.key === String(readiness.structureItems.indexOf(item)))
           return { ...item, ...(match || {}) }
@@ -1308,9 +1918,18 @@ function Stage3ReadinessPanels({
                     <SectionLabel>Generate</SectionLabel>
                     <div style={{ marginBottom: 8 }}>
                       <Badge color={mode.color}>{mode.label}</Badge>
+                      {isExecutiveFixtureMode && USE_STAGE3_EXECUTIVE_FIXTURE && (
+                        <span style={{ marginLeft: 6 }}>
+                          <Badge color="#3b82f6">dev fixture</Badge>
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55, marginBottom: 9 }}>
-                      {readiness.completion === 'full'
+                      {isExecutiveFixtureMode && USE_STAGE3_EXECUTIVE_FIXTURE
+                        ? 'Live generation disabled in dev fixture mode.'
+                        : isExecutiveFixtureMode
+                          ? 'Uses the real Stage 2 Executive handoff context to generate a structured execution cockpit.'
+                        : readiness.completion === 'full'
                         ? 'Complete handoff exists; full BU execution plan generation is available.'
                         : readiness.completion === 'none'
                           ? 'No handoff exists. Use Stage 2 to build the handoff, or explicitly opt into a Stage 1/2-only draft.'
@@ -1326,17 +1945,17 @@ function Stage3ReadinessPanels({
                       </button>
                     )}
                     <button
-                      onClick={() => mode.enabled ? onGenerateBUPlan(unit, readiness) : onStage2Action(unit.name, null, 'review')}
-                      disabled={disabled || gen?.running || (readiness.completion === 'none' && !draftOptIns[unit.name] && mode.label !== 'Pending')}
+                      onClick={() => actionEnabled ? onGenerateBUPlan(unit, readiness) : onStage2Action(unit.name, null, 'review')}
+                      disabled={disabled || gen?.running || (!isExecutiveFixtureMode && readiness.completion === 'none' && !draftOptIns[unit.name] && mode.label !== 'Pending')}
                       style={{
                         ...primaryButtonStyle,
                         marginTop: 6,
-                        background: mode.enabled ? 'var(--accent)' : 'var(--s2)',
-                        borderColor: mode.enabled ? 'var(--accent)' : 'var(--border)',
-                        color: mode.enabled ? '#000' : 'var(--muted)',
+                        background: actionEnabled ? 'var(--accent)' : 'var(--s2)',
+                        borderColor: actionEnabled ? 'var(--accent)' : 'var(--border)',
+                        color: actionEnabled ? '#000' : 'var(--muted)',
                       }}
                     >
-                      {gen?.running ? 'Generating...' : mode.cta}
+                      {gen?.running ? (isExecutiveFixtureMode ? 'Loading fixture...' : 'Generating...') : ctaLabel}
                     </button>
                     {gen?.error && (
                       <div style={{ marginTop: 7, fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.45 }}>
@@ -1351,7 +1970,13 @@ function Stage3ReadinessPanels({
                   </div>
                 </div>
 
-                <SectionLabel>Assembled Handoff Items</SectionLabel>
+                <Stage3HandoffBriefCard
+                  brief={readiness.handoffBrief || readiness.planningContext?.handoffBrief}
+                  unitName={unit.name}
+                  onStage2Action={onStage2Action}
+                />
+
+                <SectionLabel>Source References</SectionLabel>
                 {handoffItems.length > 0 ? (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                     {handoffItems.map((item, itemIdx) => (
@@ -1513,6 +2138,10 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
 
   const canRefine  = apiMode === 'ai' && refinePrompt.trim().length > 0 && !isRefining && !globalBusy
   const aiDisabled = apiMode !== 'ai'
+
+  if (isExecutiveTraceUnit(plan)) {
+    return <ExecutivePlanCockpit plan={plan} index={index} />
+  }
 
   async function handleRefine() {
     if (!canRefine) return
@@ -2431,6 +3060,7 @@ export default function Stage3View({
     }
     const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name)
     writeJsonStorage(key, draft)
+    logExecutiveBoundary(unit, 'H. persistedStage3State', draft)
     setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
   }
 
@@ -2439,6 +3069,26 @@ export default function Stage3View({
     const s1Snap = activeStage1Rev.contentSnapshot
     const enrichedUnit = { ...unit, stage3PlanningContext: readiness.planningContext }
     const otherNames = orderedStage2BUs.filter(u => u.name !== unit.name).map(u => u.name).join(', ')
+    const stage2HandoffInput = readJsonStorage(stage2HandoffDraftKey(effectiveWorkspaceId, unit.name))
+    const handoffBrief = readiness.planningContext?.handoffBrief || readiness.handoffBrief || null
+    console.info('[Stage3 Handoff Brief]', {
+      businessUnitName: unit.name,
+      briefSizeBytes: handoffBrief?.metadata?.briefSizeBytes || byteSize(handoffBrief),
+      sourceDetailExcludedFromStage3Generation: handoffBrief?.metadata?.sourceDetailExcludedFromStage3Generation !== false,
+      sourceStage2SectionIds: handoffBrief?.sourceStage2SectionIds || [],
+    })
+    logExecutiveBoundary(unit, 'A. selectedBusinessUnit', {
+      id: unit.id || unit.name,
+      name: unit.name,
+      readinessState: readiness,
+      handoff: {
+        id: stage2HandoffInput?.id || stage2HandoffInput?.businessUnitName || null,
+        version: stage2HandoffInput?.version || null,
+        hash: stage3TraceHash(stage2HandoffInput),
+      },
+    })
+    logExecutiveBoundary(unit, 'B. stage2HandoffInput', stage2HandoffInput)
+    logExecutiveBoundary(unit, 'C. normalizedStage3Input', enrichedUnit)
     const modeLabel = readiness.completion === 'full'
       ? 'full'
       : readiness.completion === 'none'
@@ -2454,8 +3104,28 @@ export default function Stage3View({
         : readiness.completion === 'none'
           ? 'stage1_2_only'
           : 'limited'
+      const isExecutiveGeneration = isExecutiveTraceUnit(unit)
       const priorDraft = stage3DraftPlans[unit.name] || null
       let atoms = buildExecutionAtomsForBU(unit, readiness, priorDraft, mode)
+      logExecutiveBoundary(unit, 'C2. executionAtoms', atoms)
+
+      if (isExecutiveGeneration && USE_STAGE3_EXECUTIVE_FIXTURE) {
+        const fixturePlan = buildExecutiveLeadershipFixturePlan(unit, readiness)
+        const fixtureAtoms = atoms.map(atom => ({
+          ...atom,
+          status: ATOM_STATUSES.COMPLETE,
+          parsedValue: {
+            sectionName: atom.elementName,
+            objective: 'Fixture-backed Executive Leadership vertical slice. Live AI generation is intentionally disabled for this slice until the structured UI is reviewable.',
+          },
+          completedAt: new Date().toISOString(),
+          metadata: { ...(atom.metadata || {}), fixture: true },
+        }))
+        logExecutiveBoundary(unit, 'Fixture. structuredExecutivePlan', fixturePlan)
+        persistBuPlanDraft(unit, fixturePlan, readiness, 'fixture', fixtureAtoms)
+        setBuPlanGeneration(prev => ({ ...prev, [unit.name]: { running: false, error: null, atomSummary: summarizeAtoms(fixtureAtoms) } }))
+        return { error: null }
+      }
 
       if (!hasApiKey()) {
         atoms = atoms.map(atom => ({
@@ -2488,8 +3158,9 @@ export default function Stage3View({
       const updatedAtoms = await runGenerationQueue({
         atoms,
         concurrency: 1,
-        delayMs: STAGE3_QUEUE_DELAY_MS,
+        delayMs: isExecutiveGeneration ? EXECUTIVE_STAGE3_QUEUE_DELAY_MS : STAGE3_QUEUE_DELAY_MS,
         retryFailedOnly: true,
+        retry: isExecutiveGeneration ? EXECUTIVE_STAGE3_RETRY : null,
         onAtomUpdate: (atom, allAtoms) => {
           const plan = assembleAtomizedBUPlan(unit, readiness, allAtoms, mode)
           persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms)
@@ -2507,7 +3178,9 @@ export default function Stage3View({
             mode,
             otherNames,
           )
+          logExecutiveBoundary(unit, `D. stage3PromptPayload / ${atom.childKey}`, messages)
           const response = await callAI(messages, { temperature: 0.3, maxTokens: 1300 })
+          logExecutiveBoundary(unit, `E. rawModelResponse / ${atom.childKey}`, response.result || response.error)
           if (response.error) {
             const message = isRateLimitedAIResponse(response)
               ? `Rate limited while generating ${unit.name} / ${atom.elementName}. Retry this atom after cooldown.`
@@ -2515,8 +3188,25 @@ export default function Stage3View({
             throw { message, rawResponseText: response.result || null, status: response.status, rateLimited: response.rateLimited }
           }
           const parsed = parseStage3ExecutionAtomResponse(response.result)
+          logExecutiveBoundary(unit, `F. parsedStage3Result / ${atom.childKey}`, parsed)
           if (parsed.error || !parsed.section) {
             throw { message: parsed.error || 'Execution atom parse failed.', rawResponseText: response.result || null }
+          }
+          const validation = isExecutiveGeneration
+            ? validateExecutiveStage3Atom(parsed.section)
+            : { pass: true, reason: null }
+          logExecutiveBoundary(unit, `G. atomValidationResults / ${atom.childKey}`, {
+            atomKey: atom.childKey,
+            parsedValue: parsed.section,
+            validationPass: validation.pass,
+            failureReason: validation.reason,
+          })
+          if (!validation.pass) {
+            throw {
+              message: `Execution atom validation failed: ${validation.reason}`,
+              rawResponseText: response.result || null,
+              failureLabel: 'validation_failed',
+            }
           }
           return { rawResponseText: response.result, parsedValue: parsed.section }
         },
