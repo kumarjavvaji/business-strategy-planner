@@ -79,6 +79,11 @@ function stage3BuPlanDraftKey(workspaceId, stage1Id, stage2Id, buName) {
   return `bsp_v1_stage3_bu_plan_${workspaceId}_${stage1Id}_${stage2Id}_${storageSafeName(buName)}`
 }
 
+function stage3CoordinationDraftKey(workspaceId, stage1Id, stage2Id) {
+  if (!workspaceId || !stage1Id || !stage2Id) return null
+  return `bsp_v1_stage3_coordination_${workspaceId}_${stage1Id}_${stage2Id}`
+}
+
 function readJsonStorage(key) {
   if (!key || typeof localStorage === 'undefined') return null
   try {
@@ -486,6 +491,21 @@ function assembleAtomizedBUPlan(unit, readiness, atoms, mode) {
     confidenceLevel: planStatus === 'complete' && mode === 'full' ? 'medium' : 'low',
     organizationalReadiness: planStatus === 'complete' ? 'medium' : 'low',
   }
+}
+
+function buildCoordinationReadiness(rows, planDrafts) {
+  const plans = rows.map(row => planDrafts[row.unit.name]?.plan).filter(Boolean)
+  const completePlans = plans.filter(plan => plan.planStatus === 'complete' || plan.planStatus === 'full')
+  if (plans.length === 0) {
+    return { status: 'pending', label: 'Coordination pending until BU plans exist.', canSynthesize: false, provisional: false, plans, completePlans }
+  }
+  if (plans.length === 1) {
+    return { status: 'not_ready', label: 'Coordination not ready; generate at least one more BU plan.', canSynthesize: false, provisional: false, plans, completePlans }
+  }
+  if (completePlans.length < rows.length) {
+    return { status: 'provisional', label: 'Multiple BU plans exist; provisional coordination synthesis is available.', canSynthesize: true, provisional: true, plans, completePlans }
+  }
+  return { status: 'full', label: 'All required BU plans are complete; full coordination synthesis is available.', canSynthesize: true, provisional: false, plans, completePlans }
 }
 
 // ── Scope selector (reuses Stage2View's REFINEMENT_SCOPES list) ──────────────
@@ -1357,6 +1377,80 @@ function Stage3ReadinessPanels({
   )
 }
 
+function CoordinationReadinessPanel({
+  readiness,
+  coordinationDraft,
+  isGenerating,
+  error,
+  onGenerate,
+}) {
+  const color = readiness.status === 'full'
+    ? '#00e5b4'
+    : readiness.status === 'provisional'
+      ? '#fb923c'
+      : 'var(--muted)'
+  return (
+    <div style={{
+      background: 'var(--surface)',
+      border: `1px solid ${readiness.status === 'full' ? 'rgba(0,229,180,.25)' : readiness.status === 'provisional' ? 'rgba(251,146,60,.28)' : 'var(--border)'}`,
+      borderRadius: 'var(--r)',
+      padding: '13px 14px',
+      marginBottom: 12,
+    }}>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>Coordination Readiness</div>
+          <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55 }}>
+            {readiness.label}
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+            <Badge color={color} small>{readiness.status.replace('_', ' ')}</Badge>
+            <Badge color="#3b82f6" small>{readiness.plans.length} generated BU plan{readiness.plans.length === 1 ? '' : 's'}</Badge>
+            {coordinationDraft?.mode && (
+              <Badge color={coordinationDraft.mode === 'full' ? '#00e5b4' : '#fb923c'} small>
+                {coordinationDraft.mode} coordination saved
+              </Badge>
+            )}
+          </div>
+        </div>
+        {readiness.canSynthesize && (
+          <button
+            onClick={() => onGenerate(readiness.provisional)}
+            disabled={isGenerating}
+            style={{
+              fontSize: 9,
+              fontFamily: 'var(--fm)',
+              fontWeight: 700,
+              padding: '6px 12px',
+              borderRadius: 5,
+              cursor: isGenerating ? 'not-allowed' : 'pointer',
+              background: readiness.provisional ? 'rgba(251,146,60,.15)' : 'var(--accent)',
+              border: `1px solid ${readiness.provisional ? 'rgba(251,146,60,.4)' : 'var(--accent)'}`,
+              color: readiness.provisional ? '#fb923c' : '#000',
+            }}
+          >
+            {isGenerating
+              ? 'Synthesizing...'
+              : readiness.provisional
+                ? 'Generate provisional coordination synthesis'
+                : 'Generate full coordination synthesis'}
+          </button>
+        )}
+      </div>
+      {error && (
+        <div style={{ marginTop: 8, fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.5 }}>
+          {error}
+        </div>
+      )}
+      {coordinationDraft?.coordinationLayer && (
+        <div style={{ marginTop: 12 }}>
+          <CoordinationLayer layer={coordinationDraft.coordinationLayer} />
+        </div>
+      )}
+    </div>
+  )
+}
+
 const primaryButtonStyle = {
   width: '100%',
   fontSize: 9,
@@ -1909,6 +2003,8 @@ export default function Stage3View({
   const [stage3DraftPlans, setStage3DraftPlans] = useState({})
   const [buPlanGeneration, setBuPlanGeneration] = useState({})
   const [stage12DraftOptIns, setStage12DraftOptIns] = useState({})
+  const [coordinationDraft, setCoordinationDraft] = useState(null)
+  const [coordinationGen, setCoordinationGen] = useState({ running: false, error: null })
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev      = stage3Revisions.find(r => r.id === stage3ActiveId) ?? null
@@ -1949,10 +2045,12 @@ export default function Stage3View({
     const draft = readJsonStorage(stage2HandoffDraftKey(effectiveWorkspaceId, unit.name))
     return { unit, draft, readiness: summarizeHandoffReadiness(unit, draft) }
   })
+  const coordinationReadiness = buildCoordinationReadiness(readinessRows, stage3DraftPlans)
 
   useEffect(() => {
     if (!effectiveWorkspaceId || !stage1ActiveId || !stage2ActiveId || !stage2BUs.length) {
       setStage3DraftPlans({})
+      setCoordinationDraft(null)
       return
     }
     const hydrated = {}
@@ -1964,6 +2062,8 @@ export default function Stage3View({
       }
     }
     setStage3DraftPlans(hydrated)
+    const coordination = readJsonStorage(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId))
+    setCoordinationDraft(coordination?.version === 1 ? coordination : null)
   }, [effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, activeStage2Rev?.id])
 
   function handleStage2HandoffAction(buName, itemKey, action) {
@@ -2433,6 +2533,69 @@ export default function Stage3View({
     }
   }
 
+  async function handleGenerateCoordination(provisional) {
+    if (!activeStage1Rev) return { error: 'No active Stage 1 revision.' }
+    if (!coordinationReadiness.canSynthesize) return { error: 'Not enough BU execution plans for coordination synthesis.' }
+    setCoordinationGen({ running: true, error: null })
+    const mode = provisional ? 'provisional' : 'full'
+
+    try {
+      let coordinationLayer
+      let summaryNote
+      if (!hasApiKey()) {
+        coordinationLayer = {
+          executionSummary: `${mode === 'provisional' ? 'Provisional' : 'Full'} coordination synthesis from ${coordinationReadiness.plans.length} generated BU plan drafts.`,
+          sequencingOverview: 'Mock coordination uses generated BU plan draft coverage and should be reviewed before use.',
+          dependencyCoordinationMap: coordinationReadiness.plans.flatMap(plan => plan.crossFunctionalDependencies || []).slice(0, 8),
+          governanceModel: coordinationReadiness.plans.flatMap(plan => plan.governanceCadence || plan.decisionRights || []).slice(0, 6),
+          organizationalBottlenecks: coordinationReadiness.plans.flatMap(plan => plan.constraints || []).slice(0, 6),
+          sharedRisks: coordinationReadiness.plans.flatMap(plan => plan.risks || []).slice(0, 6),
+          sharedUnknowns: coordinationReadiness.plans.flatMap(plan => plan.unresolvedUnknowns || []).slice(0, 6),
+          operationalReadinessOverview: provisional ? 'Partial BU coverage; treat this as provisional.' : 'All required BU plans are represented.',
+          crossFunctionalSuccessMetrics: coordinationReadiness.plans.flatMap(plan => plan.keySuccessMetrics || []).slice(0, 6),
+          escalationDecisionOwnership: coordinationReadiness.plans.flatMap(plan => plan.decisionRights || []).slice(0, 6),
+          criticalExecutionPath: coordinationReadiness.plans.flatMap(plan => plan.criticalWorkstreams || []).slice(0, 6),
+          parallelizableWorkstreams: coordinationReadiness.plans.flatMap(plan => plan.executionSections?.map(s => s.sectionName) || []).slice(0, 6),
+          confidenceReadinessAssessment: provisional ? 'Low confidence until missing BU plans are generated.' : 'Medium confidence based on complete BU plan coverage.',
+        }
+        summaryNote = coordinationLayer.executionSummary
+      } else {
+        const { messages } = buildStage3CoordinationSynthesisMessages(activeStage1Rev.contentSnapshot, coordinationReadiness.plans, {
+          prompt: provisional
+            ? 'Generate provisional coordination only. Clearly mark that not all required BU execution plans are complete.'
+            : 'Generate full coordination from all required completed BU execution plans.',
+          impactSummary: `${mode} coordination synthesis from generated BU execution plans.`,
+        })
+        const response = await callAI(messages, { temperature: 0.3, maxTokens: 1800 })
+        if (response.error) throw new Error(response.error)
+        const parsed = parseStage3CoordinationSynthesisResponse(response.result)
+        if (parsed.error || !parsed.coordinationLayer) throw new Error(parsed.error || 'Coordination synthesis parse failed.')
+        coordinationLayer = parsed.coordinationLayer
+        summaryNote = parsed.summaryNote
+      }
+
+      const draft = {
+        version: 1,
+        mode,
+        sourceBasisRevisionId: stage1ActiveId,
+        sourceStage2RevisionId: stage2ActiveId,
+        planCount: coordinationReadiness.plans.length,
+        requiredPlanCount: readinessRows.length,
+        coordinationLayer,
+        summaryNote,
+        generatedAt: new Date().toISOString(),
+      }
+      writeJsonStorage(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId), draft)
+      setCoordinationDraft(draft)
+      setCoordinationGen({ running: false, error: null })
+      return { error: null }
+    } catch (err) {
+      const message = err?.message || String(err)
+      setCoordinationGen({ running: false, error: message })
+      return { error: message }
+    }
+  }
+
   const handleUnitRegenerate = useCallback(async (planIndex, refinementPrompt, impactSummary, refinementScope) => {
     if (!activeStage1Rev)  return { error: 'No active Stage 1 revision.' }
     if (!activeStage2Rev)  return { error: 'No active Stage 2 revision.' }
@@ -2558,6 +2721,13 @@ export default function Stage3View({
           apiMode={apiMode}
           disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
           generationEnabled
+        />
+        <CoordinationReadinessPanel
+          readiness={coordinationReadiness}
+          coordinationDraft={coordinationDraft}
+          isGenerating={coordinationGen.running}
+          error={coordinationGen.error}
+          onGenerate={handleGenerateCoordination}
         />
         <div style={{
           background: 'var(--surface)', border: '1px solid var(--border)',
@@ -2698,6 +2868,13 @@ export default function Stage3View({
         apiMode={apiMode}
         disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
         generationEnabled
+      />
+      <CoordinationReadinessPanel
+        readiness={coordinationReadiness}
+        coordinationDraft={coordinationDraft}
+        isGenerating={coordinationGen.running}
+        error={coordinationGen.error}
+        onGenerate={handleGenerateCoordination}
       />
 
       {/* ── Staleness banner ──────────────────────────────────────────────── */}
