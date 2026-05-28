@@ -63,6 +63,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .app-header-imported {
@@ -71,17 +72,57 @@
   color: var(--muted);
 }
 
-.btn-clear {
+.plan-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.btn-plan,
+.plan-select {
   font-size: 9px;
   font-family: var(--fm);
   padding: 3px 10px;
   border-radius: 4px;
-  cursor: pointer;
   background: transparent;
   border: 1px solid var(--border);
   color: var(--muted);
+  white-space: nowrap;
 }
-.btn-clear:hover { border-color: var(--border2); color: var(--muted2); }
+
+.btn-plan {
+  cursor: pointer;
+}
+
+.btn-plan:hover,
+.plan-select:hover {
+  border-color: var(--border2);
+  color: var(--muted2);
+}
+
+.btn-plan:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+
+.plan-select {
+  max-width: 210px;
+  background: var(--surface);
+  color: var(--muted2);
+}
+
+.btn-clear-active {
+  border-color: rgba(251, 146, 60, .45);
+  color: #fdba74;
+}
+
+.btn-danger {
+  border-color: rgba(248, 113, 113, .45);
+  color: #fca5a5;
+}
 
 /* ── Stage tab nav ────────────────────────────────────────────────────────── */
 
