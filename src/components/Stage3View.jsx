@@ -2179,10 +2179,6 @@ function HandoffItemRow({ item, unitName, onStage2Action }) {
     generating: '#fb923c',
     not_started: 'var(--muted)',
   }[status] || 'var(--muted)'
-  const detail = item.parsedValue
-    ? listFromValue(item.parsedValue).slice(0, 2).join('; ')
-    : item.parserError || item.text || 'No generated detail yet'
-
   return (
     <div style={{
       border: '1px solid var(--border)',
@@ -2192,14 +2188,16 @@ function HandoffItemRow({ item, unitName, onStage2Action }) {
     }}>
       <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 4 }}>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)' }}>
               {item.label || item.key}
             </span>
             <Badge color={color} small>{status.replace('_', ' ')}</Badge>
-          </div>
-          <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.5 }}>
-            {detail}
+            {item.key && (
+              <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', opacity: .6 }}>
+                {item.key}
+              </span>
+            )}
           </div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 92 }}>
@@ -2244,11 +2242,8 @@ function Stage3HandoffBriefCard({ brief, unitName, onStage2Action }) {
       </div>
       <Field label="planning purpose" value={brief.planningPurpose} />
       <Field label="decision basis" value={brief.decisionBasisSummary} />
-      <Field label="key implications" value={brief.keyImplications} />
-      <Field label="execution constraints" value={brief.executionConstraints} />
-      <Field label="dependencies" value={brief.dependencies} />
-      <Field label="risks / contradictions" value={brief.risksOrContradictions} />
-      <Field label="unresolved questions" value={brief.unresolvedQuestions} />
+      {/* key implications, execution constraints, dependencies, risks, unresolved questions
+          are canonical in the Execution Plan Draft — not repeated here */}
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
         <Badge color="#3b82f6" small>{brief.metadata?.briefSizeBytes || 0}b brief</Badge>
         <Badge color="var(--muted)" small>{brief.metadata?.fullDraftSizeBytes || 0}b source</Badge>
@@ -2609,6 +2604,150 @@ function StorageStatusIndicator({ idbReady, stage3DraftPlans }) {
   )
 }
 
+// ── Duplicate audit ───────────────────────────────────────────────────────────
+// Dev-visible cross-layer duplicate detector. Surfaces exact-duplicate text
+// that appears in more than one content layer (handoff brief / execution draft /
+// PlanCard flat fields). Reports canonical location and redundant locations.
+
+function extractTextLines(value) {
+  if (!value) return []
+  if (typeof value === 'string') return value.split(/\n+/).map(s => s.trim()).filter(s => s.length > 20)
+  if (Array.isArray(value)) return value.flatMap(v => extractTextLines(v))
+  if (typeof value === 'object') return Object.values(value).flatMap(v => extractTextLines(v))
+  return []
+}
+
+function Stage3DuplicateAudit({ draft, legacyPlan, handoffBrief }) {
+  const [open, setOpen] = React.useState(false)
+
+  const findings = React.useMemo(() => {
+    const layers = []
+
+    // Layer 1: handoff brief
+    if (handoffBrief) {
+      const briefLines = [
+        ...extractTextLines(handoffBrief.planningPurpose),
+        ...extractTextLines(handoffBrief.decisionBasisSummary),
+        ...extractTextLines(handoffBrief.keyImplications),
+        ...extractTextLines(handoffBrief.executionConstraints),
+        ...extractTextLines(handoffBrief.dependencies),
+        ...extractTextLines(handoffBrief.risksOrContradictions),
+        ...extractTextLines(handoffBrief.unresolvedQuestions),
+      ]
+      layers.push({ name: 'Handoff Brief', lines: briefLines })
+    }
+
+    // Layer 2: execution draft atoms
+    const resolved = resolveExecutionDraftSource(draft, legacyPlan)
+    const atoms = resolved.atoms || []
+    const atomLines = atoms.flatMap(atom => extractTextLines(atom.parsedValue))
+    layers.push({ name: 'Execution Draft', lines: atomLines })
+
+    // Layer 3: PlanCard flat fields (from assembleAtomizedBUPlan output)
+    const plan = draft?.plan || legacyPlan
+    if (plan) {
+      const flatFields = [
+        plan.priorityOutcomes,
+        plan.initiativesMissionCritical,
+        plan.initiativesOptional,
+        plan.initiativesDeferred,
+        plan.initiativesBlocked,
+        plan.keyMilestones,
+        plan.crossFunctionalDependencies,
+        plan.requiredCapabilities,
+        plan.staffingOwnership,
+        plan.systemsTools,
+        plan.governanceCadence,
+        plan.decisionRights,
+        plan.risks,
+        plan.constraints,
+        plan.unresolvedUnknowns,
+        plan.leadingIndicators,
+        plan.keySuccessMetrics,
+        plan.failureSignals,
+        plan.assumptions,
+      ]
+      const planCardLines = flatFields.flatMap(f => extractTextLines(f))
+      layers.push({ name: 'PlanCard Flat Fields', lines: planCardLines })
+    }
+
+    // Find duplicates: any line appearing in 2+ layers
+    const lineMap = new Map() // line → [{ layerName, layerIdx }]
+    layers.forEach(({ name, lines }, layerIdx) => {
+      const seen = new Set()
+      lines.forEach(line => {
+        const key = line.toLowerCase().replace(/\s+/g, ' ').trim()
+        if (key.length < 25) return  // skip very short lines
+        if (seen.has(key)) return
+        seen.add(key)
+        if (!lineMap.has(key)) lineMap.set(key, [])
+        lineMap.get(key).push({ layerName: name, layerIdx, original: line })
+      })
+    })
+
+    const duplicates = []
+    for (const [, occurrences] of lineMap) {
+      if (occurrences.length < 2) continue
+      duplicates.push({
+        text: occurrences[0].original,
+        canonical: occurrences[0].layerName,
+        repeated: occurrences.slice(1).map(o => o.layerName),
+      })
+    }
+    return { duplicates, layerLineCounts: layers.map(l => ({ name: l.name, count: l.lines.length })) }
+  }, [draft, legacyPlan, handoffBrief])
+
+  const dupCount = findings.duplicates.length
+  const color = dupCount === 0 ? '#00e5b4' : dupCount < 5 ? '#fb923c' : '#f87171'
+
+  return (
+    <div style={{ marginTop: 12, border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+          padding: '7px 10px', background: 'var(--s2)',
+        }}
+      >
+        <Badge color={color} small>{dupCount} dup{dupCount !== 1 ? 's' : ''} detected</Badge>
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', flex: 1 }}>
+          Content Ownership Audit
+          {findings.layerLineCounts.map(l => ` · ${l.name}: ${l.count}`).join('')}
+        </span>
+        <span style={{ fontSize: 8, color: 'var(--muted)' }}>{open ? '▲' : '▼'}</span>
+      </div>
+      {open && (
+        <div style={{ padding: '10px 12px', background: 'var(--surface)' }}>
+          {dupCount === 0 ? (
+            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#00e5b4' }}>
+              No cross-layer duplicates detected.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {findings.duplicates.map((dup, i) => (
+                <div key={i} style={{
+                  background: 'var(--s2)', border: '1px solid rgba(248,113,113,.25)',
+                  borderRadius: 4, padding: '7px 9px',
+                }}>
+                  <div style={{ display: 'flex', gap: 6, marginBottom: 4, flexWrap: 'wrap' }}>
+                    <Badge color="#00e5b4" small>canonical: {dup.canonical}</Badge>
+                    {dup.repeated.map((r, ri) => (
+                      <Badge key={ri} color="#f87171" small>duplicate in: {r}</Badge>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.5 }}>
+                    "{dup.text.length > 120 ? dup.text.slice(0, 117) + '…' : dup.text}"
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Stage3ReadinessPanels({
   rows,
   planDrafts,
@@ -2936,6 +3075,11 @@ function Stage3ReadinessPanels({
                   draft={draft}
                   legacyPlan={legacyPlan}
                 />
+                <Stage3DuplicateAudit
+                  draft={draft}
+                  legacyPlan={legacyPlan}
+                  handoffBrief={readiness.handoffBrief || readiness.planningContext?.handoffBrief || null}
+                />
               </div>
             )}
           </div>
@@ -3171,40 +3315,6 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
               <BulletList items={plan.handoffWarnings} borderColor="rgba(251,146,60,.45)" />
             </div>
           )}
-          {plan.executionSections?.length > 0 && (
-            <PlanSection label="Atomized Execution Sections">
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {plan.executionSections.map((section, sectionIdx) => (
-                  <div key={section.atomId || sectionIdx} style={{
-                    border: '1px solid var(--border)',
-                    borderRadius: 6,
-                    padding: '10px 11px',
-                    background: 'var(--s2)',
-                  }}>
-                    <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text)', marginBottom: 5 }}>
-                      {section.sectionName || `Execution section ${sectionIdx + 1}`}
-                    </div>
-                    {section.objective && (
-                      <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 7 }}>
-                        {section.objective}
-                      </div>
-                    )}
-                    <TwoCol
-                      left={<PlanSection label="Execution Strategy" marginBottom={8}><BulletList items={section.executionStrategy} borderColor="rgba(59,130,246,.35)" /></PlanSection>}
-                      right={<PlanSection label="Validation / Readiness" marginBottom={8}><BulletList items={section.validationReadinessChecks} borderColor="rgba(0,229,180,.35)" /></PlanSection>}
-                      gap={12}
-                    />
-                    <TwoCol
-                      left={<PlanSection label="Dependencies" marginBottom={8}><BulletList items={section.dependencies} borderColor="rgba(139,92,246,.35)" /></PlanSection>}
-                      right={<PlanSection label="Risks / Unknowns" marginBottom={8}><BulletList items={[...(section.risks || []), ...(section.unknowns || [])]} borderColor="rgba(248,113,113,.35)" /></PlanSection>}
-                      gap={12}
-                    />
-                  </div>
-                ))}
-              </div>
-            </PlanSection>
-          )}
-
           {/* Mission */}
           {plan.mission && (
             <div style={{
@@ -3229,142 +3339,32 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
             </PlanSection>
           )}
 
-          {/* Priority outcomes */}
-          {priorityOutcomes?.length > 0 && (
-            <PlanSection label="Priority Outcomes">
-              <BulletList items={priorityOutcomes} borderColor="rgba(59,130,246,.4)" />
-            </PlanSection>
-          )}
-
-          {/* Prioritised initiatives — only when plan has these fields (not from DOM capture) */}
-          {plan.captureSource !== 'browser_dom_visible_stage3_capture' && (
-            <PlanSection label="Execution Workstreams">
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 7, marginBottom: 2 }}>
-                <InitiativeBlock label="🔴 Mission Critical" items={plan.initiativesMissionCritical} accentColor="#f87171" empty="None identified" />
-                <InitiativeBlock label="🔵 Optional"         items={plan.initiativesOptional}        accentColor="#3b82f6" empty="None identified" />
-                <InitiativeBlock label="⏱ Deferred"          items={plan.initiativesDeferred}        accentColor="#94a3b8" empty="None deferred"   />
-                <InitiativeBlock label="🚫 Blocked"           items={plan.initiativesBlocked}         accentColor="#fb923c" empty="None blocked"    />
-              </div>
-            </PlanSection>
-          )}
-
-          {/* Sequencing + milestones */}
-          {(plan.sequencingNarrative || plan.keyMilestones?.length > 0) && (
-            <PlanSection label="Sequencing & Key Milestones">
-              {plan.sequencingNarrative && (
-                <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.7, marginBottom: 8, fontFamily: 'var(--fm)' }}>
-                  {plan.sequencingNarrative}
+          {/* Execution Summary — canonical content lives in Execution Plan Draft below */}
+          <PlanSection label="Execution Summary">
+            <div style={{
+              background: 'var(--s2)', border: '1px solid var(--border)',
+              borderRadius: 5, padding: '10px 12px',
+            }}>
+              {plan.executionSections?.length > 0 ? (
+                <>
+                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 8 }}>
+                    {plan.executionSections.length} execution section{plan.executionSections.length !== 1 ? 's' : ''} — full detail in Execution Plan Draft below
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                    {plan.executionSections.map((s, i) => (
+                      <Badge key={i} color="#3b82f6" small>
+                        {s.sectionName || `Section ${i + 1}`}
+                      </Badge>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+                  No execution sections yet — generate or import a plan to see the Execution Plan Draft.
                 </div>
               )}
-              <BulletList items={plan.keyMilestones} borderColor="rgba(0,229,180,.4)" />
-            </PlanSection>
-          )}
-
-          {plan.executionLenses?.length > 0 && (
-            <PlanSection label="Adaptive Execution Lenses">
-              <LensList lenses={plan.executionLenses} />
-            </PlanSection>
-          )}
-
-          {/* Dependencies + capabilities */}
-          <TwoCol
-            left={
-              <PlanSection label="Cross-functional Dependencies">
-                <BulletList items={plan.crossFunctionalDependencies} borderColor="rgba(139,92,246,.4)" empty="None identified" />
-              </PlanSection>
-            }
-            right={
-              <PlanSection label="Required Capabilities">
-                <BulletList items={plan.requiredCapabilities} borderColor="rgba(59,130,246,.4)" empty="None identified" />
-              </PlanSection>
-            }
-          />
-
-          {/* Staffing + systems */}
-          <TwoCol
-            left={
-              <PlanSection label="Staffing & Ownership">
-                <BulletList items={plan.staffingOwnership} borderColor="rgba(251,146,60,.4)" empty="Not specified" />
-              </PlanSection>
-            }
-            right={
-              <PlanSection label="Systems & Tools">
-                <BulletList items={plan.systemsTools} borderColor="rgba(148,163,184,.4)" empty="Not specified" />
-              </PlanSection>
-            }
-          />
-
-          {/* Governance + decision rights */}
-          <TwoCol
-            left={
-              <PlanSection label="Governance Cadence">
-                <BulletList items={plan.governanceCadence} borderColor="rgba(59,130,246,.35)" empty="Not specified" />
-              </PlanSection>
-            }
-            right={
-              <PlanSection label="Decision Rights">
-                <BulletList items={plan.decisionRights} borderColor="rgba(59,130,246,.35)" empty="Not specified" />
-              </PlanSection>
-            }
-          />
-
-          {/* Risks / constraints / unknowns */}
-          <PlanSection label="Risks · Constraints · Unknowns">
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
-              <div>
-                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>Risks</div>
-                <BulletList items={plan.risks} borderColor="rgba(248,113,113,.45)" empty="None identified" />
-              </div>
-              <div>
-                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>Constraints</div>
-                <BulletList items={plan.constraints} borderColor="rgba(251,146,60,.45)" empty="None identified" />
-              </div>
-              <div>
-                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#94a3b8', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>Unknowns</div>
-                <BulletList items={plan.unresolvedUnknowns} borderColor="rgba(148,163,184,.45)" empty="None identified" />
-              </div>
             </div>
           </PlanSection>
-
-          {/* Assumptions */}
-          {plan.assumptions?.length > 0 && (
-            <PlanSection label="Assumptions">
-              <div style={{
-                background: 'var(--s2)', borderRadius: 5, padding: '10px 12px',
-                border: '1px solid var(--border)',
-              }}>
-                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 8, display: 'flex', gap: 8 }}>
-                  <Badge color="#3b82f6" small>fact</Badge>
-                  <Badge color="#fb923c" small>inferred</Badge>
-                  <Badge color="#f87171" small>speculative</Badge>
-                  <span style={{ opacity: .6 }}>— assumption type labels</span>
-                </div>
-                {plan.assumptions.map((a, i) => (
-                  <AssumptionItem key={i} assumption={a} />
-                ))}
-              </div>
-            </PlanSection>
-          )}
-
-          {/* Metrics */}
-          {hasMeasurement && (
-          <PlanSection label="Measurement">
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
-              <div>
-                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>Leading Indicators</div>
-                <BulletList items={plan.leadingIndicators} borderColor="rgba(0,229,180,.4)" empty="Not defined" />
-              </div>
-              <div>
-                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#3b82f6', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>Success Metrics</div>
-                <BulletList items={plan.keySuccessMetrics} borderColor="rgba(59,130,246,.4)" empty="Not defined" />
-              </div>
-              <div>
-                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>Failure Signals</div>
-                <BulletList items={plan.failureSignals} borderColor="rgba(248,113,113,.4)" empty="Not defined" />
-              </div>
-            </div>
-          </PlanSection>
-          )}
 
           {/* Readiness assessment */}
           {plan.readinessAssessment && (
