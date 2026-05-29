@@ -132,6 +132,208 @@ function stage3CoordinationDraftKey(workspaceId, stage1Id, stage2Id) {
   return `bsp_v1_stage3_coordination_${workspaceId}_${stage1Id}_${stage2Id}`
 }
 
+// Fallback key for the PM capture import — matches the key that was live in the browser
+// when the DOM capture was taken. Written alongside the runtime-computed key so the
+// legacy search path and the canonical path both resolve the draft.
+const CAPTURE_FALLBACK_KEY = 'bsp_v1_stage3_bu_plan_plan_mpphui1l_eq11b_Product_Management'
+
+// DOM text uses ALL-CAPS concatenated labels (e.g. EXECUTIONSTRATEGY, DECISIONSREQUIRED).
+// Map each to the camelCase field key used in the draft schema.
+const CAPTURE_LABEL_MAP = {
+  'OBJECTIVE':            'objective',
+  'EXECUTIONSTRATEGY':    'executionStrategy',
+  'DECISIONSREQUIRED':    'decisionsRequired',
+  'SEQUENCINGANDGATES':   'sequencingAndGates',
+  'DEPENDENCIES':         'dependencies',
+  'RISKS':                'risks',
+  'VALIDATIONSIGNALS':    'validationSignals',
+  'ACCEPTANCECRITERIA':   'acceptanceCriteria',
+  // spaced variants present in some render layouts
+  'EXECUTION STRATEGY':   'executionStrategy',
+  'DECISIONS REQUIRED':   'decisionsRequired',
+  'SEQUENCING AND GATES': 'sequencingAndGates',
+  'VALIDATION SIGNALS':   'validationSignals',
+  'VALIDATION / READINESS': 'validationSignals',
+  'ACCEPTANCE CRITERIA':  'acceptanceCriteria',
+}
+const CAPTURE_LABEL_RE = new RegExp(
+  `^(${Object.keys(CAPTURE_LABEL_MAP).map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$`
+)
+
+// Parse the text block for a single section into a field map.
+// sectionText starts with the section name line.
+function extractCaptureSection(sectionText, sectionName) {
+  const fields = {}
+  const lines = sectionText.split('\n').map(l => l.trim()).filter(Boolean)
+  let currentKey = null
+  const buf = []
+
+  function flush() {
+    if (currentKey && buf.length) {
+      const content = buf.join('\n').trim()
+      if (content) fields[currentKey] = content
+    }
+    buf.length = 0
+  }
+
+  for (const line of lines) {
+    if (line === sectionName) continue
+    const labelMatch = line.match(CAPTURE_LABEL_RE)
+    if (labelMatch) {
+      flush()
+      currentKey = CAPTURE_LABEL_MAP[line]
+    } else if (currentKey) {
+      buf.push(line)
+    }
+  }
+  flush()
+  return { sectionName, ...fields }
+}
+
+// Parse the PM execution-plan region from fullVisibleText and build the canonical draft.
+function buildCapturedStage3Draft(captureJson, buName) {
+  const foundSections = captureJson.foundSections || []
+  const rawText = captureJson.fullVisibleText || ''
+  const now = new Date().toISOString()
+
+  // ── Locate the PM execution-plan region ─────────────────────────────────────
+  // Start: "EXECUTION PLAN DRAFT" header (only one occurrence in the text)
+  // End:   "\n2\nCompliance" — the next BU row (the "2" is the row index badge)
+  const planStart = rawText.indexOf('EXECUTION PLAN DRAFT')
+  const endMarker = planStart >= 0 ? rawText.indexOf('\n2\nCompliance', planStart) : -1
+  const planEnd   = endMarker > planStart ? endMarker : rawText.length
+
+  // ── Find each named section inside the PM region ─────────────────────────────
+  // Sections appear in order, each starting with the section name on its own line
+  // immediately followed by OBJECTIVE. We search only within [planStart, planEnd].
+  const positions = []
+  for (const name of foundSections) {
+    let searchFrom = positions.length > 0
+      ? positions[positions.length - 1].idx + name.length
+      : planStart
+    const idx = rawText.indexOf(name, searchFrom)
+    if (idx >= 0 && idx < planEnd) positions.push({ name, idx })
+  }
+
+  // Extract each section's text block
+  const extractedSections = positions.map((pos, i) => {
+    const end = positions[i + 1]?.idx ?? planEnd
+    return extractCaptureSection(rawText.slice(pos.idx, end), pos.name)
+  })
+
+  // Fall back to name-only stubs only if nothing was found in the text
+  const sections = extractedSections.length
+    ? extractedSections
+    : foundSections.map(name => ({ sectionName: name }))
+
+  // ── Build executionAtoms ─────────────────────────────────────────────────────
+  const FIELD_KEYS = ['objective','executionStrategy','decisionsRequired','sequencingAndGates','dependencies','risks','validationSignals','acceptanceCriteria']
+  const atoms = []
+  sections.forEach(section => {
+    const sectionKey = storageSafeName(section.sectionName)
+    let addedAny = false
+    FIELD_KEYS.forEach(fieldKey => {
+      const value = section[fieldKey]
+      if (!value) return
+      addedAny = true
+      atoms.push({
+        id: `capture:${storageSafeName(buName)}:${sectionKey}:${fieldKey}`,
+        stage: 'stage3',
+        phase: 'executionPlanFieldAtom',
+        status: ATOM_STATUSES.COMPLETE,
+        parentId: buName,
+        businessUnitName: buName,
+        elementName: section.sectionName,
+        childKey: fieldKey,
+        metadata: {
+          sectionKey,
+          sectionName: section.sectionName,
+          fieldKey,
+          fieldName: fieldKey,
+          buName,
+          captureSource: 'browser_dom_visible_stage3_capture',
+        },
+        parsedValue: value,
+        capturedAt: captureJson.capturedAt,
+        completedAt: now,
+        createdAt: captureJson.capturedAt,
+        updatedAt: now,
+      })
+    })
+    // Preserve section as a stub if no fields were extracted
+    if (!addedAny) {
+      atoms.push({
+        id: `capture:${storageSafeName(buName)}:${sectionKey}:objective`,
+        stage: 'stage3',
+        phase: 'executionPlanFieldAtom',
+        status: ATOM_STATUSES.COMPLETE,
+        parentId: buName,
+        businessUnitName: buName,
+        elementName: section.sectionName,
+        childKey: 'objective',
+        metadata: { sectionKey, sectionName: section.sectionName, fieldKey: 'objective', fieldName: 'objective', buName, captureSource: 'browser_dom_visible_stage3_capture', note: 'field labels not matched in DOM text' },
+        parsedValue: `${section.sectionName} — section found but field content not resolved from DOM text`,
+        capturedAt: captureJson.capturedAt,
+        completedAt: now,
+        createdAt: captureJson.capturedAt,
+        updatedAt: now,
+      })
+    }
+  })
+
+  // ── Aggregate plan-level fields from section content ─────────────────────────
+  const NOT_CAPTURED = 'not captured from runtime import'
+  const collectLines = key => sections.flatMap(s => s[key] ? [s[key]] : [])
+
+  return {
+    version: 1,
+    businessUnitName: buName,
+    source: 'browser_dom_visible_stage3_capture',
+    status: 'runtime_captured_unaccepted_draft',
+    accepted: false,
+    capturedAt: captureJson.capturedAt,
+    persistedAt: now,
+    plan: {
+      buName,
+      captureSource: 'browser_dom_visible_stage3_capture',
+      executionSections: sections.map(s => ({
+        sectionName: s.sectionName,
+        atomId: storageSafeName(s.sectionName),
+        objective: s.objective || null,
+        executionStrategy: asBulletArray(s.executionStrategy),
+        decisionsRequired: asBulletArray(s.decisionsRequired),
+        sequencingAndGates: asBulletArray(s.sequencingAndGates),
+        dependencies: asBulletArray(s.dependencies),
+        risks: asBulletArray(s.risks),
+        validationSignals: asBulletArray(s.validationSignals),
+        validationReadinessChecks: asBulletArray(s.validationSignals),
+        acceptanceCriteria: asBulletArray(s.acceptanceCriteria),
+        captureSource: 'browser_dom_visible_stage3_capture',
+      })),
+      criticalWorkstreams: foundSections,
+      missingSections: [],
+      failedSections: [],
+      crossFunctionalDependencies: asBulletArray(collectLines('dependencies').length ? collectLines('dependencies') : [NOT_CAPTURED]),
+      risks:         asBulletArray(collectLines('risks').length          ? collectLines('risks')          : [NOT_CAPTURED]),
+      decisionRights: asBulletArray(collectLines('decisionsRequired').length ? collectLines('decisionsRequired') : [NOT_CAPTURED]),
+      staffingOwnership: [NOT_CAPTURED],
+      systemsTools:      [NOT_CAPTURED],
+      governanceCadence: [NOT_CAPTURED],
+    },
+    executionAtoms: atoms,
+    lifecycle: { status: LIFECYCLE_STATES.DRAFT_GENERATED },
+    diagnostics: {
+      captureType: captureJson.captureType || 'stage3_visible_page_text_capture',
+      sectionsFound: foundSections.length,
+      sectionsExtracted: sections.length,
+      atomsBuilt: atoms.length,
+      importedThroughApp: true,
+      importedAt: now,
+    },
+    lastSavedAt: now,
+  }
+}
+
 function readJsonStorage(key) {
   if (!key || typeof localStorage === 'undefined') return null
   try {
@@ -1228,8 +1430,16 @@ function SectionLabel({ children }) {
   )
 }
 
+const asBulletArray = (value) => {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string') return value.trim() ? [value.trim()] : []
+  if (value == null) return []
+  return [String(value)]
+}
+
 function BulletList({ items, borderColor, empty }) {
-  if (!items?.length) {
+  const arr = asBulletArray(items)
+  if (!arr.length) {
     return empty
       ? <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic' }}>{empty}</div>
       : null
@@ -1237,7 +1447,7 @@ function BulletList({ items, borderColor, empty }) {
   const bc = borderColor || 'var(--border2)'
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-      {items.map((item, i) => (
+      {arr.map((item, i) => (
         <div key={i} style={{
           fontSize: 10, color: 'var(--muted2)', lineHeight: 1.65,
           paddingLeft: 10, borderLeft: `2px solid ${bc}`,
@@ -2332,6 +2542,9 @@ function Stage3ReadinessPanels({
   apiMode,
   disabled,
   generationEnabled = false,
+  captureImportRef = null,
+  captureImportStatus = null,
+  onCaptureImport = null,
 }) {
   const [open, setOpen] = useState({})
   const completedCount = rows.filter(row => planDrafts[row.unit.name]?.plan).length
@@ -2566,6 +2779,42 @@ function Stage3ReadinessPanels({
                     {apiMode !== 'ai' && (
                       <div style={{ marginTop: 7, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
                         Mock mode active.
+                      </div>
+                    )}
+                    {isPilotUnit && (
+                      <div style={{ marginTop: 9, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
+                        <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 5, lineHeight: 1.45 }}>
+                          Restore from DOM capture — import a <code>bsp-stage3-pm-runtime-capture.json</code> file to persist a captured draft without regenerating.
+                        </div>
+                        <input
+                          type="file"
+                          accept=".json"
+                          ref={captureImportRef}
+                          style={{ display: 'none' }}
+                          onChange={e => {
+                            const file = e.target.files?.[0]
+                            if (file && onCaptureImport) onCaptureImport(file, unit)
+                            e.target.value = ''
+                          }}
+                        />
+                        <button
+                          onClick={() => captureImportRef.current?.click()}
+                          style={{ ...secondaryButtonStyle }}
+                        >
+                          Import Stage 3 capture
+                        </button>
+                        {captureImportStatus?.ok && (
+                          <div style={{ marginTop: 6, fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4', lineHeight: 1.55 }}>
+                            Imported: {captureImportStatus.sections} sections · {captureImportStatus.atoms} atoms
+                            <br />Runtime key: {captureImportStatus.runtimeKey}
+                            <br />Fallback key: {captureImportStatus.fallbackKey}
+                          </div>
+                        )}
+                        {captureImportStatus?.error && (
+                          <div style={{ marginTop: 6, fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.45 }}>
+                            {captureImportStatus.error}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -2899,15 +3148,17 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
             </PlanSection>
           )}
 
-          {/* Prioritised initiatives */}
-          <PlanSection label="Execution Workstreams">
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 7, marginBottom: 2 }}>
-              <InitiativeBlock label="🔴 Mission Critical" items={plan.initiativesMissionCritical} accentColor="#f87171" empty="None identified" />
-              <InitiativeBlock label="🔵 Optional"         items={plan.initiativesOptional}        accentColor="#3b82f6" empty="None identified" />
-              <InitiativeBlock label="⏱ Deferred"          items={plan.initiativesDeferred}        accentColor="#94a3b8" empty="None deferred"   />
-              <InitiativeBlock label="🚫 Blocked"           items={plan.initiativesBlocked}         accentColor="#fb923c" empty="None blocked"    />
-            </div>
-          </PlanSection>
+          {/* Prioritised initiatives — only when plan has these fields (not from DOM capture) */}
+          {plan.captureSource !== 'browser_dom_visible_stage3_capture' && (
+            <PlanSection label="Execution Workstreams">
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 7, marginBottom: 2 }}>
+                <InitiativeBlock label="🔴 Mission Critical" items={plan.initiativesMissionCritical} accentColor="#f87171" empty="None identified" />
+                <InitiativeBlock label="🔵 Optional"         items={plan.initiativesOptional}        accentColor="#3b82f6" empty="None identified" />
+                <InitiativeBlock label="⏱ Deferred"          items={plan.initiativesDeferred}        accentColor="#94a3b8" empty="None deferred"   />
+                <InitiativeBlock label="🚫 Blocked"           items={plan.initiativesBlocked}         accentColor="#fb923c" empty="None blocked"    />
+              </div>
+            </PlanSection>
+          )}
 
           {/* Sequencing + milestones */}
           {(plan.sequencingNarrative || plan.keyMilestones?.length > 0) && (
@@ -3241,6 +3492,8 @@ export default function Stage3View({
   const [stage12DraftOptIns, setStage12DraftOptIns] = useState({})
   const [coordinationDraft, setCoordinationDraft] = useState(null)
   const [coordinationGen, setCoordinationGen] = useState({ running: false, error: null })
+  const [captureImportStatus, setCaptureImportStatus] = useState(null)
+  const captureImportRef = useRef(null)
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev      = stage3Revisions.find(r => r.id === stage3ActiveId) ?? null
@@ -3317,6 +3570,37 @@ export default function Stage3View({
     const coordination = readJsonStorage(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId))
     setCoordinationDraft(coordination?.version === 1 ? coordination : null)
   }, [effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, activeStage2Rev?.id])
+
+  function handleCaptureImport(file, unit) {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const captureJson = JSON.parse(e.target.result)
+        if (captureJson.buName !== unit.name) {
+          setCaptureImportStatus({ error: `Capture buName "${captureJson.buName}" does not match "${unit.name}"` })
+          return
+        }
+        const draft = buildCapturedStage3Draft(captureJson, unit.name)
+        // Write to runtime-computed canonical key if IDs are available
+        const runtimeKey = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name)
+        if (runtimeKey) writeJsonStorage(runtimeKey, draft)
+        // Always write to the fallback key (the key that was live at capture time)
+        writeJsonStorage(CAPTURE_FALLBACK_KEY, draft)
+        setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
+        setCaptureImportStatus({
+          ok: true,
+          runtimeKey: runtimeKey || '(IDs not available)',
+          fallbackKey: CAPTURE_FALLBACK_KEY,
+          sections: draft.plan.executionSections.length,
+          atoms: draft.executionAtoms.length,
+        })
+      } catch (err) {
+        setCaptureImportStatus({ error: `Parse failed: ${err.message}` })
+      }
+    }
+    reader.readAsText(file)
+  }
 
   function handleStage2HandoffAction(buName, itemKey, action) {
     writeJsonStorage('bsp_v1_stage2_handoff_focus', {
@@ -4127,6 +4411,9 @@ export default function Stage3View({
           apiMode={apiMode}
           disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
           generationEnabled
+          captureImportRef={captureImportRef}
+          captureImportStatus={captureImportStatus}
+          onCaptureImport={handleCaptureImport}
         />
         <CoordinationReadinessPanel
           readiness={coordinationReadiness}
@@ -4275,6 +4562,9 @@ export default function Stage3View({
         apiMode={apiMode}
         disabled={!activeStage1Rev || !activeStage2Rev || isGenerating}
         generationEnabled
+        captureImportRef={captureImportRef}
+        captureImportStatus={captureImportStatus}
+        onCaptureImport={handleCaptureImport}
       />
       <CoordinationReadinessPanel
         readiness={coordinationReadiness}
