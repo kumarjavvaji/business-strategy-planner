@@ -11,6 +11,7 @@
 // Revision history remains strictly stage-level — no nested unit histories.
 
 import React, { useState, useCallback, useEffect, useRef } from 'react'
+import { readArtifactAsync, writeArtifact } from '../utils/storageRouter'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import {
   buildStage2Messages,
@@ -305,17 +306,16 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   const storageKey  = workspaceId ? `bsp_v1_handoff_${workspaceId}_${bu.name}` : null
   const [lastSavedAt, setLastSavedAt] = useState(null)
 
-  // Hydrate once on mount
+  // Hydrate once on mount — uses IDB-aware async read so data survives quota migration
   useEffect(() => {
     if (!storageKey) {
       console.log('[Stage2 Handoff Draft] missing workspaceId — persistence disabled for', bu.name)
       hasHydrated.current = true
       return
     }
-    try {
-      const raw = localStorage.getItem(storageKey)
+    readArtifactAsync(storageKey).then(raw => {
       if (raw) {
-        const draft = normalizeHandoffDraftPayload(JSON.parse(raw))
+        const draft = normalizeHandoffDraftPayload(raw)
         if (draft.parsed) setParsed(draft.parsed)
         setItemStates(draft.itemStates || {})
         setSmeLensState(draft.smeLensState || SME_LENS_STATE_DEFAULT)
@@ -323,16 +323,17 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
         if (draft.buHandoff) setBuHandoff(draft.buHandoff)
         if (draft.structureRaw) setStructureRaw(draft.structureRaw)
         if (draft.savedAt) setLastSavedAt(draft.savedAt)
-        console.log('[Stage2 Handoff Draft] hydrated BU', bu.name, 'keys:', Object.keys(JSON.parse(raw)))
+        console.log('[Stage2 Handoff Draft] hydrated BU', bu.name, 'keys:', Object.keys(raw))
         console.log('[Stage2 Handoff Draft] SME lens persisted:', !!draft.smeLensState?.parsedValue)
         console.log('[Stage2 Handoff Draft] handoff items persisted count:', Object.keys(draft.itemStates || {}).length)
       } else {
         console.log('[Stage2 Handoff Draft] no draft found for', bu.name)
       }
-    } catch (e) {
+      hasHydrated.current = true
+    }).catch(e => {
       console.error('[Stage2 Handoff Draft] hydrate failed for', bu.name, e)
-    }
-    hasHydrated.current = true
+      hasHydrated.current = true
+    })
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -353,8 +354,9 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
         buHandoff,
         structureRaw,
       })
-      localStorage.setItem(storageKey, JSON.stringify(draft))
-      setLastSavedAt(draft.savedAt)
+      writeArtifact(storageKey, draft).then(ok => {
+        if (ok) setLastSavedAt(draft.savedAt)
+      }).catch(() => {})
       console.log('[Stage2 Handoff Draft] saving BU', bu.name, 'keys:', Object.keys(draft))
       console.log('[Stage2 Handoff Draft] SME lens persisted:', !!draft.SMEReviewLens)
       console.log('[Stage2 Handoff Draft] handoff items persisted count:', Object.keys(draft.handoffItems || {}).length)

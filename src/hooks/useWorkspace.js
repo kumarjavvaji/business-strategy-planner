@@ -12,6 +12,7 @@
 import { useEffect, useState } from 'react'
 import { normalizeStrategyBasisPackage } from '../utils/packageImport'
 import { buildInitialRevision, buildManualRevision } from '../utils/stageSnapshots'
+import { writeArtifact as writeArtifactToIdb } from '../utils/storageRouter'
 
 const LEGACY_STORAGE_KEY = 'bsp_v1_workspace'
 const LEGACY_PLAN_ID = 'legacy_bsp_v1_workspace'
@@ -204,7 +205,10 @@ function readPlanFromIndex(index, id) {
 
 function writePlan(plan, index) {
   const key = plan.storageKey || storageKeyForPlan(index, plan.id)
+  // Synchronous LS write — needed for startup (loadMultiPlanStorage runs sync)
   localStorage.setItem(key, JSON.stringify(plan))
+  // Async IDB backup — fire-and-forget; keeps IDB in sync for recovery
+  writeArtifactToIdb(key, plan).catch(() => {})
 }
 
 function writeIndex(index) {

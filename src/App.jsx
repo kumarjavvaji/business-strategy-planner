@@ -1,6 +1,7 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import './App.css'
 import { useWorkspace }              from './hooks/useWorkspace'
+import { initStorageCache }          from './utils/storageRouter'
 import { DEMO_STRATEGY_BASIS_PACKAGE } from './data/demoPackage'
 import Stage1View                    from './components/Stage1View'
 import Stage2View                    from './components/Stage2View'
@@ -377,6 +378,10 @@ export default function App() {
   const [activeStage,           setActiveStage]           = useState(1)
   const [stage2PendingGenerate, setStage2PendingGenerate] = useState(false)
   const [stage3PendingGenerate, setStage3PendingGenerate] = useState(false)
+
+  // Kick off IDB cache init immediately on mount (non-blocking).
+  // Stage3 and Stage2 hydration effects await storageReady() before reading.
+  useEffect(() => { initStorageCache() }, [])
 
   function handleRegenerateAndGoToStage2() {
     setStage2PendingGenerate(true)

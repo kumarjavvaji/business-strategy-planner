@@ -45,6 +45,7 @@ import {
   runGenerationLifecycle,
 } from '../utils/generationLifecycle'
 import { stage3ExecutiveLeadershipFixture } from '../fixtures/stage3ExecutiveLeadershipFixture'
+import { readCached, readArtifactAsync, writeArtifact, storageReady, getStorageDiagnostics } from '../utils/storageRouter'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -61,7 +62,6 @@ const READINESS_COLORS = {
 
 const STAGE3_QUEUE_DELAY_MS = 850
 const STAGE3_DRAFT_PLAN_VERSION = 1
-const STAGE3_PILOT_BU_NAME = 'Product Management'
 const STAGE3_FIELD_ATOM_KEYS = [
   'objective',
   'executionStrategy',
@@ -334,17 +334,16 @@ function buildCapturedStage3Draft(captureJson, buName) {
   }
 }
 
+// readJsonStorage: checks IDB in-memory cache first (populated by storageReady()),
+// then falls back to raw localStorage. For LS-only keys the behaviour is unchanged.
 function readJsonStorage(key) {
-  if (!key || typeof localStorage === 'undefined') return null
-  try {
-    const raw = localStorage.getItem(key)
-    return raw ? JSON.parse(raw) : null
-  } catch {
-    return null
-  }
+  if (!key) return null
+  return readCached(key)
 }
 
-function writeJsonStorage(key, value) {
+// writeJsonStorageSync: synchronous LS-only write for small, non-routed keys.
+// Do NOT use for stage3 plans, handoffs, or workspace plans — use writeArtifact() instead.
+function writeJsonStorageSync(key, value) {
   if (!key || typeof localStorage === 'undefined') return false
   try {
     localStorage.setItem(key, JSON.stringify(value))
@@ -460,8 +459,24 @@ function isExecutiveTraceUnit(unit) {
   return EXECUTIVE_TRACE_PATTERN.test(unit?.name || unit?.buName || '')
 }
 
-function isStage3PilotUnit(unit) {
-  return String(unit?.name || unit?.buName || '').toLowerCase() === STAGE3_PILOT_BU_NAME.toLowerCase()
+/**
+ * Returns a human-readable block reason if the BU cannot generate right now,
+ * or null if generation is allowed.
+ *
+ * Gate order:
+ *  1. Already running          → 'Generation already running'
+ *  2. IDB not initialised yet  → 'Storage not ready'
+ *  3. LS quota critical (>90%) → 'Storage quota risk'
+ *  4. No Stage 2 handoff       → 'Missing Stage 2 handoff'
+ *  5. null                     → allowed
+ */
+function getPerBuGenerationBlock(unit, readiness, idbReady, gen) {
+  if (gen?.running) return 'Generation already running'
+  if (!idbReady) return 'Storage not ready'
+  const diag = getStorageDiagnostics()
+  if (diag.initialized && diag.lsEstimatedQuotaPct > 90) return 'Storage quota risk'
+  if (!readiness || readiness.completion === 'none') return 'Missing Stage 2 handoff'
+  return null
 }
 
 function logExecutiveBoundary(unit, label, value) {
@@ -2540,6 +2555,60 @@ function Stage3BuGenerationProgress({ progress }) {
   )
 }
 
+// ── Storage health indicator ──────────────────────────────────────────────────
+// Compact, dev-facing panel that shows IDB readiness, plan migration status,
+// PM draft persistence, and whether large artifacts have left localStorage.
+
+function StorageStatusIndicator({ idbReady, stage3DraftPlans }) {
+  const [diag, setDiag] = useState(null)
+  useEffect(() => {
+    storageReady().then(() => setDiag(getStorageDiagnostics())).catch(() => {})
+  }, [idbReady])
+
+  const pmDraft          = stage3DraftPlans?.['Product Management']
+  const pmPersisted      = !!(pmDraft?.persistedAt)
+  const activePlanInIdb  = !!(diag?.idbCachedKeys?.some(k => k.startsWith('bsp_plan_v1_')))
+  const lsWritesBlocked  = !!(diag?.lsPointerKeys?.some(k =>
+    k.startsWith('bsp_v1_stage3_') || k.startsWith('bsp_v1_handoff_')
+  ))
+
+  function Row({ label, ok, okText = 'yes', failText = 'no' }) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+        <span style={{ color: ok ? '#00e5b4' : '#f87171', fontSize: 8, lineHeight: 1 }}>●</span>
+        <span style={{ fontSize: 8, color: 'var(--muted)', fontFamily: 'var(--fm)', flex: 1 }}>{label}</span>
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: ok ? '#00e5b4' : '#f87171' }}>{ok ? okText : failText}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{
+      background: 'var(--s2)',
+      border: '1px solid var(--border)',
+      borderRadius: 5,
+      padding: '8px 10px',
+      marginBottom: 8,
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 4,
+    }}>
+      <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--muted2)', marginBottom: 2, letterSpacing: '.04em' }}>
+        Storage Health
+      </div>
+      <Row label="IndexedDB ready"           ok={idbReady}       okText="ready"              failText="not ready" />
+      <Row label="Active plan in IDB"         ok={activePlanInIdb} />
+      <Row label="PM draft persisted"         ok={pmPersisted} />
+      <Row label="LS large writes blocked"    ok={lsWritesBlocked} okText="yes (IDB used)"   failText="no (migration pending)" />
+      {diag && (
+        <div style={{ fontSize: 7, color: 'var(--muted)', marginTop: 2, fontFamily: 'var(--fm)' }}>
+          LS quota ~{diag.lsEstimatedQuotaPct ?? '?'}% · IDB cache {diag.idbCacheSize ?? 0} keys
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Stage3ReadinessPanels({
   rows,
   planDrafts,
@@ -2555,6 +2624,7 @@ function Stage3ReadinessPanels({
   captureImportRef = null,
   captureImportStatus = null,
   onCaptureImport = null,
+  idbReady = false,
 }) {
   const [open, setOpen] = useState({})
   const completedCount = rows.filter(row => planDrafts[row.unit.name]?.plan).length
@@ -2599,6 +2669,8 @@ function Stage3ReadinessPanels({
         </div>
       </div>
 
+      <StorageStatusIndicator idbReady={idbReady} stage3DraftPlans={planDrafts} />
+
       {rows.map((row, idx) => {
         const unit = row.unit
         const readiness = row.readiness
@@ -2606,13 +2678,13 @@ function Stage3ReadinessPanels({
         const legacyPlan = legacyExecutionPlans.find(plan => plan?.buName === unit.name || plan?.businessUnitName === unit.name)
         const gen = planGeneration[unit.name]
         const isExecutiveFixtureMode = isExecutiveTraceUnit(unit)
-        const isPilotUnit = isStage3PilotUnit(unit)
         const isOpen = open[unit.name] ?? idx === 0
         const hasPlan = !!draft?.plan
         const lifecycleState = gen?.lifecycleState || draft?.lifecycle?.status || LIFECYCLE_STATES.NOT_STARTED
-        const hasRetryableAtoms = isPilotUnit && (draft?.executionAtoms || []).some(atom => (
+        const hasRetryableAtoms = (draft?.executionAtoms || []).some(atom => (
           STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status) && atom?.status !== ATOM_STATUSES.COMPLETE
         ))
+        const blockReason = getPerBuGenerationBlock(unit, readiness, idbReady, gen)
         const executionStatus = gen?.persistError
           ? 'not persisted'
           : gen?.error && lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED
@@ -2638,16 +2710,16 @@ function Stage3ReadinessPanels({
               ? 'ready'
               : 'partial'
         const mode = modeFor(readiness, !!draftOptIns[unit.name])
-        const ctaLabel = !isPilotUnit
-          ? 'Locked during PM pilot'
+        const ctaLabel = blockReason
+          ? `Blocked: ${blockReason}`
           : hasRetryableAtoms || lifecycleState === LIFECYCLE_STATES.PARTIAL_DRAFT
             ? 'Retry failed sections'
             : lifecycleState === LIFECYCLE_STATES.DRAFT_GENERATED
-              ? 'Regenerate Product Management'
+              ? `Regenerate ${unit.name}`
               : lifecycleState === LIFECYCLE_STATES.ACCEPTED
                 ? 'Accepted'
-            : mode.cta
-        const actionEnabled = isPilotUnit && mode.enabled && lifecycleState !== LIFECYCLE_STATES.ACCEPTED
+              : mode.cta
+        const actionEnabled = !blockReason && mode.enabled && lifecycleState !== LIFECYCLE_STATES.ACCEPTED
         const handoffItems = readiness.structureItems.map(item => {
           const match = readiness.itemStates.find(state => state.key === item.key || state.key === String(readiness.structureItems.indexOf(item)))
           return { ...item, ...(match || {}) }
@@ -2733,30 +2805,27 @@ function Stage3ReadinessPanels({
                   <div style={{ border: '1px solid var(--border)', borderRadius: 6, padding: '10px 11px', background: 'var(--s2)' }}>
                     <SectionLabel>Generate</SectionLabel>
                     <div style={{ marginBottom: 8 }}>
-                      <Badge color={mode.color}>{mode.label}</Badge>
+                      <Badge color={blockReason ? '#f87171' : mode.color}>
+                        {blockReason ? 'blocked' : mode.label}
+                      </Badge>
                       {isExecutiveFixtureMode && USE_STAGE3_EXECUTIVE_FIXTURE && (
                         <span style={{ marginLeft: 6 }}>
                           <Badge color="#3b82f6">dev fixture</Badge>
                         </span>
                       )}
-                      {!isPilotUnit && (
-                        <span style={{ marginLeft: 6 }}>
-                          <Badge color="var(--muted)">pilot locked</Badge>
-                        </span>
-                      )}
                     </div>
-                    <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55, marginBottom: 9 }}>
-                      {!isPilotUnit
-                        ? `Stage 3 generation is locked to ${STAGE3_PILOT_BU_NAME} until the lifecycle is proven.`
+                    <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: blockReason ? '#f87171' : 'var(--muted)', lineHeight: 1.55, marginBottom: 9 }}>
+                      {blockReason
+                        ? `Blocked: ${blockReason}. Resolve this before generating ${unit.name}.`
                         : readiness.completion === 'full'
-                          ? 'Generating one BU only: Product Management. Existing valid atoms will be skipped; failed/missing/stale atoms only will run.'
+                          ? `${unit.name}: existing valid atoms will be skipped; failed/missing/stale atoms only will run.`
                           : readiness.completion === 'none'
-                            ? 'No Product Management handoff exists. Build the Stage 2 handoff before generating Stage 3.'
-                            : 'Retry mode is partial: only failed, missing, or stale Product Management atoms will run.'}
+                            ? `No ${unit.name} handoff exists. Build the Stage 2 handoff before generating Stage 3.`
+                            : `Retry mode: only failed, missing, or stale atoms for ${unit.name} will run.`}
                     </div>
                     <button
                       onClick={() => actionEnabled ? onGenerateBUPlan(unit, readiness) : onStage2Action(unit.name, null, 'review')}
-                      disabled={disabled || gen?.running || (!isExecutiveFixtureMode && readiness.completion === 'none' && !draftOptIns[unit.name] && mode.label !== 'Pending')}
+                      disabled={disabled || gen?.running || !!blockReason || (!isExecutiveFixtureMode && readiness.completion === 'none' && !draftOptIns[unit.name] && mode.label !== 'Pending')}
                       style={{
                         ...primaryButtonStyle,
                         marginTop: 6,
@@ -2767,13 +2836,13 @@ function Stage3ReadinessPanels({
                     >
                       {gen?.running ? (isExecutiveFixtureMode ? 'Loading fixture...' : 'Generating...') : ctaLabel}
                     </button>
-                    {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && isPilotUnit && (
+                    {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && !blockReason && (
                       <button
                         onClick={() => onGenerateBUPlan(unit, { ...readiness, acceptOnly: true })}
                         disabled={disabled || gen?.running}
                         style={{ ...secondaryButtonStyle, marginTop: 6 }}
                       >
-                        Accept Product Management draft
+                        Accept {unit.name} draft
                       </button>
                     )}
                     {(gen?.diagnostics || draft?.diagnostics) && (
@@ -2800,7 +2869,7 @@ function Stage3ReadinessPanels({
                         Mock mode active.
                       </div>
                     )}
-                    {isPilotUnit && (
+                    {onCaptureImport && (
                       <div style={{ marginTop: 9, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
                         <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 5, lineHeight: 1.45 }}>
                           Restore from DOM capture — import a <code>bsp-stage3-pm-runtime-capture.json</code> file to persist a captured draft without regenerating.
@@ -3510,6 +3579,8 @@ export default function Stage3View({
   const [buPlanGeneration, setBuPlanGeneration] = useState({})
   const [stage12DraftOptIns, setStage12DraftOptIns] = useState({})
   const [coordinationDraft, setCoordinationDraft] = useState(null)
+  // IDB readiness: true once storageReady() resolves; gates per-BU generation
+  const [idbReady, setIdbReady] = useState(false)
   const [coordinationGen, setCoordinationGen] = useState({ running: false, error: null })
   const [captureImportStatus, setCaptureImportStatus] = useState(null)
   const captureImportRef = useRef(null)
@@ -3568,27 +3639,43 @@ export default function Stage3View({
       setCoordinationDraft(null)
       return
     }
-    const hydrated = {}
-    for (const bu of stage2BUs) {
-      const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, bu.name)
-      const draft = readJsonStorage(key)
-      if (draft?.version === STAGE3_DRAFT_PLAN_VERSION && draft?.plan?.buName) {
-        hydrated[bu.name] = draft
-      } else {
-        const legacyDraft = findLegacyStage3DraftForBU(bu.name, key)
-        if (legacyDraft) hydrated[bu.name] = legacyDraft
+    let cancelled = false
+    storageReady().then(() => {
+      if (cancelled) return
+      const hydrated = {}
+      for (const bu of stage2BUs) {
+        const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, bu.name)
+        const draft = readJsonStorage(key)
+        if (draft?.version === STAGE3_DRAFT_PLAN_VERSION && draft?.plan?.buName) {
+          hydrated[bu.name] = draft
+        } else {
+          const legacyDraft = findLegacyStage3DraftForBU(bu.name, key)
+          if (legacyDraft) hydrated[bu.name] = legacyDraft
+        }
       }
-    }
-    setStage3DraftPlans(hydrated)
-    const recovered = {}
-    for (const draft of findAllLegacyStage3Drafts()) {
-      const name = draft?.businessUnitName || draft?.plan?.buName
-      if (name && !hydrated[name]) recovered[name] = draft
-    }
-    setLegacyStage3DraftPlans(recovered)
-    const coordination = readJsonStorage(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId))
-    setCoordinationDraft(coordination?.version === 1 ? coordination : null)
+      if (!cancelled) setStage3DraftPlans(hydrated)
+      const recovered = {}
+      for (const draft of findAllLegacyStage3Drafts()) {
+        const name = draft?.businessUnitName || draft?.plan?.buName
+        if (name && !hydrated[name]) recovered[name] = draft
+      }
+      if (!cancelled) setLegacyStage3DraftPlans(recovered)
+      const coordination = readJsonStorage(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId))
+      if (!cancelled) setCoordinationDraft(coordination?.version === 1 ? coordination : null)
+    }).catch(e => {
+      if (!cancelled) console.error('[Stage3] hydration failed', e)
+    })
+    return () => { cancelled = true }
   }, [effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, activeStage2Rev?.id])
+
+  // Resolve idbReady once the IDB cache initialises
+  useEffect(() => {
+    let active = true
+    storageReady()
+      .then(() => { if (active) setIdbReady(true) })
+      .catch(() => { if (active) setIdbReady(false) })
+    return () => { active = false }
+  }, [])
 
   function handleCaptureImport(file, unit) {
     if (!file) return
@@ -3601,11 +3688,15 @@ export default function Stage3View({
           return
         }
         const draft = buildCapturedStage3Draft(captureJson, unit.name)
-        // Write to runtime-computed canonical key if IDs are available
+        // Write to IDB (+ LS pointer). Run writes in parallel then update React state.
         const runtimeKey = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name)
-        if (runtimeKey) writeJsonStorage(runtimeKey, draft)
-        // Always write to the fallback key (the key that was live at capture time)
-        writeJsonStorage(CAPTURE_FALLBACK_KEY, draft)
+        Promise.all([
+          runtimeKey ? writeArtifact(runtimeKey, draft) : Promise.resolve(true),
+          writeArtifact(CAPTURE_FALLBACK_KEY, draft),
+        ]).then(([rOk, fbOk]) => {
+          if (rOk || fbOk) setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
+        }).catch(() => {})
+        // Optimistic UI update so the user sees the import immediately
         setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
         setCaptureImportStatus({
           ok: true,
@@ -3622,7 +3713,7 @@ export default function Stage3View({
   }
 
   function handleStage2HandoffAction(buName, itemKey, action) {
-    writeJsonStorage('bsp_v1_stage2_handoff_focus', {
+    writeJsonStorageSync('bsp_v1_stage2_handoff_focus', {
       workspaceId: effectiveWorkspaceId,
       businessUnitName: buName,
       itemKey,
@@ -3657,7 +3748,7 @@ export default function Stage3View({
     if (!activeStage1Rev || !activeStage2Rev || autoGenConsumedRef.current) return
     autoGenConsumedRef.current = true
     onAutoGenerateComplete?.()
-    setGenError(`All-BU Stage 3 generation is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven. Generate that BU from the readiness panel instead.`)
+    setGenError('Stage 3 all-BU generation is not yet enabled. Use the per-BU Generate buttons in the readiness panel below.')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shouldAutoGenerate])
 
@@ -3961,7 +4052,7 @@ export default function Stage3View({
   }), [generation, activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage3Revisions.length, onSaveRevision])
 
   // ── Unit-level refinement ───────────────────────────────────────────────────
-  function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = [], lifecycle = {}, diagnostics = null, progress = null) {
+  async function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = [], lifecycle = {}, diagnostics = null, progress = null) {
     const now = new Date().toISOString()
     const atomSummary = summarizeAtoms(executionAtoms)
     const derivedStatus = lifecycle.status || deriveLifecycleState({ atoms: executionAtoms })
@@ -4016,7 +4107,7 @@ export default function Stage3View({
       lastSavedAt: now,
     }
     const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name)
-    const writeOk = writeJsonStorage(key, draft)
+    const writeOk = await writeArtifact(key, draft)
     logExecutiveBoundary(unit, 'H. persistedStage3State', { key, writeOk, status: derivedStatus, atomSummary })
     if (writeOk) {
       setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
@@ -4026,9 +4117,8 @@ export default function Stage3View({
 
   async function handleGenerateBUPlan(unit, readiness) {
     if (!activeStage1Rev || !activeStage2Rev) return { error: 'No active upstream revisions.' }
-    if (!isStage3PilotUnit(unit)) {
-      return { error: `Stage 3 generation is locked to ${STAGE3_PILOT_BU_NAME} until the pilot lifecycle is proven.` }
-    }
+    const blockReason = getPerBuGenerationBlock(unit, readiness, idbReady, buPlanGeneration[unit.name])
+    if (blockReason) return { error: `Generation blocked: ${blockReason}` }
     const s1Snap = activeStage1Rev.contentSnapshot
     const enrichedUnit = { ...unit, stage3PlanningContext: readiness.planningContext }
     const otherNames = orderedStage2BUs.filter(u => u.name !== unit.name).map(u => u.name).join(', ')
@@ -4059,9 +4149,9 @@ export default function Stage3View({
       const priorDraft = stage3DraftPlans[unit.name] || null
       if (readiness.acceptOnly) {
         if (priorDraft?.lifecycle?.status !== LIFECYCLE_STATES.DRAFT_GENERATED || !priorDraft?.plan) {
-          throw new Error('No validated Product Management draft is ready to accept.')
+          throw new Error(`No validated ${unit.name} draft is ready to accept.`)
         }
-        persistBuPlanDraft(
+        await persistBuPlanDraft(
           unit,
           priorDraft.plan,
           readiness,
@@ -4092,7 +4182,7 @@ export default function Stage3View({
       logExecutiveBoundary(unit, 'C2. executionAtoms', atoms)
 
       if (!hasApiKey()) {
-        throw new Error('Anthropic API key is required for Product Management Stage 3 generation. Mock placeholder output is disabled for this pilot.')
+        throw new Error(`Anthropic API key is required for Stage 3 generation. Add VITE_ANTHROPIC_API_KEY to your environment.`)
       }
 
       const runnableAtoms = atoms.filter(atom => STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status))
@@ -4135,7 +4225,7 @@ export default function Stage3View({
         retryFailedOnly: true,
         model: AI_MODEL_LABEL,
         retryMode,
-        onUpdate: ({ lifecycleState, atomLifecycleState, currentAtom, atoms: allAtoms, diagnostics }) => {
+        onUpdate: async ({ lifecycleState, atomLifecycleState, currentAtom, atoms: allAtoms, diagnostics }) => {
           const eligibleAtoms = renderingEligibleAtoms(allAtoms)
           const plan = eligibleAtoms.length ? assembleAtomizedBUPlan(unit, readiness, allAtoms, mode) : null
           const progress = buildStage3Progress({
@@ -4148,7 +4238,7 @@ export default function Stage3View({
             latestFailureReason: currentAtom?.parserError || null,
             latestUsage: diagnostics?.latestUsage || null,
           })
-          const { ok: midWriteOk } = persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms, { status: lifecycleState }, diagnostics, progress)
+          const { ok: midWriteOk } = await persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms, { status: lifecycleState }, diagnostics, progress)
           setBuPlanGeneration(prev => ({
             ...prev,
             [unit.name]: {
@@ -4264,7 +4354,7 @@ export default function Stage3View({
         latestUsage: lifecycleResult.diagnostics?.latestUsage || null,
       })
       // Persist BEFORE updating React state — if write fails, block safe render
-      const { ok: persistOk } = persistBuPlanDraft(unit, finalPlan, readiness, 'ai', updatedAtoms, { status: finalLifecycleState }, lifecycleResult.diagnostics, finalProgress)
+      const { ok: persistOk } = await persistBuPlanDraft(unit, finalPlan, readiness, 'ai', updatedAtoms, { status: finalLifecycleState }, lifecycleResult.diagnostics, finalProgress)
       const persistError = !persistOk ? 'Generated content was not persisted. Do not refresh.' : null
       setBuPlanGeneration(prev => ({
         ...prev,
@@ -4340,7 +4430,7 @@ export default function Stage3View({
         summaryNote,
         generatedAt: new Date().toISOString(),
       }
-      writeJsonStorage(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId), draft)
+      await writeArtifact(stage3CoordinationDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId), draft)
       setCoordinationDraft(draft)
       setCoordinationGen({ running: false, error: null })
       return { error: null }
@@ -4480,6 +4570,7 @@ export default function Stage3View({
           captureImportRef={captureImportRef}
           captureImportStatus={captureImportStatus}
           onCaptureImport={handleCaptureImport}
+          idbReady={idbReady}
         />
         <CoordinationReadinessPanel
           readiness={coordinationReadiness}
@@ -4510,7 +4601,7 @@ export default function Stage3View({
 
           <GenerateButton
             apiMode={apiMode} isGenerating={isGenerating} isRegenerate={false}
-            onGenerate={() => setGenError(`All-BU Stage 3 generation is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven.`)}
+            onGenerate={() => setGenError('All-BU Stage 3 generation is not yet enabled. Use the per-BU Generate buttons in the readiness panel below.')}
             disabled large
           />
           <div style={{ marginTop: 10 }}>
@@ -4609,7 +4700,7 @@ export default function Stage3View({
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
           <GenerateButton
             apiMode={apiMode} isGenerating={isGenerating} isRegenerate
-            onGenerate={() => setGenError(`All-BU Stage 3 regeneration is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven.`)}
+            onGenerate={() => setGenError('All-BU Stage 3 regeneration is not yet enabled. Use the per-BU Generate buttons in the readiness panel below.')}
             disabled
           />
           <ApiModeStatus apiMode={apiMode} />
@@ -4654,11 +4745,11 @@ export default function Stage3View({
             </div>
             <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.6 }}>
               {staleReason} has changed since this Stage 3 was generated.
-              Product Management can be regenerated from its BU row. All-BU regeneration is disabled during the Stage 3 pilot.
+              Regenerate individual BUs from the readiness panel below. All-BU regeneration is not yet enabled.
             </div>
           </div>
           <button
-            onClick={() => setGenError(`All-BU Stage 3 regeneration is disabled while ${STAGE3_PILOT_BU_NAME} lifecycle is being proven.`)}
+            onClick={() => setGenError('All-BU Stage 3 regeneration is not yet enabled. Use the per-BU Generate buttons in the readiness panel below.')}
             disabled
             style={{
               flexShrink: 0, fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
