@@ -80,6 +80,21 @@ const STAGE3_FIELD_ATOM_LABELS = {
   risks: 'Risks',
   validationSignals: 'Validation Signals',
 }
+// Cross-cutting spine themes — content that belongs at the BU level (stated once)
+// rather than re-derived independently in each execution section.
+const SPINE_THEME_PATTERNS = [
+  { key: 'build-vs-partner',       label: 'Build-vs-partner decision',                   re: /build[\s-]versus[\s-]partner|build[\s-]vs[\s-]partner|complete.*partner.*evaluation.*decision.*matrix|partner evaluation decision matrix/i },
+  { key: 'api-bandwidth',          label: 'API Engineering bandwidth constraint',         re: /api.*engineering.*bandwidth|api.*team.*bandwidth|api.*bandwidth.*active.*client.*delivery/i },
+  { key: 'dual-track',             label: 'Dual-track value streams',                    re: /client[\s-]operational.*examiner[\s-]facing|two distinct value stream|examiner[\s-]facing documentation.*second/i },
+  { key: 'modularity-spec',        label: 'Architectural modularity specification',       re: /architectural modularity spec|modularity specification.*extension point|extension points.*interface boundaries|interface boundaries.*extension points/i },
+  { key: 'pilot-validation-gate',  label: 'Pilot validation gate (live BSA/AML workflow)', re: /pilot validation.*live.*bsa|live.*bsa.*aml.*workflow.*before.*broader|bsa.*aml.*workflow.*before.*rollout/i },
+  { key: 'scope-boundary',         label: 'Scope boundary / no hard regulatory deadline', re: /scope.{0,20}boundary.{0,20}definit|scope creep.{0,25}criteria|absence of a hard regulatory deadline|no hard regulatory deadline/i },
+  { key: 'compliance-context',     label: 'Compliance & MRG provides context (not dictate)', re: /compliance.*model risk.*(?:regulatory context|documentation standard).*(?:before|cannot|without|architecture)/i },
+  { key: 'exec-final-authority',   label: 'Executive Leadership final authority',         re: /executive leadership.*(?:holds )?final authority|executive.*strategic governance.*(?:holds )?final authority/i },
+  { key: 'partner-vendor-ownership', label: 'Partner & Vendor ecosystem ownership',      re: /partner.*vendor ecosystem.*(?:owns|own|vendor shortlist|integration governance)/i },
+  { key: 'mcd-feedback',           label: 'Managed Client Delivery workflow feedback',   re: /managed client delivery.*structured feedback.*bsa|managed client delivery.*(?:provide|provides).*feedback.*bsa.*aml/i },
+]
+
 const EXECUTIVE_TRACE_PATTERN = /executive leadership|strategic governance|executive/i
 const DEBUG_STAGE3_TRACE = import.meta.env?.VITE_STAGE3_TRACE === 'true'
 const USE_STAGE3_EXECUTIVE_FIXTURE = import.meta.env?.VITE_USE_STAGE3_FIXTURE === 'true'
@@ -2606,102 +2621,135 @@ function StorageStatusIndicator({ idbReady, stage3DraftPlans }) {
 
 // ── Duplicate audit ───────────────────────────────────────────────────────────
 // Dev-visible cross-layer duplicate detector. Surfaces exact-duplicate text
-// that appears in more than one content layer (handoff brief / execution draft /
-// PlanCard flat fields). Reports canonical location and redundant locations.
+// that appears in more than one section. Uses semantic fingerprinting (Jaccard
+// similarity on content word n-grams) rather than exact-line matching, so it
+// catches concept-level duplication even when wording differs across sections.
 
-function extractTextLines(value) {
-  if (!value) return []
-  if (typeof value === 'string') return value.split(/\n+/).map(s => s.trim()).filter(s => s.length > 20)
-  if (Array.isArray(value)) return value.flatMap(v => extractTextLines(v))
-  if (typeof value === 'object') return Object.values(value).flatMap(v => extractTextLines(v))
-  return []
+// ── Semantic duplicate helpers ────────────────────────────────────────────────
+
+// Common stopwords to ignore when fingerprinting bullets
+const AUDIT_STOPWORDS = new Set(
+  'a an the and or but in on at to for of with from by is are was were be been being have has had do does did will would could should may might shall must that this these those it its they their them we our us i my you your which who what when where how'.split(' ')
+)
+
+/**
+ * Extract significant content words from a string for fingerprinting.
+ * Returns a Set of lowercased words (length > 3, non-stopword) plus common bigrams.
+ */
+function semanticFingerprint(text) {
+  const words = String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !AUDIT_STOPWORDS.has(w))
+  const bigrams = []
+  for (let i = 0; i < words.length - 1; i++) {
+    bigrams.push(words[i] + '_' + words[i + 1])
+  }
+  return new Set([...words, ...bigrams])
 }
+
+/** Jaccard similarity between two fingerprint Sets. */
+function jaccardSim(a, b) {
+  if (!a.size || !b.size) return 0
+  let inter = 0
+  for (const w of a) if (b.has(w)) inter++
+  return inter / (a.size + b.size - inter)
+}
+
+/**
+ * Extract individual bullet/sentence items from an atom's parsedValue,
+ * keeping provenance (sectionName, fieldKey).
+ */
+function atomsToBullets(atoms) {
+  const bullets = []
+  ;(atoms || []).forEach(atom => {
+    const sn = atom.metadata?.sectionName || atom.elementName || atom.id || '?'
+    const fk = atom.metadata?.fieldKey || atom.childKey || '?'
+    const val = atom.parsedValue
+    const items = Array.isArray(val) ? val : [String(val || '')]
+    items.forEach(item => {
+      const t = String(item || '').replace(/\s+/g, ' ').trim()
+      if (t.length > 40) bullets.push({ section: sn, field: fk, text: t })
+    })
+  })
+  return bullets
+}
+
+/**
+ * Find cross-section semantic duplicates in a list of bullets.
+ * Returns pairs with similarity above the threshold, deduplicated by concept cluster.
+ */
+function findSemanticDuplicates(bullets, threshold = 0.42) {
+  const fps = bullets.map(b => ({ ...b, fp: semanticFingerprint(b.text) }))
+  const pairs = []
+  const seen = new Set()
+
+  for (let i = 0; i < fps.length; i++) {
+    for (let j = i + 1; j < fps.length; j++) {
+      if (fps[i].section === fps[j].section) continue
+      const sim = jaccardSim(fps[i].fp, fps[j].fp)
+      if (sim < threshold) continue
+      // Deduplicate by concept: use the shorter text as the cluster key
+      const clusterKey = (fps[i].text.length <= fps[j].text.length ? fps[i].text : fps[j].text).slice(0, 80).toLowerCase()
+      if (seen.has(clusterKey)) continue
+      seen.add(clusterKey)
+      pairs.push({ sim, a: fps[i], b: fps[j] })
+    }
+  }
+  return pairs.sort((x, y) => y.sim - x.sim)
+}
+
+// ── Duplicate audit component ─────────────────────────────────────────────────
 
 function Stage3DuplicateAudit({ draft, legacyPlan, handoffBrief }) {
   const [open, setOpen] = React.useState(false)
 
   const findings = React.useMemo(() => {
-    const layers = []
-
-    // Layer 1: handoff brief
-    if (handoffBrief) {
-      const briefLines = [
-        ...extractTextLines(handoffBrief.planningPurpose),
-        ...extractTextLines(handoffBrief.decisionBasisSummary),
-        ...extractTextLines(handoffBrief.keyImplications),
-        ...extractTextLines(handoffBrief.executionConstraints),
-        ...extractTextLines(handoffBrief.dependencies),
-        ...extractTextLines(handoffBrief.risksOrContradictions),
-        ...extractTextLines(handoffBrief.unresolvedQuestions),
-      ]
-      layers.push({ name: 'Handoff Brief', lines: briefLines })
-    }
-
-    // Layer 2: execution draft atoms
+    // Build bullet corpus from execution atoms (primary source)
     const resolved = resolveExecutionDraftSource(draft, legacyPlan)
     const atoms = resolved.atoms || []
-    const atomLines = atoms.flatMap(atom => extractTextLines(atom.parsedValue))
-    layers.push({ name: 'Execution Draft', lines: atomLines })
+    const atomBullets = atomsToBullets(atoms)
 
-    // Layer 3: PlanCard flat fields (from assembleAtomizedBUPlan output)
-    const plan = draft?.plan || legacyPlan
-    if (plan) {
-      const flatFields = [
-        plan.priorityOutcomes,
-        plan.initiativesMissionCritical,
-        plan.initiativesOptional,
-        plan.initiativesDeferred,
-        plan.initiativesBlocked,
-        plan.keyMilestones,
-        plan.crossFunctionalDependencies,
-        plan.requiredCapabilities,
-        plan.staffingOwnership,
-        plan.systemsTools,
-        plan.governanceCadence,
-        plan.decisionRights,
-        plan.risks,
-        plan.constraints,
-        plan.unresolvedUnknowns,
-        plan.leadingIndicators,
-        plan.keySuccessMetrics,
-        plan.failureSignals,
-        plan.assumptions,
-      ]
-      const planCardLines = flatFields.flatMap(f => extractTextLines(f))
-      layers.push({ name: 'PlanCard Flat Fields', lines: planCardLines })
+    // Include handoff brief bullets as a separate provenance layer
+    const briefBullets = []
+    if (handoffBrief) {
+      const briefFields = {
+        'planning purpose': handoffBrief.planningPurpose,
+        'decision basis':   handoffBrief.decisionBasisSummary,
+        'key implications': handoffBrief.keyImplications,
+        'constraints':      handoffBrief.executionConstraints,
+        'dependencies':     handoffBrief.dependencies,
+        'risks':            handoffBrief.risksOrContradictions,
+        'open questions':   handoffBrief.unresolvedQuestions,
+      }
+      Object.entries(briefFields).forEach(([fk, val]) => {
+        const items = Array.isArray(val) ? val : [String(val || '')]
+        items.forEach(item => {
+          const t = String(item || '').replace(/\s+/g, ' ').trim()
+          if (t.length > 40) briefBullets.push({ section: 'Handoff Brief', field: fk, text: t })
+        })
+      })
     }
 
-    // Find duplicates: any line appearing in 2+ layers
-    const lineMap = new Map() // line → [{ layerName, layerIdx }]
-    layers.forEach(({ name, lines }, layerIdx) => {
-      const seen = new Set()
-      lines.forEach(line => {
-        const key = line.toLowerCase().replace(/\s+/g, ' ').trim()
-        if (key.length < 25) return  // skip very short lines
-        if (seen.has(key)) return
-        seen.add(key)
-        if (!lineMap.has(key)) lineMap.set(key, [])
-        lineMap.get(key).push({ layerName: name, layerIdx, original: line })
-      })
+    const allBullets = [...atomBullets, ...briefBullets]
+    const pairs = findSemanticDuplicates(allBullets)
+
+    // Compute section-level stats
+    const sectionCounts = {}
+    atomBullets.forEach(b => {
+      sectionCounts[b.section] = (sectionCounts[b.section] || 0) + 1
     })
 
-    const duplicates = []
-    for (const [, occurrences] of lineMap) {
-      if (occurrences.length < 2) continue
-      duplicates.push({
-        text: occurrences[0].original,
-        canonical: occurrences[0].layerName,
-        repeated: occurrences.slice(1).map(o => o.layerName),
-      })
-    }
-    return { duplicates, layerLineCounts: layers.map(l => ({ name: l.name, count: l.lines.length })) }
+    return { pairs, sectionCounts, totalBullets: allBullets.length }
   }, [draft, legacyPlan, handoffBrief])
 
-  const dupCount = findings.duplicates.length
-  const color = dupCount === 0 ? '#00e5b4' : dupCount < 5 ? '#fb923c' : '#f87171'
+  const dupCount = findings.pairs.length
+  const color = dupCount === 0 ? '#00e5b4' : dupCount < 4 ? '#fb923c' : '#f87171'
+  const sectionNames = Object.keys(findings.sectionCounts)
 
   return (
-    <div style={{ marginTop: 12, border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
+    <div style={{ marginTop: 10, border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
       <div
         onClick={() => setOpen(o => !o)}
         style={{
@@ -2709,10 +2757,11 @@ function Stage3DuplicateAudit({ draft, legacyPlan, handoffBrief }) {
           padding: '7px 10px', background: 'var(--s2)',
         }}
       >
-        <Badge color={color} small>{dupCount} dup{dupCount !== 1 ? 's' : ''} detected</Badge>
+        <Badge color={color} small>
+          {dupCount} semantic dup{dupCount !== 1 ? 's' : ''}
+        </Badge>
         <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', flex: 1 }}>
-          Content Ownership Audit
-          {findings.layerLineCounts.map(l => ` · ${l.name}: ${l.count}`).join('')}
+          Semantic Ownership Audit · {findings.totalBullets} bullets · {sectionNames.length} sections
         </span>
         <span style={{ fontSize: 8, color: 'var(--muted)' }}>{open ? '▲' : '▼'}</span>
       </div>
@@ -2720,27 +2769,37 @@ function Stage3DuplicateAudit({ draft, legacyPlan, handoffBrief }) {
         <div style={{ padding: '10px 12px', background: 'var(--surface)' }}>
           {dupCount === 0 ? (
             <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#00e5b4' }}>
-              No cross-layer duplicates detected.
+              No cross-section semantic duplicates detected above threshold.
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {findings.duplicates.map((dup, i) => (
-                <div key={i} style={{
-                  background: 'var(--s2)', border: '1px solid rgba(248,113,113,.25)',
-                  borderRadius: 4, padding: '7px 9px',
-                }}>
-                  <div style={{ display: 'flex', gap: 6, marginBottom: 4, flexWrap: 'wrap' }}>
-                    <Badge color="#00e5b4" small>canonical: {dup.canonical}</Badge>
-                    {dup.repeated.map((r, ri) => (
-                      <Badge key={ri} color="#f87171" small>duplicate in: {r}</Badge>
-                    ))}
+            <>
+              <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 8, lineHeight: 1.5 }}>
+                Bullets with Jaccard similarity &gt; 0.42 across different sections — same concept, different wording.
+                Canonical = first occurrence; repeated = later section re-deriving the same meaning.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {findings.pairs.map((p, i) => (
+                  <div key={i} style={{
+                    background: 'var(--s2)', border: '1px solid rgba(248,113,113,.22)',
+                    borderRadius: 4, padding: '8px 10px',
+                  }}>
+                    <div style={{ display: 'flex', gap: 5, marginBottom: 5, flexWrap: 'wrap', alignItems: 'center' }}>
+                      <Badge color="#94a3b8" small>sim {(p.sim * 100).toFixed(0)}%</Badge>
+                      <Badge color="#00e5b4" small>↑ {p.a.section.length > 28 ? p.a.section.slice(0, 25) + '…' : p.a.section} / {p.a.field}</Badge>
+                      <Badge color="#f87171" small>↓ {p.b.section.length > 28 ? p.b.section.slice(0, 25) + '…' : p.b.section} / {p.b.field}</Badge>
+                    </div>
+                    <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.55, marginBottom: 4 }}>
+                      <span style={{ color: '#00e5b4', opacity: .8 }}>↑ </span>
+                      {p.a.text.length > 180 ? p.a.text.slice(0, 177) + '…' : p.a.text}
+                    </div>
+                    <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.55 }}>
+                      <span style={{ color: '#f87171', opacity: .8 }}>↓ </span>
+                      {p.b.text.length > 180 ? p.b.text.slice(0, 177) + '…' : p.b.text}
+                    </div>
                   </div>
-                  <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.5 }}>
-                    "{dup.text.length > 120 ? dup.text.slice(0, 117) + '…' : dup.text}"
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            </>
           )}
         </div>
       )}
@@ -3071,15 +3130,7 @@ function Stage3ReadinessPanels({
                   </div>
                 )}
 
-                <Stage3ExecutionPlanDraft
-                  draft={draft}
-                  legacyPlan={legacyPlan}
-                />
-                <Stage3DuplicateAudit
-                  draft={draft}
-                  legacyPlan={legacyPlan}
-                  handoffBrief={readiness.handoffBrief || readiness.planningContext?.handoffBrief || null}
-                />
+                {/* Stage3ExecutionPlanDraft and Stage3DuplicateAudit have moved to PlanCard (section B) */}
               </div>
             )}
           </div>
@@ -3186,6 +3237,361 @@ const secondaryButtonStyle = {
   color: 'var(--muted)',
 }
 
+// ── Plan tree helpers ─────────────────────────────────────────────────────────
+
+function classifyBulletSpine(text) {
+  return SPINE_THEME_PATTERNS.filter(p => p.re.test(text))
+}
+
+function inferSectionMandate(atoms, sectionIdx) {
+  const objAtom = atoms.find(a => (a.metadata?.fieldKey || a.childKey) === 'objective')
+  const raw = String(objAtom?.parsedValue || '').replace(/\s+/g, ' ').trim()
+  if (!raw) return `Section ${sectionIdx}`
+  // Prefer text after em-dash (most sections include a specific phrase after '—')
+  const dashIdx = raw.indexOf(' — ')
+  if (dashIdx > 0) {
+    const after = raw.slice(dashIdx + 3).replace(/[,;]\s*$/, '').trim()
+    if (after.length > 10) return after.slice(0, 70)
+  }
+  // Strip generic preamble and take the first distinctive clause
+  const stripped = raw
+    .replace(/^(?:Define and (?:govern|sequence|build)\s+(?:a|the)\s+)?(?:modular,\s+)?(?:evolution-ready\s+)?BSA\/AML explainability capability (?:roadmap|build)(?:\s+as a modular,[\w\s-]+investment)?\s+(?:that\s+)?/i, '')
+  return stripped.slice(0, 70).replace(/[,;]\s*$/, '').trim() || `Section ${sectionIdx}`
+}
+
+/**
+ * Groups atoms by section, tags each bullet as spine/duplicate/unique,
+ * and computes per-section stats. Returns { spine, sections }.
+ */
+function buildPlanTree(atoms) {
+  const eligible = renderingEligibleAtoms(atoms)
+  if (!eligible.length) return { spine: [], sections: [] }
+
+  // ── 1. Group by section ────────────────────────────────────────────────────
+  const sectionMap = new Map()
+  eligible.forEach(atom => {
+    const sk = atom.metadata?.sectionKey || atom.elementName || atom.id
+    if (!sectionMap.has(sk)) {
+      sectionMap.set(sk, {
+        sectionKey: sk,
+        sectionName: atom.metadata?.sectionName || atom.elementName || sk,
+        sectionIndex: atom.metadata?.sectionIndex ?? sectionMap.size,
+        atoms: [],
+      })
+    }
+    sectionMap.get(sk).atoms.push(atom)
+  })
+  const rawSections = Array.from(sectionMap.values()).sort((a, b) => a.sectionIndex - b.sectionIndex)
+
+  // ── 2. Extract bullets from each section ───────────────────────────────────
+  const withBullets = rawSections.map(sec => {
+    const bullets = []
+    sec.atoms.forEach(atom => {
+      const fk = atom.metadata?.fieldKey || atom.childKey
+      const val = atom.parsedValue
+      const items = Array.isArray(val) ? val : (val ? [String(val)] : [])
+      items.forEach(item => {
+        const t = String(item).replace(/\s+/g, ' ').trim()
+        if (t.length > 30) bullets.push({ text: t, fieldKey: fk, spineThemes: classifyBulletSpine(t) })
+      })
+    })
+    return { ...sec, bullets }
+  })
+
+  // ── 3. Cross-section Jaccard duplicate detection ───────────────────────────
+  let gi = 0
+  const flat = withBullets.flatMap(sec =>
+    sec.bullets.map(b => ({ ...b, sectionKey: sec.sectionKey, gi: gi++, fp: semanticFingerprint(b.text) }))
+  )
+  const bulletDups = new Map() // gi → Set<sectionKey>
+  for (let i = 0; i < flat.length; i++) {
+    for (let j = i + 1; j < flat.length; j++) {
+      if (flat[i].sectionKey === flat[j].sectionKey) continue
+      if (jaccardSim(flat[i].fp, flat[j].fp) < 0.42) continue
+      if (!bulletDups.has(flat[i].gi)) bulletDups.set(flat[i].gi, new Set())
+      if (!bulletDups.has(flat[j].gi)) bulletDups.set(flat[j].gi, new Set())
+      bulletDups.get(flat[i].gi).add(flat[j].sectionKey)
+      bulletDups.get(flat[j].gi).add(flat[i].sectionKey)
+    }
+  }
+
+  // ── 4. Tag bullets + build per-section stats ───────────────────────────────
+  let flatIdx = 0
+  const sections = withBullets.map(sec => {
+    const tagged = sec.bullets.map(b => {
+      const dups = bulletDups.get(flatIdx++) || new Set()
+      const isSpine = b.spineThemes.length > 0
+      const isDup   = dups.size > 0 && !isSpine
+      const isUniq  = dups.size === 0 && !isSpine
+      return { ...b, dupSections: [...dups], isSpine, isDup, isUnique: isUniq }
+    })
+
+    const total     = tagged.length
+    const spineRefs = tagged.filter(b => b.isSpine).length
+    const semDups   = tagged.filter(b => b.isDup).length
+    const unique    = tagged.filter(b => b.isUnique).length
+    const ratio     = total > 0 ? unique / total : 0
+    const uniqueScore = ratio > 0.4 ? 'high' : ratio > 0.2 ? 'medium' : 'low'
+
+    // Field map: { fieldKey → [taggedBullets] }
+    const fieldMap = Object.fromEntries(STAGE3_FIELD_ATOM_KEYS.map(k => [k, []]))
+    tagged.forEach(b => { if (fieldMap[b.fieldKey]) fieldMap[b.fieldKey].push(b) })
+
+    // Unique contribution: first 2 unique bullets from risks, then any other field
+    const uniq = tagged.filter(b => b.isUnique)
+    const best = [...uniq.filter(b => b.fieldKey === 'risks'), ...uniq.filter(b => b.fieldKey !== 'risks')]
+    const uniqueContrib = best.slice(0, 2).map(b => b.text.slice(0, 95)).join(' · ')
+      || '(no unique content detected — all bullets match spine themes or other sections)'
+
+    return {
+      ...sec,
+      mandate: inferSectionMandate(sec.atoms, sec.sectionIndex),
+      taggedBullets: tagged,
+      fieldMap,
+      stats: { total, spineRefs, semDups, unique, uniqueScore },
+      uniqueContrib,
+    }
+  })
+
+  // ── 5. Aggregate shared spine ──────────────────────────────────────────────
+  const spineAgg = {}
+  sections.forEach(sec =>
+    sec.taggedBullets.forEach(b =>
+      b.spineThemes.forEach(t => {
+        if (!spineAgg[t.key]) spineAgg[t.key] = { theme: t, sectionKeys: new Set() }
+        spineAgg[t.key].sectionKeys.add(sec.sectionKey)
+      })
+    )
+  )
+  const spine = Object.values(spineAgg)
+    .filter(e => e.sectionKeys.size >= 2)
+    .map(e => ({ ...e.theme, sectionCount: e.sectionKeys.size }))
+    .sort((a, b) => b.sectionCount - a.sectionCount)
+
+  return { spine, sections }
+}
+
+// ── Stage3BUPlanTree — navigable tree hierarchy for one BU's execution plan ──
+
+function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief }) {
+  const [openSections, setOpenSections] = useState({ 0: true })
+  const [openFields,   setOpenFields]   = useState({})
+  const [spineOpen,    setSpineOpen]    = useState(false)
+
+  const tree = React.useMemo(() => {
+    const resolved = resolveExecutionDraftSource(draft, legacyPlan)
+    if (!resolved.atoms?.length) return null
+    return buildPlanTree(resolved.atoms)
+  }, [draft, legacyPlan])
+
+  if (!tree || !tree.sections.length) {
+    return (
+      <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic', marginTop: 10, marginBottom: 12 }}>
+        No execution plan draft — generate or import a plan to see the section hierarchy.
+      </div>
+    )
+  }
+
+  const { spine, sections } = tree
+  const totals = sections.reduce(
+    (acc, s) => ({
+      total:     acc.total     + s.stats.total,
+      spineRefs: acc.spineRefs + s.stats.spineRefs,
+      semDups:   acc.semDups   + s.stats.semDups,
+      unique:    acc.unique    + s.stats.unique,
+    }),
+    { total: 0, spineRefs: 0, semDups: 0, unique: 0 }
+  )
+
+  const scoreColor = s => s === 'high' ? '#00e5b4' : s === 'medium' ? '#fb923c' : '#f87171'
+  const toggleSection = idx => setOpenSections(p => ({ ...p, [idx]: !p[idx] }))
+  const toggleField   = (sk, fk) => setOpenFields(p => ({ ...p, [`${sk}:${fk}`]: !p[`${sk}:${fk}`] }))
+
+  return (
+    <div style={{ marginTop: 12, marginBottom: 12 }}>
+
+      {/* ── Summary bar ──────────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 }}>
+        <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em' }}>
+          Execution Plan · {sections.length} sections · {totals.total} bullets
+        </span>
+        <Badge color="#00e5b4" small>{totals.unique} unique</Badge>
+        <Badge color="#3b82f6" small>{totals.spineRefs} spine refs</Badge>
+        <Badge color="#fb923c" small>{totals.semDups} sem dups</Badge>
+      </div>
+
+      {/* ── Shared spine panel ───────────────────────────────────────────────── */}
+      {spine.length > 0 && (
+        <div style={{ marginBottom: 8, border: '1px solid rgba(59,130,246,.28)', borderRadius: 5, overflow: 'hidden' }}>
+          <div
+            onClick={() => setSpineOpen(o => !o)}
+            style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '7px 10px', background: 'rgba(59,130,246,.07)' }}
+          >
+            <span style={{ fontSize: 9, fontWeight: 700, color: '#3b82f6', flexShrink: 0 }}>Shared Plan Spine</span>
+            <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', flex: 1 }}>
+              {spine.length} cross-cutting themes present in 2+ sections — should be stated once, referenced elsewhere
+            </span>
+            <span style={{ fontSize: 8, color: 'var(--muted)' }}>{spineOpen ? '▲' : '▼'}</span>
+          </div>
+          {spineOpen && (
+            <div style={{ padding: '9px 11px', background: 'var(--surface)' }}>
+              <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 7, lineHeight: 1.55 }}>
+                Blue dot = spine theme. Sections that re-derive a spine theme instead of referencing it produce the observed duplication.
+                The section that first introduces each theme should become its canonical owner.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                {spine.map(t => (
+                  <div key={t.key} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <Badge color="#3b82f6" small>{t.sectionCount}/{sections.length} sections</Badge>
+                    <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)' }}>{t.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Section rows ─────────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        {sections.map((sec, idx) => {
+          const isOpen = !!openSections[idx]
+          const { stats } = sec
+          const uc = scoreColor(stats.uniqueScore)
+
+          return (
+            <div key={sec.sectionKey} style={{ border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
+
+              {/* Section header */}
+              <div
+                onClick={() => toggleSection(idx)}
+                style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer',
+                  padding: '8px 10px',
+                  background: isOpen ? 'var(--surface)' : 'var(--s2)',
+                  borderBottom: isOpen ? '1px solid var(--border)' : 'none',
+                }}
+              >
+                {/* Index badge colored by uniqueness */}
+                <span style={{
+                  flexShrink: 0, width: 20, height: 20, borderRadius: 3, marginTop: 1,
+                  background: `${uc}15`, border: `1px solid ${uc}35`,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700, color: uc,
+                }}>
+                  {idx}
+                </span>
+
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 2 }}>Section {idx}</div>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text)', marginBottom: 4, lineHeight: 1.35 }}>
+                    {sec.mandate}
+                  </div>
+                  <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                    <Badge color={uc} small>{stats.uniqueScore} · {stats.unique}/{stats.total} unique</Badge>
+                    {stats.spineRefs > 0 && <Badge color="#3b82f6" small>{stats.spineRefs} spine refs</Badge>}
+                    {stats.semDups   > 0 && <Badge color="#fb923c" small>{stats.semDups} sem dups</Badge>}
+                  </div>
+                </div>
+                <span style={{ fontSize: 8, color: 'var(--muted)', flexShrink: 0, marginTop: 4 }}>{isOpen ? '▲' : '▼'}</span>
+              </div>
+
+              {/* Section body */}
+              {isOpen && (
+                <div style={{ padding: '10px 10px 6px' }}>
+
+                  {/* Unique contribution */}
+                  <div style={{
+                    marginBottom: 10, padding: '7px 9px',
+                    background: `${uc}08`, border: `1px solid ${uc}20`, borderRadius: 4,
+                  }}>
+                    <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 3 }}>
+                      Unique contribution
+                    </div>
+                    <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6 }}>
+                      {sec.uniqueContrib}
+                    </div>
+                  </div>
+
+                  {/* Field accordions */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {STAGE3_FIELD_ATOM_KEYS.map(fk => {
+                      const bullets = sec.fieldMap[fk] || []
+                      if (!bullets.length) return null
+                      const fOpen  = !!openFields[`${sec.sectionKey}:${fk}`]
+                      const fLabel = STAGE3_FIELD_ATOM_LABELS[fk] || fk
+                      const uC = bullets.filter(b => b.isUnique).length
+                      const sC = bullets.filter(b => b.isSpine).length
+                      const dC = bullets.filter(b => b.isDup).length
+
+                      return (
+                        <div key={fk}>
+                          <div
+                            onClick={() => toggleField(sec.sectionKey, fk)}
+                            style={{
+                              display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer',
+                              padding: '5px 8px', background: 'var(--s2)', border: '1px solid var(--border)',
+                              borderRadius: fOpen ? '4px 4px 0 0' : 4,
+                            }}
+                          >
+                            <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', flex: 1 }}>
+                              {fLabel}
+                            </span>
+                            <span style={{ display: 'flex', gap: 5, fontSize: 8, fontFamily: 'var(--fm)' }}>
+                              {uC > 0 && <span style={{ color: '#00e5b4' }}>{uC}u</span>}
+                              {sC > 0 && <span style={{ color: '#3b82f6' }}>{sC}s</span>}
+                              {dC > 0 && <span style={{ color: '#fb923c' }}>{dC}d</span>}
+                            </span>
+                            <span style={{ fontSize: 7, color: 'var(--muted)', flexShrink: 0 }}>{fOpen ? '▲' : '▼'}</span>
+                          </div>
+
+                          {fOpen && (
+                            <div style={{
+                              border: '1px solid var(--border)', borderTop: 'none',
+                              borderRadius: '0 0 4px 4px', padding: '8px 9px 4px',
+                              background: 'var(--surface)',
+                            }}>
+                              {bullets.map((b, bi) => {
+                                const dot = b.isSpine ? '#3b82f6' : b.isDup ? '#fb923c' : '#00e5b4'
+                                return (
+                                  <div key={bi} style={{ display: 'flex', gap: 7, marginBottom: 8, alignItems: 'flex-start' }}>
+                                    <span style={{ flexShrink: 0, width: 6, height: 6, borderRadius: '50%', background: dot, marginTop: 5 }} />
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                      <div style={{ fontSize: 9, color: 'var(--muted2)', lineHeight: 1.65, fontFamily: 'var(--fm)' }}>{b.text}</div>
+                                      {b.isSpine && b.spineThemes.length > 0 && (
+                                        <div style={{ marginTop: 3, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                                          {b.spineThemes.map(t => (
+                                            <Badge key={t.key} color="#3b82f6" small>spine: {t.label}</Badge>
+                                          ))}
+                                        </div>
+                                      )}
+                                      {b.isDup && b.dupSections.length > 0 && (
+                                        <div style={{ marginTop: 3 }}>
+                                          <Badge color="#fb923c" small>
+                                            dup in section{b.dupSections.length !== 1 ? 's' : ''} {b.dupSections.join(', ')}
+                                          </Badge>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function IndicatorStrip({ plan }) {
   const indicators = [
     { label: 'Exec Risk',   value: plan.executionRisk,           color: riskColor(plan.executionRisk)              },
@@ -3213,7 +3619,7 @@ function IndicatorStrip({ plan }) {
 
 // ── Execution plan card ───────────────────────────────────────────────────────
 
-function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
+function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy, draft = null, handoffBrief = null }) {
   const [open,         setOpen]         = useState(true)
   const [refineOpen,   setRefineOpen]   = useState(false)
   const [refinePrompt, setRefinePrompt] = useState('')
@@ -3365,6 +3771,9 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy }) {
               )}
             </div>
           </PlanSection>
+
+          {/* Execution Plan — navigable section tree with spine detection */}
+          <Stage3BUPlanTree draft={draft} legacyPlan={plan} handoffBrief={handoffBrief} />
 
           {/* Readiness assessment */}
           {plan.readinessAssessment && (
@@ -4555,6 +4964,9 @@ export default function Stage3View({
   if (stage3Revisions.length === 0) {
     return (
       <div style={{ maxWidth: 840, padding: '0 16px 40px' }}>
+        <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+          D · BU Readiness &amp; Generation
+        </div>
         <Stage3ReadinessPanels
           rows={readinessRows}
           planDrafts={stage3DraftPlans}
@@ -4572,6 +4984,9 @@ export default function Stage3View({
           onCaptureImport={handleCaptureImport}
           idbReady={idbReady}
         />
+        <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+          C · Cross-BU Coordination
+        </div>
         <CoordinationReadinessPanel
           readiness={coordinationReadiness}
           coordinationDraft={coordinationDraft}
@@ -4586,7 +5001,7 @@ export default function Stage3View({
           <div style={{ fontSize: 24, opacity: .15, marginBottom: 16, lineHeight: 1 }}>▦</div>
           <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Execution Planning</div>
           <div style={{ fontSize: 11, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.7, maxWidth: 460, margin: '0 auto 24px' }}>
-            All-BU Stage 3 generation is disabled while the Product Management lifecycle is being proven. Use the Product Management row above to generate one BU only.
+            Generate execution plans for each business unit using the per-BU Generate buttons in the readiness panel above. When at least two BU plans are ready, generate coordination synthesis.
           </div>
 
           {(!activeStage1Rev || !activeStage2Rev) && (
@@ -4639,17 +5054,23 @@ export default function Stage3View({
           )}
         </div>
         <GenerationProgress generation={generation} onRetry={handleRetryGeneration} />
-        <CoordinationLayer layer={coordinationLayer} />
-        {executionPlans.map((plan, i) => (
-          <PlanCard
-            key={`${plan.buName}-${i}`}
-            plan={plan}
-            index={i}
-            apiMode={apiMode}
-            globalBusy
-            onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
-          />
-        ))}
+        {/* CoordinationLayer shown inside CoordinationReadinessPanel above — not repeated here */}
+        {executionPlans.map((plan, i) => {
+          const buDraft = stage3DraftPlans[plan.buName] || legacyStage3DraftPlans[plan.buName] || null
+          const buHandoffBrief = readinessRows.find(r => r.unit.name === plan.buName)?.readiness?.handoffBrief || null
+          return (
+            <PlanCard
+              key={`${plan.buName}-${i}`}
+              plan={plan}
+              index={i}
+              apiMode={apiMode}
+              globalBusy
+              onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
+              draft={buDraft}
+              handoffBrief={buHandoffBrief}
+            />
+          )
+        })}
       </div>
     )
   }
@@ -4707,6 +5128,10 @@ export default function Stage3View({
         </div>
       </div>
 
+      {/* ── D. BU Readiness & Generation ──────────────────────────────────── */}
+      <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+        D · BU Readiness &amp; Generation
+      </div>
       <Stage3ReadinessPanels
         rows={readinessRows}
         planDrafts={stage3DraftPlans}
@@ -4723,6 +5148,11 @@ export default function Stage3View({
         captureImportStatus={captureImportStatus}
         onCaptureImport={handleCaptureImport}
       />
+
+      {/* ── C. Cross-BU Coordination ──────────────────────────────────────── */}
+      <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+        C · Cross-BU Coordination
+      </div>
       <CoordinationReadinessPanel
         readiness={coordinationReadiness}
         coordinationDraft={coordinationDraft}
@@ -4796,9 +5226,10 @@ export default function Stage3View({
         </div>
       )}
 
-      {/* ── Execution plan cards ──────────────────────────────────────────── */}
+      {/* ── B. Business Unit Execution Plans ─────────────────────────────── */}
+      {/* Inline GenerationProgress shows live atom progress during generation */}
       <GenerationProgress generation={generation} onRetry={handleRetryGeneration} />
-      <CoordinationLayer layer={coordinationLayer} />
+      {/* CoordinationLayer is shown inline in CoordinationReadinessPanel above — not repeated here */}
 
       {executionPlans.length > 0 && (
         <div style={{ marginBottom: 12 }}>
@@ -4807,7 +5238,7 @@ export default function Stage3View({
             textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8,
             display: 'flex', alignItems: 'center', gap: 8,
           }}>
-            Execution Plans
+            B · Business Unit Execution Plans
             <span style={{
               padding: '1px 6px', borderRadius: 3,
               background: 'var(--s2)', border: '1px solid var(--border)',
@@ -4821,16 +5252,22 @@ export default function Stage3View({
               </span>
             )}
           </div>
-          {executionPlans.map((plan, i) => (
-            <PlanCard
-              key={i}
-              plan={plan}
-              index={i}
-              apiMode={apiMode}
-              globalBusy={isGenerating}
-              onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
-            />
-          ))}
+          {executionPlans.map((plan, i) => {
+            const buDraft = stage3DraftPlans[plan.buName] || legacyStage3DraftPlans[plan.buName] || null
+            const buHandoffBrief = readinessRows.find(r => r.unit.name === plan.buName)?.readiness?.handoffBrief || null
+            return (
+              <PlanCard
+                key={i}
+                plan={plan}
+                index={i}
+                apiMode={apiMode}
+                globalBusy={isGenerating}
+                onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
+                draft={buDraft}
+                handoffBrief={buHandoffBrief}
+              />
+            )
+          })}
         </div>
       )}
 
