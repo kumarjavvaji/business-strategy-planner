@@ -3112,25 +3112,35 @@ function Stage3ReadinessPanels({
                   onStage2Action={onStage2Action}
                 />
 
-                <SectionLabel>Source References</SectionLabel>
-                {handoffItems.length > 0 ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {handoffItems.map((item, itemIdx) => (
-                      <HandoffItemRow
-                        key={`${item.key}-${itemIdx}`}
-                        item={item}
-                        unitName={unit.name}
-                        onStage2Action={onStage2Action}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic' }}>
-                    No Stage 2 handoff items generated yet.
-                  </div>
+                {/* Execution plan — rendered here when a draft exists so BU plan
+                    appears in one place (the expanded readiness row), not duplicated below */}
+                {(draft || legacyPlan) && (
+                  <Stage3BUPlanTree
+                    draft={draft}
+                    legacyPlan={legacyPlan}
+                    handoffBrief={readiness.handoffBrief || readiness.planningContext?.handoffBrief}
+                    unitName={unit.name}
+                    onStage2Action={onStage2Action}
+                    showHandoffBrief={false}
+                  />
                 )}
 
-                {/* Stage3ExecutionPlanDraft and Stage3DuplicateAudit have moved to PlanCard (section B) */}
+                {/* Stage 2 actions — kept for operators but not the primary reading path */}
+                {handoffItems.length > 0 && !(draft || legacyPlan) && (
+                  <div style={{ marginTop: 4 }}>
+                    <SectionLabel>Source References</SectionLabel>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {handoffItems.map((item, itemIdx) => (
+                        <HandoffItemRow
+                          key={`${item.key}-${itemIdx}`}
+                          item={item}
+                          unitName={unit.name}
+                          onStage2Action={onStage2Action}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -3239,6 +3249,16 @@ const secondaryButtonStyle = {
 
 // ── Plan tree helpers ─────────────────────────────────────────────────────────
 
+// Fields that appear in the compiled Execution Plan (excludes objective)
+const EXEC_PLAN_FIELDS = [
+  'executionStrategy',
+  'decisionsRequired',
+  'sequencingAndGates',
+  'dependencies',
+  'risks',
+  'validationSignals',
+]
+
 function classifyBulletSpine(text) {
   return SPINE_THEME_PATTERNS.filter(p => p.re.test(text))
 }
@@ -3247,25 +3267,27 @@ function inferSectionMandate(atoms, sectionIdx) {
   const objAtom = atoms.find(a => (a.metadata?.fieldKey || a.childKey) === 'objective')
   const raw = String(objAtom?.parsedValue || '').replace(/\s+/g, ' ').trim()
   if (!raw) return `Section ${sectionIdx}`
-  // Prefer text after em-dash (most sections include a specific phrase after '—')
   const dashIdx = raw.indexOf(' — ')
   if (dashIdx > 0) {
     const after = raw.slice(dashIdx + 3).replace(/[,;]\s*$/, '').trim()
     if (after.length > 10) return after.slice(0, 70)
   }
-  // Strip generic preamble and take the first distinctive clause
   const stripped = raw
     .replace(/^(?:Define and (?:govern|sequence|build)\s+(?:a|the)\s+)?(?:modular,\s+)?(?:evolution-ready\s+)?BSA\/AML explainability capability (?:roadmap|build)(?:\s+as a modular,[\w\s-]+investment)?\s+(?:that\s+)?/i, '')
   return stripped.slice(0, 70).replace(/[,;]\s*$/, '').trim() || `Section ${sectionIdx}`
 }
 
 /**
- * Groups atoms by section, tags each bullet as spine/duplicate/unique,
- * and computes per-section stats. Returns { spine, sections }.
+ * Groups atoms by section, tags bullets as spine/duplicate/unique, computes
+ * per-section stats, and aggregates a dimension-first execution plan.
+ *
+ * Returns { spine, sections, executionPlan }
+ *   executionPlan[fieldKey] = [ { sectionKey, sectionIndex, mandate, bullets } ]
+ *   where bullets are de-duplicated canonical occurrences (spine excluded).
  */
 function buildPlanTree(atoms) {
   const eligible = renderingEligibleAtoms(atoms)
-  if (!eligible.length) return { spine: [], sections: [] }
+  if (!eligible.length) return { spine: [], sections: [], executionPlan: {} }
 
   // ── 1. Group by section ────────────────────────────────────────────────────
   const sectionMap = new Map()
@@ -3283,7 +3305,7 @@ function buildPlanTree(atoms) {
   })
   const rawSections = Array.from(sectionMap.values()).sort((a, b) => a.sectionIndex - b.sectionIndex)
 
-  // ── 2. Extract bullets from each section ───────────────────────────────────
+  // ── 2. Extract bullets ─────────────────────────────────────────────────────
   const withBullets = rawSections.map(sec => {
     const bullets = []
     sec.atoms.forEach(atom => {
@@ -3303,7 +3325,7 @@ function buildPlanTree(atoms) {
   const flat = withBullets.flatMap(sec =>
     sec.bullets.map(b => ({ ...b, sectionKey: sec.sectionKey, gi: gi++, fp: semanticFingerprint(b.text) }))
   )
-  const bulletDups = new Map() // gi → Set<sectionKey>
+  const bulletDups = new Map()
   for (let i = 0; i < flat.length; i++) {
     for (let j = i + 1; j < flat.length; j++) {
       if (flat[i].sectionKey === flat[j].sectionKey) continue
@@ -3315,15 +3337,22 @@ function buildPlanTree(atoms) {
     }
   }
 
-  // ── 4. Tag bullets + build per-section stats ───────────────────────────────
+  // ── 4. Tag bullets + per-section stats ────────────────────────────────────
+  const sectionIdxByKey = new Map(rawSections.map(s => [s.sectionKey, s.sectionIndex]))
   let flatIdx = 0
   const sections = withBullets.map(sec => {
     const tagged = sec.bullets.map(b => {
-      const dups = bulletDups.get(flatIdx++) || new Set()
+      const dups    = bulletDups.get(flatIdx++) || new Set()
       const isSpine = b.spineThemes.length > 0
       const isDup   = dups.size > 0 && !isSpine
       const isUniq  = dups.size === 0 && !isSpine
-      return { ...b, dupSections: [...dups], isSpine, isDup, isUnique: isUniq }
+      // Canonical = first (lowest sectionIndex) occurrence among all dup matches
+      const isCanonical = isSpine
+        ? false
+        : isUniq
+          ? true
+          : [...dups].every(sk => (sectionIdxByKey.get(sk) ?? Infinity) > sec.sectionIndex)
+      return { ...b, dupSections: [...dups], isSpine, isDup, isUnique: isUniq, isCanonical }
     })
 
     const total     = tagged.length
@@ -3333,15 +3362,13 @@ function buildPlanTree(atoms) {
     const ratio     = total > 0 ? unique / total : 0
     const uniqueScore = ratio > 0.4 ? 'high' : ratio > 0.2 ? 'medium' : 'low'
 
-    // Field map: { fieldKey → [taggedBullets] }
     const fieldMap = Object.fromEntries(STAGE3_FIELD_ATOM_KEYS.map(k => [k, []]))
     tagged.forEach(b => { if (fieldMap[b.fieldKey]) fieldMap[b.fieldKey].push(b) })
 
-    // Unique contribution: first 2 unique bullets from risks, then any other field
     const uniq = tagged.filter(b => b.isUnique)
     const best = [...uniq.filter(b => b.fieldKey === 'risks'), ...uniq.filter(b => b.fieldKey !== 'risks')]
     const uniqueContrib = best.slice(0, 2).map(b => b.text.slice(0, 95)).join(' · ')
-      || '(no unique content detected — all bullets match spine themes or other sections)'
+      || '(no unique content detected)'
 
     return {
       ...sec,
@@ -3353,30 +3380,57 @@ function buildPlanTree(atoms) {
     }
   })
 
-  // ── 5. Aggregate shared spine ──────────────────────────────────────────────
+  // ── 5. Shared spine ────────────────────────────────────────────────────────
   const spineAgg = {}
   sections.forEach(sec =>
     sec.taggedBullets.forEach(b =>
       b.spineThemes.forEach(t => {
-        if (!spineAgg[t.key]) spineAgg[t.key] = { theme: t, sectionKeys: new Set() }
+        if (!spineAgg[t.key]) spineAgg[t.key] = { theme: t, sectionKeys: new Set(), representative: b.text }
         spineAgg[t.key].sectionKeys.add(sec.sectionKey)
       })
     )
   )
   const spine = Object.values(spineAgg)
     .filter(e => e.sectionKeys.size >= 2)
-    .map(e => ({ ...e.theme, sectionCount: e.sectionKeys.size }))
+    .map(e => ({ ...e.theme, sectionCount: e.sectionKeys.size, representative: e.representative }))
     .sort((a, b) => b.sectionCount - a.sectionCount)
 
-  return { spine, sections }
+  // ── 6. Execution plan — dimension-first aggregation ────────────────────────
+  // For each field: collect canonical (non-spine, first-occurrence) bullets
+  // from every section that contributes something, grouped by section.
+  const executionPlan = {}
+  EXEC_PLAN_FIELDS.forEach(fk => {
+    const contributions = sections
+      .map(sec => ({
+        sectionKey:   sec.sectionKey,
+        sectionIndex: sec.sectionIndex,
+        mandate:      sec.mandate,
+        bullets: (sec.fieldMap[fk] || [])
+          .filter(b => b.isCanonical)
+          .map(b => b.text),
+      }))
+      .filter(c => c.bullets.length > 0)
+    executionPlan[fk] = contributions
+  })
+
+  return { spine, sections, executionPlan }
 }
 
-// ── Stage3BUPlanTree — navigable tree hierarchy for one BU's execution plan ──
+// ── Stage3BUPlanTree — dimension-first BU execution plan hierarchy ────────────
 
-function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief }) {
-  const [openSections, setOpenSections] = useState({ 0: true })
-  const [openFields,   setOpenFields]   = useState({})
-  const [spineOpen,    setSpineOpen]    = useState(false)
+function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, unitName, onStage2Action, showHandoffBrief = true }) {
+  // Panel open/closed state — Handoff Brief, Spine, Exec Plan open by default
+  const [briefOpen,   setBriefOpen]   = useState(true)
+  const [spineOpen,   setSpineOpen]   = useState(true)
+  const [execOpen,    setExecOpen]    = useState(true)
+  const [suppOpen,    setSuppOpen]    = useState(false)
+  const [refsOpen,    setRefsOpen]    = useState(false)
+  // Within Exec Plan: which field dimension is expanded
+  const [execFields,  setExecFields]  = useState({ executionStrategy: true })
+  // Within Supporting Analysis: which section is expanded
+  const [suppSecs,    setSuppSecs]    = useState({})
+  // Within Supporting Analysis sections: which field accordion is expanded
+  const [suppFields,  setSuppFields]  = useState({})
 
   const tree = React.useMemo(() => {
     const resolved = resolveExecutionDraftSource(draft, legacyPlan)
@@ -3387,191 +3441,303 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief }) {
   if (!tree || !tree.sections.length) {
     return (
       <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic', marginTop: 10, marginBottom: 12 }}>
-        No execution plan draft — generate or import a plan to see the section hierarchy.
+        No execution plan draft — generate or import a plan to see the hierarchy.
       </div>
     )
   }
 
-  const { spine, sections } = tree
-  const totals = sections.reduce(
-    (acc, s) => ({
-      total:     acc.total     + s.stats.total,
-      spineRefs: acc.spineRefs + s.stats.spineRefs,
-      semDups:   acc.semDups   + s.stats.semDups,
-      unique:    acc.unique    + s.stats.unique,
-    }),
-    { total: 0, spineRefs: 0, semDups: 0, unique: 0 }
-  )
-
+  const { spine, sections, executionPlan } = tree
   const scoreColor = s => s === 'high' ? '#00e5b4' : s === 'medium' ? '#fb923c' : '#f87171'
-  const toggleSection = idx => setOpenSections(p => ({ ...p, [idx]: !p[idx] }))
-  const toggleField   = (sk, fk) => setOpenFields(p => ({ ...p, [`${sk}:${fk}`]: !p[`${sk}:${fk}`] }))
+
+  // ── Shared panel header style helper ────────────────────────────────────────
+  function PanelHeader({ label, sub, open, onToggle, accent = 'var(--muted2)', defaultBg = 'var(--s2)' }) {
+    return (
+      <div
+        onClick={onToggle}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+          padding: '8px 11px', background: defaultBg,
+          borderBottom: open ? '1px solid var(--border)' : 'none',
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: accent }}>{label}</div>
+          {sub && <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginTop: 1 }}>{sub}</div>}
+        </div>
+        <span style={{ fontSize: 8, color: 'var(--muted)', flexShrink: 0 }}>{open ? '▲' : '▼'}</span>
+      </div>
+    )
+  }
+
+  // ── Bullet renderer ─────────────────────────────────────────────────────────
+  function BulletItem({ text, dot = 'var(--muted)' }) {
+    return (
+      <div style={{ display: 'flex', gap: 7, marginBottom: 7, alignItems: 'flex-start' }}>
+        <span style={{ flexShrink: 0, width: 5, height: 5, borderRadius: '50%', background: dot, marginTop: 5 }} />
+        <div style={{ fontSize: 9, color: 'var(--muted2)', lineHeight: 1.65, fontFamily: 'var(--fm)' }}>{text}</div>
+      </div>
+    )
+  }
+
+  // ── Source refs: derive from handoff brief ──────────────────────────────────
+  const evidenceRefs = handoffBrief?.evidenceRefs || []
+  const sourceTitles = handoffBrief?.sourceSectionTitles || []
 
   return (
-    <div style={{ marginTop: 12, marginBottom: 12 }}>
+    <div style={{ marginTop: 12, marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
 
-      {/* ── Summary bar ──────────────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 }}>
-        <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em' }}>
-          Execution Plan · {sections.length} sections · {totals.total} bullets
-        </span>
-        <Badge color="#00e5b4" small>{totals.unique} unique</Badge>
-        <Badge color="#3b82f6" small>{totals.spineRefs} spine refs</Badge>
-        <Badge color="#fb923c" small>{totals.semDups} sem dups</Badge>
-      </div>
-
-      {/* ── Shared spine panel ───────────────────────────────────────────────── */}
-      {spine.length > 0 && (
-        <div style={{ marginBottom: 8, border: '1px solid rgba(59,130,246,.28)', borderRadius: 5, overflow: 'hidden' }}>
-          <div
-            onClick={() => setSpineOpen(o => !o)}
-            style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '7px 10px', background: 'rgba(59,130,246,.07)' }}
-          >
-            <span style={{ fontSize: 9, fontWeight: 700, color: '#3b82f6', flexShrink: 0 }}>Shared Plan Spine</span>
-            <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', flex: 1 }}>
-              {spine.length} cross-cutting themes present in 2+ sections — should be stated once, referenced elsewhere
-            </span>
-            <span style={{ fontSize: 8, color: 'var(--muted)' }}>{spineOpen ? '▲' : '▼'}</span>
-          </div>
-          {spineOpen && (
-            <div style={{ padding: '9px 11px', background: 'var(--surface)' }}>
-              <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 7, lineHeight: 1.55 }}>
-                Blue dot = spine theme. Sections that re-derive a spine theme instead of referencing it produce the observed duplication.
-                The section that first introduces each theme should become its canonical owner.
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                {spine.map(t => (
-                  <div key={t.key} style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                    <Badge color="#3b82f6" small>{t.sectionCount}/{sections.length} sections</Badge>
-                    <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)' }}>{t.label}</span>
-                  </div>
-                ))}
-              </div>
+      {/* ══ 1. HANDOFF BRIEF — omitted when already shown by Stage3HandoffBriefCard above ══ */}
+      {showHandoffBrief && (
+        <div style={{ border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
+          <PanelHeader
+            label="Handoff Brief"
+            sub="Why this BU exists in Stage 3 and what Stage 2 handed into it"
+            open={briefOpen}
+            onToggle={() => setBriefOpen(o => !o)}
+          />
+          {briefOpen && (
+            <div style={{ padding: '10px 12px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {handoffBrief?.planningPurpose && (
+                <div>
+                  <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 3 }}>Planning Purpose</div>
+                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6 }}>{handoffBrief.planningPurpose}</div>
+                </div>
+              )}
+              {handoffBrief?.decisionBasisSummary && (
+                <div>
+                  <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 3 }}>Decision Basis</div>
+                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6 }}>{handoffBrief.decisionBasisSummary}</div>
+                </div>
+              )}
             </div>
           )}
         </div>
       )}
 
-      {/* ── Section rows ─────────────────────────────────────────────────────── */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-        {sections.map((sec, idx) => {
-          const isOpen = !!openSections[idx]
-          const { stats } = sec
-          const uc = scoreColor(stats.uniqueScore)
+      {/* ══ 1b. MISSION + STRATEGIC ROLE — always shown (BU-level context) ══════ */}
+      {(legacyPlan?.mission || legacyPlan?.strategicRole) && (
+        <div style={{ border: '1px solid rgba(59,130,246,.2)', borderRadius: 5, overflow: 'hidden' }}>
+          <div style={{ padding: '10px 12px', background: 'rgba(59,130,246,.04)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {legacyPlan.mission && (
+              <div>
+                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#3b82f6', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>Mission</div>
+                <div style={{ fontSize: 10, color: 'var(--text)', lineHeight: 1.7, fontStyle: 'italic' }}>{legacyPlan.mission}</div>
+              </div>
+            )}
+            {legacyPlan.strategicRole && (
+              <div>
+                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#3b82f6', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>Strategic Role</div>
+                <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.7 }}>{legacyPlan.strategicRole}</div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
-          return (
-            <div key={sec.sectionKey} style={{ border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
-
-              {/* Section header */}
-              <div
-                onClick={() => toggleSection(idx)}
-                style={{
-                  display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer',
-                  padding: '8px 10px',
-                  background: isOpen ? 'var(--surface)' : 'var(--s2)',
-                  borderBottom: isOpen ? '1px solid var(--border)' : 'none',
-                }}
-              >
-                {/* Index badge colored by uniqueness */}
-                <span style={{
-                  flexShrink: 0, width: 20, height: 20, borderRadius: 3, marginTop: 1,
-                  background: `${uc}15`, border: `1px solid ${uc}35`,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700, color: uc,
-                }}>
-                  {idx}
-                </span>
-
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 2 }}>Section {idx}</div>
-                  <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text)', marginBottom: 4, lineHeight: 1.35 }}>
-                    {sec.mandate}
-                  </div>
-                  <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-                    <Badge color={uc} small>{stats.uniqueScore} · {stats.unique}/{stats.total} unique</Badge>
-                    {stats.spineRefs > 0 && <Badge color="#3b82f6" small>{stats.spineRefs} spine refs</Badge>}
-                    {stats.semDups   > 0 && <Badge color="#fb923c" small>{stats.semDups} sem dups</Badge>}
+      {/* ══ 2. SHARED PLAN SPINE ═══════════════════════════════════════════════ */}
+      {spine.length > 0 && (
+        <div style={{ border: '1px solid rgba(59,130,246,.3)', borderRadius: 5, overflow: 'hidden' }}>
+          <PanelHeader
+            label="Shared Plan Spine"
+            sub={`${spine.length} cross-cutting constraints that apply to the whole BU — stated once here, referenced in sections`}
+            open={spineOpen}
+            onToggle={() => setSpineOpen(o => !o)}
+            accent="#3b82f6"
+            defaultBg="rgba(59,130,246,.06)"
+          />
+          {spineOpen && (
+            <div style={{ padding: '10px 12px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {spine.map(t => (
+                <div key={t.key} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', paddingBottom: 6, borderBottom: '1px solid var(--border)' }}>
+                  <Badge color="#3b82f6" small style={{ flexShrink: 0 }}>{t.sectionCount}/{sections.length}</Badge>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 9, fontWeight: 600, color: '#3b82f6', marginBottom: 2 }}>{t.label}</div>
+                    {t.representative && (
+                      <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.6, whiteSpace: 'normal' }}>
+                        {t.representative}
+                      </div>
+                    )}
                   </div>
                 </div>
-                <span style={{ fontSize: 8, color: 'var(--muted)', flexShrink: 0, marginTop: 4 }}>{isOpen ? '▲' : '▼'}</span>
-              </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
-              {/* Section body */}
-              {isOpen && (
-                <div style={{ padding: '10px 10px 6px' }}>
+      {/* ══ 3. EXECUTION PLAN — dimension-first ════════════════════════════════ */}
+      <div style={{ border: '1px solid rgba(0,229,180,.3)', borderRadius: 5, overflow: 'hidden' }}>
+        <PanelHeader
+          label="Execution Plan"
+          sub="Aggregated across all sections — each dimension appears once"
+          open={execOpen}
+          onToggle={() => setExecOpen(o => !o)}
+          accent="#00e5b4"
+          defaultBg="rgba(0,229,180,.05)"
+        />
+        {execOpen && (
+          <div style={{ padding: '8px 10px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {EXEC_PLAN_FIELDS.map(fk => {
+              const contributions = executionPlan[fk] || []
+              const totalBullets  = contributions.reduce((s, c) => s + c.bullets.length, 0)
+              if (!totalBullets) return null
+              const isOpen = !!execFields[fk]
+              const label  = STAGE3_FIELD_ATOM_LABELS[fk] || fk
 
-                  {/* Unique contribution */}
-                  <div style={{
-                    marginBottom: 10, padding: '7px 9px',
-                    background: `${uc}08`, border: `1px solid ${uc}20`, borderRadius: 4,
-                  }}>
-                    <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 3 }}>
-                      Unique contribution
-                    </div>
-                    <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6 }}>
-                      {sec.uniqueContrib}
-                    </div>
+              return (
+                <div key={fk} style={{ border: '1px solid var(--border)', borderRadius: 4, overflow: 'hidden' }}>
+                  {/* Dimension header */}
+                  <div
+                    onClick={() => setExecFields(p => ({ ...p, [fk]: !p[fk] }))}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+                      padding: '6px 9px', background: isOpen ? 'rgba(0,229,180,.05)' : 'var(--s2)',
+                      borderBottom: isOpen ? '1px solid var(--border)' : 'none',
+                    }}
+                  >
+                    <span style={{ fontSize: 9, fontWeight: 700, color: '#00e5b4', flex: 1 }}>{label}</span>
+                    <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+                      {totalBullets} items · {contributions.length} section{contributions.length !== 1 ? 's' : ''}
+                    </span>
+                    <span style={{ fontSize: 7, color: 'var(--muted)', marginLeft: 4 }}>{isOpen ? '▲' : '▼'}</span>
                   </div>
 
-                  {/* Field accordions */}
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    {STAGE3_FIELD_ATOM_KEYS.map(fk => {
-                      const bullets = sec.fieldMap[fk] || []
-                      if (!bullets.length) return null
-                      const fOpen  = !!openFields[`${sec.sectionKey}:${fk}`]
-                      const fLabel = STAGE3_FIELD_ATOM_LABELS[fk] || fk
-                      const uC = bullets.filter(b => b.isUnique).length
-                      const sC = bullets.filter(b => b.isSpine).length
-                      const dC = bullets.filter(b => b.isDup).length
+                  {/* Contributions grouped by section */}
+                  {isOpen && (
+                    <div style={{ padding: '8px 10px 4px', background: 'var(--surface)' }}>
+                      {contributions.map((contrib, ci) => (
+                        <div key={contrib.sectionKey} style={{ marginBottom: ci < contributions.length - 1 ? 10 : 2 }}>
+                          <div style={{
+                            fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+                            marginBottom: 4, paddingLeft: 6,
+                            borderLeft: '2px solid rgba(0,229,180,.35)',
+                            lineHeight: 1.5, whiteSpace: 'normal',
+                          }}>
+                            Section {contrib.sectionIndex} — {contrib.mandate}
+                          </div>
+                          {contrib.bullets.map((text, bi) => (
+                            <BulletItem key={bi} text={text} dot="#00e5b4" />
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
 
-                      return (
-                        <div key={fk}>
+      {/* ══ 4. SUPPORTING ANALYSIS — section-specific unique content ═══════════ */}
+      <div style={{ border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
+        <PanelHeader
+          label="Supporting Analysis"
+          sub={`${sections.length} sections — unique contributions and section-specific evidence`}
+          open={suppOpen}
+          onToggle={() => setSuppOpen(o => !o)}
+        />
+        {suppOpen && (
+          <div style={{ padding: '8px 10px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {sections.map((sec, idx) => {
+              const isOpen = !!suppSecs[sec.sectionKey]
+              const { stats } = sec
+              const uc = scoreColor(stats.uniqueScore)
+
+              // For Supporting Analysis, primary display = unique content only.
+              // Spine-covered and duplicated content is shown as a count indicator,
+              // not restated inline. Full raw detail is available behind expansion.
+              const uniqueBullets = sec.taggedBullets.filter(b => b.isUnique)
+              const hasUniqueContent = uniqueBullets.length > 0
+
+              return (
+                <div key={sec.sectionKey} style={{ border: '1px solid var(--border)', borderRadius: 4, overflow: 'hidden' }}>
+                  {/* Section header — mandate, unique contribution, overlap indicators */}
+                  <div
+                    onClick={() => setSuppSecs(p => ({ ...p, [sec.sectionKey]: !p[sec.sectionKey] }))}
+                    style={{
+                      display: 'flex', alignItems: 'flex-start', gap: 7, cursor: 'pointer',
+                      padding: '7px 9px', background: isOpen ? 'var(--surface)' : 'var(--s2)',
+                      borderBottom: isOpen ? '1px solid var(--border)' : 'none',
+                    }}
+                  >
+                    <span style={{
+                      flexShrink: 0, width: 18, height: 18, borderRadius: 3, marginTop: 1,
+                      background: `${uc}15`, border: `1px solid ${uc}35`,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 700, color: uc,
+                    }}>{idx}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 9, fontWeight: 600, color: 'var(--text)', marginBottom: 3, lineHeight: 1.4, whiteSpace: 'normal' }}>
+                        {sec.mandate}
+                      </div>
+                      {hasUniqueContent ? (
+                        <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.55, marginBottom: 4, whiteSpace: 'normal' }}>
+                          {sec.uniqueContrib}
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic', marginBottom: 4 }}>
+                          No unique content — all bullets covered by Shared Plan Spine or repeated across sections.
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                        <Badge color={uc} small>{stats.unique} unique</Badge>
+                        {stats.spineRefs > 0 && <Badge color="#3b82f6" small>{stats.spineRefs} in spine</Badge>}
+                        {stats.semDups   > 0 && <Badge color="#fb923c" small>{stats.semDups} duplicated</Badge>}
+                      </div>
+                    </div>
+                    <span style={{ fontSize: 7, color: 'var(--muted)', flexShrink: 0, marginTop: 3 }}>{isOpen ? '▲' : '▼'}</span>
+                  </div>
+
+                  {/* Section body — unique bullets first, then optional raw detail */}
+                  {isOpen && (
+                    <div style={{ padding: '8px 9px 6px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+
+                      {/* Unique bullets by field — primary content */}
+                      {EXEC_PLAN_FIELDS.map(fk => {
+                        const uniqBullets = (sec.fieldMap[fk] || []).filter(b => b.isUnique)
+                        if (!uniqBullets.length) return null
+                        return (
+                          <div key={fk}>
+                            <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>
+                              {STAGE3_FIELD_ATOM_LABELS[fk]} — unique contribution
+                            </div>
+                            {uniqBullets.map((b, bi) => (
+                              <div key={bi} style={{ display: 'flex', gap: 6, marginBottom: 5, alignItems: 'flex-start' }}>
+                                <span style={{ flexShrink: 0, width: 5, height: 5, borderRadius: '50%', background: '#00e5b4', marginTop: 5 }} />
+                                <div style={{ fontSize: 9, color: 'var(--muted2)', lineHeight: 1.65, fontFamily: 'var(--fm)', whiteSpace: 'normal' }}>{b.text}</div>
+                              </div>
+                            ))}
+                          </div>
+                        )
+                      })}
+
+                      {/* Raw detail expansion — includes spine + dup bullets for completeness */}
+                      {(stats.spineRefs > 0 || stats.semDups > 0) && (
+                        <div>
                           <div
-                            onClick={() => toggleField(sec.sectionKey, fk)}
+                            onClick={() => setSuppFields(p => ({ ...p, [`${sec.sectionKey}:_raw`]: !p[`${sec.sectionKey}:_raw`] }))}
                             style={{
-                              display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer',
-                              padding: '5px 8px', background: 'var(--s2)', border: '1px solid var(--border)',
-                              borderRadius: fOpen ? '4px 4px 0 0' : 4,
+                              fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', cursor: 'pointer',
+                              padding: '3px 0', display: 'flex', alignItems: 'center', gap: 5,
                             }}
                           >
-                            <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', flex: 1 }}>
-                              {fLabel}
+                            <span style={{ opacity: .6 }}>
+                              {suppFields[`${sec.sectionKey}:_raw`] ? '▲' : '▼'}
                             </span>
-                            <span style={{ display: 'flex', gap: 5, fontSize: 8, fontFamily: 'var(--fm)' }}>
-                              {uC > 0 && <span style={{ color: '#00e5b4' }}>{uC}u</span>}
-                              {sC > 0 && <span style={{ color: '#3b82f6' }}>{sC}s</span>}
-                              {dC > 0 && <span style={{ color: '#fb923c' }}>{dC}d</span>}
-                            </span>
-                            <span style={{ fontSize: 7, color: 'var(--muted)', flexShrink: 0 }}>{fOpen ? '▲' : '▼'}</span>
+                            Raw detail ({stats.spineRefs} spine-covered · {stats.semDups} cross-section duplicates)
                           </div>
-
-                          {fOpen && (
-                            <div style={{
-                              border: '1px solid var(--border)', borderTop: 'none',
-                              borderRadius: '0 0 4px 4px', padding: '8px 9px 4px',
-                              background: 'var(--surface)',
-                            }}>
-                              {bullets.map((b, bi) => {
-                                const dot = b.isSpine ? '#3b82f6' : b.isDup ? '#fb923c' : '#00e5b4'
+                          {suppFields[`${sec.sectionKey}:_raw`] && (
+                            <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 5 }}>
+                              {sec.taggedBullets.filter(b => !b.isUnique).map((b, bi) => {
+                                const dot = b.isSpine ? '#3b82f6' : '#fb923c'
                                 return (
-                                  <div key={bi} style={{ display: 'flex', gap: 7, marginBottom: 8, alignItems: 'flex-start' }}>
-                                    <span style={{ flexShrink: 0, width: 6, height: 6, borderRadius: '50%', background: dot, marginTop: 5 }} />
+                                  <div key={bi} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+                                    <span style={{ flexShrink: 0, width: 5, height: 5, borderRadius: '50%', background: dot, marginTop: 5 }} />
                                     <div style={{ flex: 1, minWidth: 0 }}>
-                                      <div style={{ fontSize: 9, color: 'var(--muted2)', lineHeight: 1.65, fontFamily: 'var(--fm)' }}>{b.text}</div>
-                                      {b.isSpine && b.spineThemes.length > 0 && (
-                                        <div style={{ marginTop: 3, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                                          {b.spineThemes.map(t => (
-                                            <Badge key={t.key} color="#3b82f6" small>spine: {t.label}</Badge>
-                                          ))}
-                                        </div>
-                                      )}
-                                      {b.isDup && b.dupSections.length > 0 && (
-                                        <div style={{ marginTop: 3 }}>
-                                          <Badge color="#fb923c" small>
-                                            dup in section{b.dupSections.length !== 1 ? 's' : ''} {b.dupSections.join(', ')}
-                                          </Badge>
-                                        </div>
-                                      )}
+                                      <div style={{ fontSize: 8, color: 'var(--muted)', lineHeight: 1.6, fontFamily: 'var(--fm)', whiteSpace: 'normal' }}>{b.text}</div>
+                                      {b.isSpine && <Badge color="#3b82f6" small>covered in Spine</Badge>}
+                                      {b.isDup && b.dupSections.length > 0 && <Badge color="#fb923c" small>dup §{b.dupSections.join(', §')}</Badge>}
                                     </div>
                                   </div>
                                 )
@@ -3579,15 +3745,66 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief }) {
                             </div>
                           )}
                         </div>
-                      )
-                    })}
-                  </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-          )
-        })}
+              )
+            })}
+          </div>
+        )}
       </div>
+
+      {/* ══ 5. SOURCE REFERENCES — evidence navigation ══════════════════════════ */}
+      {(evidenceRefs.length > 0 || sourceTitles.length > 0) && (
+        <div style={{ border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden' }}>
+          <PanelHeader
+            label="Source References"
+            sub="Stage 2 artifacts that informed this execution plan"
+            open={refsOpen}
+            onToggle={() => setRefsOpen(o => !o)}
+          />
+          {refsOpen && (
+            <div style={{ padding: '8px 10px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {(evidenceRefs.length > 0 ? evidenceRefs : sourceTitles.map((t, i) => ({ id: String(i), title: t }))).map((ref, ri) => {
+                const title   = ref.title || ref.id || `Source ${ri + 1}`
+                const summary = handoffBrief?.keyImplications?.[ri] || handoffBrief?.planningPurpose || ''
+                return (
+                  <div key={ref.id || ri} style={{
+                    display: 'flex', alignItems: 'flex-start', gap: 10,
+                    padding: '7px 9px', background: 'var(--s2)', borderRadius: 4,
+                    border: '1px solid var(--border)',
+                  }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 9, fontWeight: 600, color: 'var(--text)', marginBottom: 2 }}>
+                        {title}
+                      </div>
+                      {summary && (
+                        <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.5 }}>
+                          {summary.slice(0, 140)}{summary.length > 140 ? '…' : ''}
+                        </div>
+                      )}
+                    </div>
+                    {onStage2Action && (
+                      <button
+                        onClick={() => onStage2Action(unitName || legacyPlan?.buName, ref.id, 'review')}
+                        style={{
+                          flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)',
+                          padding: '3px 8px', borderRadius: 3, cursor: 'pointer',
+                          background: 'transparent', border: '1px solid var(--border)',
+                          color: 'var(--muted)',
+                        }}
+                      >
+                        Open in Stage 2
+                      </button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -3619,7 +3836,7 @@ function IndicatorStrip({ plan }) {
 
 // ── Execution plan card ───────────────────────────────────────────────────────
 
-function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy, draft = null, handoffBrief = null }) {
+function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy, draft = null, handoffBrief = null, onStage2Action = null }) {
   const [open,         setOpen]         = useState(true)
   const [refineOpen,   setRefineOpen]   = useState(false)
   const [refinePrompt, setRefinePrompt] = useState('')
@@ -3721,59 +3938,7 @@ function PlanCard({ plan, index, onRefineUnit, apiMode, globalBusy, draft = null
               <BulletList items={plan.handoffWarnings} borderColor="rgba(251,146,60,.45)" />
             </div>
           )}
-          {/* Mission */}
-          {plan.mission && (
-            <div style={{
-              marginBottom: 14,
-              padding: '10px 13px',
-              background: 'rgba(59,130,246,.05)',
-              border: '1px solid rgba(59,130,246,.15)',
-              borderRadius: 6,
-            }}>
-              <SectionLabel>Mission</SectionLabel>
-              <div style={{ fontSize: 11, color: 'var(--text)', lineHeight: 1.7, fontStyle: 'italic' }}>
-                {plan.mission}
-              </div>
-            </div>
-          )}
-
-          {plan.strategicRole && (
-            <PlanSection label="Strategic Role">
-              <div style={{ fontSize: 10, color: 'var(--muted2)', lineHeight: 1.7 }}>
-                {plan.strategicRole}
-              </div>
-            </PlanSection>
-          )}
-
-          {/* Execution Summary — canonical content lives in Execution Plan Draft below */}
-          <PlanSection label="Execution Summary">
-            <div style={{
-              background: 'var(--s2)', border: '1px solid var(--border)',
-              borderRadius: 5, padding: '10px 12px',
-            }}>
-              {plan.executionSections?.length > 0 ? (
-                <>
-                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 8 }}>
-                    {plan.executionSections.length} execution section{plan.executionSections.length !== 1 ? 's' : ''} — full detail in Execution Plan Draft below
-                  </div>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                    {plan.executionSections.map((s, i) => (
-                      <Badge key={i} color="#3b82f6" small>
-                        {s.sectionName || `Section ${i + 1}`}
-                      </Badge>
-                    ))}
-                  </div>
-                </>
-              ) : (
-                <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
-                  No execution sections yet — generate or import a plan to see the Execution Plan Draft.
-                </div>
-              )}
-            </div>
-          </PlanSection>
-
-          {/* Execution Plan — navigable section tree with spine detection */}
-          <Stage3BUPlanTree draft={draft} legacyPlan={plan} handoffBrief={handoffBrief} />
+          {/* Mission, Strategic Role, Execution Plan — all shown in expanded BU readiness row above */}
 
           {/* Readiness assessment */}
           {plan.readinessAssessment && (
@@ -5066,8 +5231,9 @@ export default function Stage3View({
               apiMode={apiMode}
               globalBusy
               onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
-              draft={buDraft}
+              draft={null}
               handoffBrief={buHandoffBrief}
+              onStage2Action={handleStage2HandoffAction}
             />
           )
         })}
@@ -5255,6 +5421,8 @@ export default function Stage3View({
           {executionPlans.map((plan, i) => {
             const buDraft = stage3DraftPlans[plan.buName] || legacyStage3DraftPlans[plan.buName] || null
             const buHandoffBrief = readinessRows.find(r => r.unit.name === plan.buName)?.readiness?.handoffBrief || null
+            // Execution plan content lives in the D · BU Readiness expanded row above.
+            // Show a lightweight refinement card here only — no duplicate execution content.
             return (
               <PlanCard
                 key={i}
@@ -5263,8 +5431,9 @@ export default function Stage3View({
                 apiMode={apiMode}
                 globalBusy={isGenerating}
                 onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
-                draft={buDraft}
+                draft={null}
                 handoffBrief={buHandoffBrief}
+                onStage2Action={handleStage2HandoffAction}
               />
             )
           })}
