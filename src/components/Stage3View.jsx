@@ -345,10 +345,13 @@ function readJsonStorage(key) {
 }
 
 function writeJsonStorage(key, value) {
-  if (!key || typeof localStorage === 'undefined') return
+  if (!key || typeof localStorage === 'undefined') return false
   try {
     localStorage.setItem(key, JSON.stringify(value))
-  } catch {}
+    return true
+  } catch {
+    return false
+  }
 }
 
 function hasRenderableStage3Draft(draft) {
@@ -374,11 +377,13 @@ function normalizeLegacyStage3Draft(draft, storageKey) {
     legacyStorageKey: storageKey,
     lifecycle: {
       ...(draft.lifecycle || {}),
-      status: hasPlanSections || hasValidAtoms
-        ? LIFECYCLE_STATES.DRAFT_GENERATED
-        : hasFailures
-          ? LIFECYCLE_STATES.GENERATION_FAILED
-          : draft.lifecycle?.status || LIFECYCLE_STATES.NOT_STARTED,
+      status: (hasPlanSections || hasValidAtoms) && hasFailures
+        ? LIFECYCLE_STATES.PARTIAL_DRAFT
+        : hasPlanSections || hasValidAtoms
+          ? LIFECYCLE_STATES.DRAFT_GENERATED
+          : hasFailures
+            ? LIFECYCLE_STATES.GENERATION_FAILED
+            : draft.lifecycle?.status || LIFECYCLE_STATES.NOT_STARTED,
     },
     diagnostics: {
       ...(draft.diagnostics || {}),
@@ -411,7 +416,7 @@ function findLegacyStage3DraftForBU(buName, exactKey = null) {
         key === exactKey ? 1000 : 0,
         normalized?.plan?.executionSections?.length ? 100 : 0,
         normalized?.executionAtoms?.length ? 50 : 0,
-        normalized?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED ? 25 : 0,
+        [LIFECYCLE_STATES.DRAFT_GENERATED, LIFECYCLE_STATES.PARTIAL_DRAFT].includes(normalized?.lifecycle?.status) ? 25 : 0,
         Date.parse(normalized?.lastSavedAt || normalized?.updatedAt || normalized?.createdAt || '') || 0,
       ].reduce((sum, value) => sum + value, 0),
     })
@@ -2119,6 +2124,11 @@ function Stage3ReadinessMatrix({
                         Use Stage 1/2 only
                       </button>
                     )}
+                    {gen?.persistError && (
+                      <div style={{ marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#fbbf24', lineHeight: 1.4, fontWeight: 600 }}>
+                        ⚠ {gen.persistError}
+                      </div>
+                    )}
                     {gen?.error && (
                       <div style={{ marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
                         {gen.error}
@@ -2603,12 +2613,16 @@ function Stage3ReadinessPanels({
         const hasRetryableAtoms = isPilotUnit && (draft?.executionAtoms || []).some(atom => (
           STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status) && atom?.status !== ATOM_STATUSES.COMPLETE
         ))
-        const executionStatus = gen?.error
-          ? 'failed'
+        const executionStatus = gen?.persistError
+          ? 'not persisted'
+          : gen?.error && lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED
+            ? 'failed'
           : lifecycleState === LIFECYCLE_STATES.ACCEPTED
             ? 'accepted'
           : lifecycleState === LIFECYCLE_STATES.DRAFT_GENERATED
             ? 'draft'
+          : lifecycleState === LIFECYCLE_STATES.PARTIAL_DRAFT
+            ? 'partial draft'
           : lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED
             ? 'failed'
           : hasPlan
@@ -2626,7 +2640,7 @@ function Stage3ReadinessPanels({
         const mode = modeFor(readiness, !!draftOptIns[unit.name])
         const ctaLabel = !isPilotUnit
           ? 'Locked during PM pilot'
-          : hasRetryableAtoms
+          : hasRetryableAtoms || lifecycleState === LIFECYCLE_STATES.PARTIAL_DRAFT
             ? 'Retry failed sections'
             : lifecycleState === LIFECYCLE_STATES.DRAFT_GENERATED
               ? 'Regenerate Product Management'
@@ -2771,6 +2785,11 @@ function Stage3ReadinessPanels({
                       </div>
                     )}
                     <Stage3BuGenerationProgress progress={gen?.progress || draft?.progress} />
+                    {gen?.persistError && (
+                      <div style={{ marginTop: 7, fontSize: 9, fontFamily: 'var(--fm)', color: '#fbbf24', lineHeight: 1.45, fontWeight: 600 }}>
+                        ⚠ {gen.persistError}
+                      </div>
+                    )}
                     {gen?.error && (
                       <div style={{ marginTop: 7, fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.45 }}>
                         {gen.error}
@@ -3501,7 +3520,7 @@ export default function Stage3View({
   const savedSummaryNote    = activeRev?.contentSnapshot?.summaryNote    || ''
   const savedCoordinationLayer = activeRev?.contentSnapshot?.coordinationLayer || null
   const persistedExecutionPlans = Object.values(stage3DraftPlans)
-    .filter(d => [LIFECYCLE_STATES.DRAFT_GENERATED, LIFECYCLE_STATES.ACCEPTED].includes(d?.lifecycle?.status))
+    .filter(d => [LIFECYCLE_STATES.DRAFT_GENERATED, LIFECYCLE_STATES.PARTIAL_DRAFT, LIFECYCLE_STATES.ACCEPTED].includes(d?.lifecycle?.status))
     .map(d => d?.plan)
     .filter(Boolean)
   const recoveredLegacyExecutionPlans = Object.values(legacyStage3DraftPlans)
@@ -3944,14 +3963,31 @@ export default function Stage3View({
   // ── Unit-level refinement ───────────────────────────────────────────────────
   function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = [], lifecycle = {}, diagnostics = null, progress = null) {
     const now = new Date().toISOString()
+    const atomSummary = summarizeAtoms(executionAtoms)
+    const derivedStatus = lifecycle.status || deriveLifecycleState({ atoms: executionAtoms })
     const draft = {
       version: STAGE3_DRAFT_PLAN_VERSION,
+      workspaceId: effectiveWorkspaceId,
+      activePlanId: effectiveWorkspaceId,
+      buName: unit.name,
       businessUnitName: unit.name,
       sourceBasisRevisionId: stage1ActiveId,
       sourceStage2RevisionId: stage2ActiveId,
       plan,
       executionAtoms,
-      atomSummary: summarizeAtoms(executionAtoms),
+      atomSummary,
+      failures: executionAtoms
+        .filter(a => STAGE3_FAILED_ATOM_STATUSES.has(a?.status))
+        .map(a => ({
+          atomId: a.id,
+          elementName: a.elementName,
+          childKey: a.childKey,
+          reason: a.parserError || 'unknown',
+          stopReason: a.metadata?.stopReason || null,
+          failureLabel: a.metadata?.failureLabel || null,
+          usage: a.metadata?.usage || null,
+          rawExcerpt: typeof a.rawResponseText === 'string' ? a.rawResponseText.slice(0, 200) : null,
+        })),
       planStatus: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_draft' : 'limited_draft',
       planGenerationMode: readiness.completion === 'full' ? 'full' : readiness.completion === 'none' ? 'stage1_2_only' : 'limited',
       handoffStatus: readiness.status,
@@ -3963,19 +3999,29 @@ export default function Stage3View({
         failedCount: readiness.failedCount,
       },
       lifecycle: {
-        status: lifecycle.status || deriveLifecycleState({ atoms: executionAtoms }),
+        status: derivedStatus,
         acceptedAt: lifecycle.acceptedAt || null,
         failureReason: lifecycle.failureReason || null,
       },
+      status: derivedStatus,
+      accepted: false,
+      source,
+      provenance: { generatedBy: 'stage3-bu-plan-lifecycle', stage1Id: stage1ActiveId, stage2Id: stage2ActiveId },
+      tokenUsage: diagnostics ? { inputTokens: diagnostics.inputTokens || 0, outputTokens: diagnostics.outputTokens || 0 } : null,
       diagnostics,
       progress: progress ? { ...progress, lifecycleState: progress.lifecycleState === 'generating' ? 'interrupted' : progress.lifecycleState } : null,
-      source,
+      generatedAt: executionAtoms.find(a => a.completedAt)?.completedAt || now,
+      persistedAt: now,
+      updatedAt: now,
       lastSavedAt: now,
     }
     const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name)
-    writeJsonStorage(key, draft)
-    logExecutiveBoundary(unit, 'H. persistedStage3State', draft)
-    setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
+    const writeOk = writeJsonStorage(key, draft)
+    logExecutiveBoundary(unit, 'H. persistedStage3State', { key, writeOk, status: derivedStatus, atomSummary })
+    if (writeOk) {
+      setStage3DraftPlans(prev => ({ ...prev, [unit.name]: draft }))
+    }
+    return { ok: writeOk, key, draft }
   }
 
   async function handleGenerateBUPlan(unit, readiness) {
@@ -4102,10 +4148,18 @@ export default function Stage3View({
             latestFailureReason: currentAtom?.parserError || null,
             latestUsage: diagnostics?.latestUsage || null,
           })
-          persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms, { status: lifecycleState }, diagnostics, progress)
+          const { ok: midWriteOk } = persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms, { status: lifecycleState }, diagnostics, progress)
           setBuPlanGeneration(prev => ({
             ...prev,
-            [unit.name]: { running: true, error: null, lifecycleState, diagnostics, progress, atomSummary: summarizeAtoms(allAtoms) },
+            [unit.name]: {
+              running: true,
+              error: null,
+              persistError: midWriteOk ? null : 'Generated content was not persisted. Do not refresh.',
+              lifecycleState,
+              diagnostics,
+              progress,
+              atomSummary: summarizeAtoms(allAtoms),
+            },
           }))
         },
         worker: async (atom) => {
@@ -4190,25 +4244,37 @@ export default function Stage3View({
       })
 
       const updatedAtoms = lifecycleResult.atoms
-      const plan = lifecycleResult.lifecycleState === LIFECYCLE_STATES.DRAFT_GENERATED
+      const eligibleFinal = renderingEligibleAtoms(updatedAtoms)
+      const hasFinalFailures = updatedAtoms.some(a => STAGE3_FAILED_ATOM_STATUSES.has(a?.status))
+      // Assemble partial plan from any successful atoms — never null just because some atoms failed
+      const finalPlan = eligibleFinal.length
         ? assembleAtomizedBUPlan(unit, readiness, updatedAtoms, mode)
         : null
+      const finalLifecycleState = eligibleFinal.length && hasFinalFailures
+        ? LIFECYCLE_STATES.PARTIAL_DRAFT
+        : lifecycleResult.lifecycleState
       const finalProgress = buildStage3Progress({
         unit,
         mode: lifecycleResult.diagnostics?.retryMode || 'partial',
         atoms: updatedAtoms,
-        lifecycleState: lifecycleResult.lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED ? 'failed' : 'persisted',
+        lifecycleState: finalLifecycleState === LIFECYCLE_STATES.GENERATION_FAILED ? 'failed'
+          : finalLifecycleState === LIFECYCLE_STATES.PARTIAL_DRAFT ? 'partial' : 'persisted',
         skippedCount: lifecycleResult.diagnostics?.atomsSkippedAlreadyValid || 0,
-        latestFailureReason: lifecycleResult.lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED ? 'One or more field atoms failed.' : null,
+        latestFailureReason: hasFinalFailures ? `${updatedAtoms.filter(a => STAGE3_FAILED_ATOM_STATUSES.has(a?.status)).length} atom(s) failed. Retry to complete.` : null,
         latestUsage: lifecycleResult.diagnostics?.latestUsage || null,
       })
-      persistBuPlanDraft(unit, plan, readiness, 'ai', updatedAtoms, { status: lifecycleResult.lifecycleState }, lifecycleResult.diagnostics, finalProgress)
+      // Persist BEFORE updating React state — if write fails, block safe render
+      const { ok: persistOk } = persistBuPlanDraft(unit, finalPlan, readiness, 'ai', updatedAtoms, { status: finalLifecycleState }, lifecycleResult.diagnostics, finalProgress)
+      const persistError = !persistOk ? 'Generated content was not persisted. Do not refresh.' : null
       setBuPlanGeneration(prev => ({
         ...prev,
         [unit.name]: {
           running: false,
-          error: lifecycleResult.lifecycleState === LIFECYCLE_STATES.GENERATION_FAILED ? 'One or more Product Management atoms failed validation or generation.' : null,
-          lifecycleState: lifecycleResult.lifecycleState,
+          error: hasFinalFailures
+            ? `${updatedAtoms.filter(a => STAGE3_FAILED_ATOM_STATUSES.has(a?.status)).length} atom(s) failed. Retry to complete missing sections.`
+            : null,
+          persistError,
+          lifecycleState: persistOk ? finalLifecycleState : LIFECYCLE_STATES.GENERATION_FAILED,
           diagnostics: lifecycleResult.diagnostics,
           progress: finalProgress,
           atomSummary: lifecycleResult.atomSummary,

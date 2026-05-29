@@ -6,6 +6,7 @@ export const LIFECYCLE_STATES = {
   INPUT_READY: 'input_ready',
   GENERATING: 'generating',
   GENERATION_FAILED: 'generation_failed',
+  PARTIAL_DRAFT: 'partial_draft',
   DRAFT_GENERATED: 'draft_generated',
   ACCEPTED: 'accepted',
   STALE: 'stale',
@@ -49,9 +50,10 @@ export function deriveLifecycleState({ atoms = [], accepted = false, stale = fal
   if (!atoms.length) return LIFECYCLE_STATES.NOT_STARTED
   if (accepted && atoms.every(atomIsValidDraft)) return LIFECYCLE_STATES.ACCEPTED
   if (atoms.every(atomIsValidDraft)) return LIFECYCLE_STATES.DRAFT_GENERATED
-  if (atoms.some(atom => atom?.status === ATOM_STATUSES.FAILED || atom?.status === ATOM_STATUSES.API_RATE_LIMITED)) {
-    return LIFECYCLE_STATES.GENERATION_FAILED
-  }
+  const hasFailures = atoms.some(atom => atom?.status === ATOM_STATUSES.FAILED || atom?.status === ATOM_STATUSES.API_RATE_LIMITED)
+  const hasSuccess = atoms.some(atomIsValidDraft)
+  if (hasFailures && hasSuccess) return LIFECYCLE_STATES.PARTIAL_DRAFT
+  if (hasFailures) return LIFECYCLE_STATES.GENERATION_FAILED
   return LIFECYCLE_STATES.INPUT_READY
 }
 
