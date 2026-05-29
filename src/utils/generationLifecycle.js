@@ -78,6 +78,8 @@ export function buildGenerationDiagnostics({
   return {
     buName,
     atomCountRequested: requestedAtoms.length,
+    atomsRequestedThisRun: runnableAtoms.length,
+    totalAtomsEvaluated: requestedAtoms.length,
     atomsSkippedAlreadyValid: requestedAtoms.length - runnableAtoms.length,
     atomsGenerated: completedAtoms.length,
     atomsFailed: failedAtoms.length,

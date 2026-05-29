@@ -62,6 +62,13 @@ const READINESS_COLORS = {
 
 const STAGE3_QUEUE_DELAY_MS = 850
 const STAGE3_DRAFT_PLAN_VERSION = 1
+const STAGE3_BASIS_VERSION = 2
+const STAGE3_LEARNING_SIGNALS_VERSION = 1
+const STAGE3_REGENERATION_MODES = {
+  SMART: 'smart',
+  FORCE: 'force',
+  RECOMPILE_ONLY: 'recompile_only',
+}
 const STAGE3_FIELD_ATOM_KEYS = [
   'objective',
   'executionStrategy',
@@ -140,6 +147,11 @@ function stage2HandoffDraftKey(workspaceId, buName) {
 function stage3BuPlanDraftKey(workspaceId, stage1Id, stage2Id, buName) {
   if (!workspaceId || !stage1Id || !stage2Id || !buName) return null
   return `bsp_v1_stage3_bu_plan_${workspaceId}_${stage1Id}_${stage2Id}_${storageSafeName(buName)}`
+}
+
+function stage3BuPlanBackupKey(workspaceId, stage1Id, stage2Id, buName, timestamp) {
+  const base = stage3BuPlanDraftKey(workspaceId, stage1Id, stage2Id, buName)
+  return base ? `${base}_backup_${storageSafeName(timestamp || new Date().toISOString())}` : null
 }
 
 function stage3CoordinationDraftKey(workspaceId, stage1Id, stage2Id) {
@@ -736,6 +748,23 @@ function compactBusinessUnitSummaryForStage3(unit) {
   ].filter(line => !line.endsWith(': ')).join('\n')
 }
 
+function compactStage3CompiledStrategyBasisForPrompt(unit) {
+  const profile = inferCompiledBUProfile({ draft: null, legacyPlan: { buName: unit?.name, mission: unit?.purpose, strategicRole: unit?.strategicInvolvement }, handoffBrief: unit?.stage3PlanningContext?.handoffBrief, tree: null })
+  const basis = STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS
+  const pmNote = profile === 'productArchitecture'
+    ? 'Product & Competitive Architecture validation case: start from use cases, outcomes, workflow evidence, mocks/prototypes, solution path comparison, architecture review, pilot evidence, and evidence quality.'
+    : ''
+  return [
+    `Compiled strategy intent: ${basis.productIntent[0]}`,
+    `Accepted compiled structure: ${basis.acceptedStructure.join(' > ')}`,
+    `BU adaptation profile: ${profile}`,
+    `Role terms: ${roleLearningTerms(profile).join('; ')}`,
+    `General learning signals: ${basis.generalLearningSignals.slice(0, 6).join(' ')}`,
+    `Avoid: ${basis.prohibitedPatterns.slice(0, 7).join('; ')}`,
+    pmNote,
+  ].filter(Boolean).join('\n')
+}
+
 function buildStage3FieldAtomMessages(stage1Snapshot, s2Unit, handoffItem, fieldKey, generationMode, otherUnitNames) {
   const planningContext = s2Unit?.stage3PlanningContext || {}
   const brief = planningContext.stage2ToStage3HandoffBrief || planningContext.handoffBrief || {}
@@ -779,10 +808,12 @@ Section name: ${sectionName}
 Field atom to generate: ${fieldLabel} (${fieldKey})
 Other business units for dependency awareness only: ${otherUnitNames || 'none'}`
 
+  const learningBasis = compactStage3CompiledStrategyBasisForPrompt(s2Unit)
+
   return {
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
+      { role: 'user', content: `${userPrompt}\n\nStage 3 compiled strategy learning basis:\n${learningBasis}` },
     ],
   }
 }
@@ -810,8 +841,11 @@ function buildStage3Progress({ unit, mode, atoms = [], currentAtom = null, lifec
     totalAtomsForSection: sectionAtoms.length || STAGE3_FIELD_ATOM_KEYS.length,
     lifecycleState,
     skippedCount: resolvedSkippedCount,
+    generatedThisRunCount: Math.max(0, atoms.filter(atomIsValidDraft).length - resolvedSkippedCount),
     generatedCount: atoms.filter(atomIsValidDraft).length,
     failedCount: failedAtoms.length,
+    totalAtomsCurrentlyPersisted: atoms.length,
+    totalValidAtomsCurrentlyPersisted: atoms.filter(atomIsValidDraft).length,
     latestFailureReason: latestFailureReason || failedAtoms[failedAtoms.length - 1]?.parserError || null,
     latestUsage,
     startedAt: atoms.find(a => a.startedAt)?.startedAt || new Date().toISOString(),
@@ -1106,7 +1140,7 @@ function orderBusinessUnitsForStage3(units, stage1Snapshot) {
   return [...units].sort((a, b) => scoreUnit(a, units.indexOf(a)) - scoreUnit(b, units.indexOf(b)))
 }
 
-function buildExecutionAtomsForBU(unit, readiness, priorDraft, mode) {
+function buildExecutionAtomPlanForBU(unit, readiness, priorDraft, mode, regenerationMode = STAGE3_REGENERATION_MODES.SMART, generationRunId = null) {
   const priorAtoms = priorDraft?.executionAtoms || []
   const priorById = new Map(priorAtoms.map(atom => [atom.id, atom]))
   const sourceItems = readiness.structureItems.map((item, idx) => {
@@ -1122,34 +1156,150 @@ function buildExecutionAtomsForBU(unit, readiness, priorDraft, mode) {
       detail: match?.parsedValue ? listFromValue(match.parsedValue).join('; ') : item.text,
     }
   }).filter(item => mode === 'stage1_2_only' || item.parsedValue || item.text || item.status === 'complete')
+  const handoffBasis = buildStage3HandoffBasis(sourceItems)
+  const learningBasisHash = stage3TraceHash(STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS)
+  const runId = generationRunId || `stage3-run:${storageSafeName(unit.name)}:${stage3TraceHash(new Date().toISOString())}`
+  const staleByReason = {
+    handoffItemChanged: 0,
+    learningBasisChanged: 0,
+    missingMetadata: 0,
+    stage3BasisChanged: 0,
+    sourceItemMissing: 0,
+    priorGlobalBasis: 0,
+  }
+  const handoffChanges = new Map()
+  let currentAtoms = 0
+  let staleAtoms = 0
+  let skippedAtoms = 0
 
-  return sourceItems.flatMap((item, sectionIdx) => (
+  const atoms = sourceItems.flatMap((item, sectionIdx) => (
     STAGE3_FIELD_ATOM_KEYS.map((fieldKey, fieldIdx) => {
-      const sectionKey = item.key || item.label || String(sectionIdx)
+      const itemBasis = handoffBasis.itemBasis[sectionIdx] || buildStage3HandoffItemBasis(item, sectionIdx)
+      const sectionKey = itemBasis.handoffItemId
       const id = `stage3:${storageSafeName(unit.name)}:${storageSafeName(sectionKey)}:${fieldKey}`
-      return priorById.get(id) || createGenerationAtom({
+      const prior = priorById.get(id)
+      const sourceMetadata = {
+        handoffItem: item,
+        generationMode: mode,
+        regenerationMode,
+        generationRunId: runId,
+        sectionKey,
+        sectionName: itemBasis.handoffItemTitle,
+        sectionIndex: sectionIdx,
+        fieldKey,
+        fieldName: STAGE3_FIELD_ATOM_LABELS[fieldKey] || fieldKey,
+        fieldIndex: fieldIdx,
+        totalFieldsForSection: STAGE3_FIELD_ATOM_KEYS.length,
+        generatedFromBUName: unit.name,
+        generatedFromHandoffBasisHash: handoffBasis.basisHash,
+        generatedFromLearningBasisHash: learningBasisHash,
+        learningSignalsVersion: STAGE3_LEARNING_SIGNALS_VERSION,
+        generatedFromStage3BasisVersion: STAGE3_BASIS_VERSION,
+        generatedFromHandoffItemIds: [itemBasis.handoffItemId],
+        generatedFromHandoffItemHashes: { [itemBasis.handoffItemId]: itemBasis.handoffItemHash },
+        generatedFromHandoffItems: [itemBasis],
+        generatedAt: new Date().toISOString(),
+      }
+      const staleCheck = classifyStage3AtomStaleness(prior, unit.name, handoffBasis, itemBasis, learningBasisHash)
+      const forceRun = regenerationMode === STAGE3_REGENERATION_MODES.FORCE
+      if (regenerationMode === STAGE3_REGENERATION_MODES.RECOMPILE_ONLY && prior) {
+        if (staleCheck.stale) {
+          staleAtoms += 1
+          staleByReason[staleCheck.reasonKey] = (staleByReason[staleCheck.reasonKey] || 0) + 1
+        } else {
+          currentAtoms += 1
+          skippedAtoms += 1
+        }
+        return {
+          ...prior,
+          metadata: {
+            ...(prior.metadata || {}),
+            stalenessStatus: staleCheck.stale ? 'stale_not_regenerated' : 'current',
+            stalenessReason: staleCheck.reason,
+          },
+        }
+      }
+      const shouldRegenerate = forceRun || staleCheck.stale
+      if (prior && atomIsValidDraft(prior) && !shouldRegenerate) {
+        currentAtoms += 1
+        skippedAtoms += 1
+        return {
+          ...prior,
+          metadata: {
+            ...(prior.metadata || {}),
+            stalenessStatus: 'current',
+            stalenessReason: staleCheck.reason,
+          },
+        }
+      }
+      staleAtoms += 1
+      staleByReason[forceRun ? 'stage3BasisChanged' : staleCheck.reasonKey] = (staleByReason[forceRun ? 'stage3BasisChanged' : staleCheck.reasonKey] || 0) + 1
+      if (staleCheck.reasonKey === 'handoffItemChanged') {
+        const current = handoffChanges.get(itemBasis.handoffItemId) || {
+          handoffItemId: itemBasis.handoffItemId,
+          handoffItemTitle: itemBasis.handoffItemTitle,
+          previousHash: staleCheck.previousHash || null,
+          currentHash: itemBasis.handoffItemHash,
+          affectedAtomCount: 0,
+          affectedGeneratedFields: [],
+        }
+        current.affectedAtomCount += 1
+        current.affectedGeneratedFields.push(fieldKey)
+        handoffChanges.set(itemBasis.handoffItemId, current)
+      }
+      return createGenerationAtom({
         id,
         stage: 'stage3',
         phase: 'executionPlanFieldAtom',
         parentId: unit.name,
         businessUnitName: unit.name,
-        elementName: item.label || item.elementName || item.key,
+        elementName: itemBasis.handoffItemTitle,
         childKey: fieldKey,
         status: ATOM_STATUSES.PENDING,
         metadata: {
-          handoffItem: item,
-          generationMode: mode,
-          sectionKey,
-          sectionName: item.label || item.elementName || item.key,
-          sectionIndex: sectionIdx,
-          fieldKey,
-          fieldName: STAGE3_FIELD_ATOM_LABELS[fieldKey] || fieldKey,
-          fieldIndex: fieldIdx,
-          totalFieldsForSection: STAGE3_FIELD_ATOM_KEYS.length,
+          ...(prior?.metadata || {}),
+          ...sourceMetadata,
+          priorStatus: prior?.status || null,
+          stalenessStatus: forceRun ? 'force_regenerate' : 'stale',
+          stalenessReason: forceRun ? 'force regenerate all atoms' : staleCheck.reason,
+          previousHandoffItemHashes: prior?.metadata?.generatedFromHandoffItemHashes || null,
         },
       })
     })
   ))
+
+  return {
+    atoms,
+    sourceItems,
+    handoffBasis,
+    learningBasisHash,
+    generationRunId: runId,
+    stalenessPlan: {
+      regenerationMode,
+      generationRunId: runId,
+      totalAtoms: atoms.length,
+      currentAtoms,
+      staleAtoms,
+      willRegenerate: regenerationMode === STAGE3_REGENERATION_MODES.RECOMPILE_ONLY ? 0 : atoms.filter(atom => STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status)).length,
+      willSkip: skippedAtoms,
+      staleDueToHandoffItemChange: staleByReason.handoffItemChanged || 0,
+      staleDueToLearningBasisChange: staleByReason.learningBasisChanged || 0,
+      staleDueToMissingMetadata: (staleByReason.missingMetadata || 0) + (staleByReason.priorGlobalBasis || 0),
+      staleDueToStage3BasisChange: staleByReason.stage3BasisChanged || 0,
+      staleDueToMissingSourceItem: staleByReason.sourceItemMissing || 0,
+      sourceHandoffItemsChanged: handoffChanges.size,
+      sourceHandoffItemsUnchanged: Math.max(0, sourceItems.length - handoffChanges.size),
+      handoffChanges: Array.from(handoffChanges.values()).map(change => ({
+        ...change,
+        affectedGeneratedFields: [...new Set(change.affectedGeneratedFields)],
+      })),
+      atomSetCurrency: staleAtoms === 0 ? 'current' : currentAtoms > 0 ? 'mixed-current-after-regeneration' : 'stale',
+    },
+  }
+}
+
+function buildExecutionAtomsForBU(unit, readiness, priorDraft, mode) {
+  return buildExecutionAtomPlanForBU(unit, readiness, priorDraft, mode).atoms
 }
 
 function assembleAtomizedBUPlan(unit, readiness, atoms, mode) {
@@ -2553,9 +2703,11 @@ function Stage3BuGenerationProgress({ progress }) {
               {progress.lifecycleState}
             </Badge>
             <Badge color="var(--muted)" small>{progress.mode}</Badge>
-            <Badge color="#00e5b4" small>{progress.generatedCount} generated</Badge>
-            <Badge color="var(--muted)" small>{progress.skippedCount} skipped</Badge>
-            <Badge color={progress.failedCount ? '#f87171' : 'var(--muted)'} small>{progress.failedCount} failed</Badge>
+            <Badge color="#00e5b4" small>{progress.generatedThisRunCount ?? 0} generated this run</Badge>
+            <Badge color="var(--muted)" small>{progress.skippedCount ?? 0} skipped this run</Badge>
+            <Badge color={progress.failedCount ? '#f87171' : 'var(--muted)'} small>{progress.failedCount ?? 0} failed this run</Badge>
+            <Badge color="#3b82f6" small>{progress.totalValidAtomsCurrentlyPersisted ?? progress.generatedCount ?? 0} valid persisted</Badge>
+            <Badge color="var(--muted)" small>{progress.totalAtomsCurrentlyPersisted ?? 0} total persisted</Badge>
           </div>
         </>
       )}
@@ -2936,6 +3088,19 @@ function Stage3ReadinessPanels({
           const match = readiness.itemStates.find(state => state.key === item.key || state.key === String(readiness.structureItems.indexOf(item)))
           return { ...item, ...(match || {}) }
         })
+        const executionGenerationMode = readiness.completion === 'full'
+          ? 'full'
+          : readiness.completion === 'none'
+            ? 'stage1_2_only'
+            : 'limited'
+        const smartRegenerationPreview = (() => {
+          try {
+            return buildExecutionAtomPlanForBU(unit, readiness, draft, executionGenerationMode, STAGE3_REGENERATION_MODES.SMART)
+          } catch {
+            return null
+          }
+        })()
+        const visibleStalenessPlan = gen?.stalenessPlan || draft?.stalenessPlan || smartRegenerationPreview?.stalenessPlan || null
         const failedItems = readiness.itemStates.filter(item => item.status === 'failed' || item.parserError)
         const staleItems = readiness.itemStates.filter(item => item.isStale)
         const missingItems = handoffItems.filter(item => !item.parsedValue && !Object.keys(item.childAtoms || {}).length && item.status !== 'complete')
@@ -3130,7 +3295,7 @@ function Stage3ReadinessPanels({
                             : `Retry mode: only failed, missing, or stale atoms for ${unit.name} will run.`}
                     </div>
                     <button
-                      onClick={() => actionEnabled ? onGenerateBUPlan(unit, readiness) : onStage2Action(unit.name, null, 'review')}
+                      onClick={() => actionEnabled ? onGenerateBUPlan(unit, { ...readiness, regenerationMode: STAGE3_REGENERATION_MODES.SMART }) : onStage2Action(unit.name, null, 'review')}
                       disabled={disabled || gen?.running || !!blockReason || (!isExecutiveFixtureMode && readiness.completion === 'none' && !draftOptIns[unit.name] && mode.label !== 'Pending')}
                       style={{
                         ...primaryButtonStyle,
@@ -3140,8 +3305,26 @@ function Stage3ReadinessPanels({
                         color: actionEnabled ? '#000' : 'var(--muted)',
                       }}
                     >
-                      {gen?.running ? (isExecutiveFixtureMode ? 'Loading fixture...' : 'Generating...') : ctaLabel}
+                      {gen?.running ? (isExecutiveFixtureMode ? 'Loading fixture...' : 'Generating...') : ctaLabel === `Regenerate ${unit.name}` ? 'Smart regenerate stale atoms' : ctaLabel}
                     </button>
+                    {hasPlan && !blockReason && lifecycleState !== LIFECYCLE_STATES.ACCEPTED && (
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                        <button
+                          onClick={() => onGenerateBUPlan(unit, { ...readiness, regenerationMode: STAGE3_REGENERATION_MODES.FORCE })}
+                          disabled={disabled || gen?.running}
+                          style={{ ...secondaryButtonStyle, marginTop: 0 }}
+                        >
+                          Force regenerate all atoms
+                        </button>
+                        <button
+                          onClick={() => onGenerateBUPlan(unit, { ...readiness, regenerationMode: STAGE3_REGENERATION_MODES.RECOMPILE_ONLY })}
+                          disabled={disabled || gen?.running}
+                          style={{ ...secondaryButtonStyle, marginTop: 0 }}
+                        >
+                          Recompile only
+                        </button>
+                      </div>
+                    )}
                     {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && !blockReason && (
                       <button
                         onClick={() => onGenerateBUPlan(unit, { ...readiness, acceptOnly: true })}
@@ -3155,11 +3338,14 @@ function Stage3ReadinessPanels({
                       <div style={{ marginTop: 8, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
                         {(() => {
                           const d = gen?.diagnostics || draft?.diagnostics
-                          return `${d.retryMode || 'partial'} · requested ${d.atomCountRequested || 0}, skipped ${d.atomsSkippedAlreadyValid || 0}, generated ${d.atomsGenerated || 0}, failed ${d.atomsFailed || 0}, input ${d.inputTokens || 0} tokens, output ${d.outputTokens || 0} tokens`
+                          const skippedThisRun = d.atomsSkippedAlreadyValid || 0
+                          const generatedThisRun = Math.max(0, (d.atomsGenerated || 0) - skippedThisRun)
+                          return `${d.retryMode || 'partial'} - current run requested ${d.atomsRequestedThisRun ?? d.atomCountRequested ?? 0}, generated this run ${generatedThisRun}, skipped this run ${skippedThisRun}, failed this run ${d.atomsFailed || 0}; total evaluated ${d.totalAtomsEvaluated ?? d.atomCountRequested ?? 0}; total valid persisted ${d.atomsGenerated || 0}; input ${d.inputTokens || 0} tokens, output ${d.outputTokens || 0} tokens`
                         })()}
                       </div>
                     )}
                     <Stage3BuGenerationProgress progress={gen?.progress || draft?.progress} />
+                    <Stage3SelectiveRegenerationDiagnostics plan={visibleStalenessPlan} />
                     {gen?.persistError && (
                       <div style={{ marginTop: 7, fontSize: 9, fontFamily: 'var(--fm)', color: '#fbbf24', lineHeight: 1.45, fontWeight: 600 }}>
                         ⚠ {gen.persistError}
@@ -3232,9 +3418,11 @@ function Stage3ReadinessPanels({
                     draft={draft}
                     legacyPlan={legacyPlan}
                     handoffBrief={readiness.handoffBrief || readiness.planningContext?.handoffBrief}
+                    handoffItems={handoffItems}
                     unitName={unit.name}
                     onStage2Action={onStage2Action}
                     showHandoffBrief={false}
+                    generationState={gen}
                   />
                 )}
 
@@ -3600,7 +3788,1049 @@ function buildPlanTree(atoms) {
 
 // ── Stage3BUPlanTree — dimension-first BU execution plan hierarchy ────────────
 
-function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, unitName, onStage2Action, showHandoffBrief = true }) {
+// Stage 3 Strategy Basis Compiler - derived view only. It reads the compact
+// handoff brief plus current atoms and does not alter persisted Stage 3 atoms.
+const PM_DECISION_PATTERNS = [
+  { name: 'Build vs Partner', re: /build|partner|vendor|external/i, options: ['Build internally', 'Partner for selected capability', 'Hybrid build plus partner integration'] },
+  { name: 'Investment Scope', re: /investment|budget|scope|tier 1|full-service|full service|margin|pricing/i, options: ['Narrow pilot scope', 'Fund full capability path', 'Stage investment behind evidence gates'] },
+  { name: 'Architecture Boundaries', re: /architecture|modular|schema|connector|api|etl|interface|boundary/i, options: ['Fixed connector boundary', 'Extension-ready modular boundary', 'Custom integration exception path'] },
+  { name: 'Pilot Validation Standard', re: /pilot|validation|evidence|threshold|workflow|completeness/i, options: ['Workflow mock validation', 'Controlled pilot evidence', 'Client plus SME review standard'] },
+  { name: 'Rollout Gate', re: /rollout|scale|gate|go\/no-go|launch|sprint|release/i, options: ['Hold for evidence', 'Limited rollout', 'Scale after validation and dependency clearance'] },
+]
+
+const PM_RISK_TEMPLATES = [
+  { name: 'False Validation Risk', re: /false|validation|pilot|sandbox|self-reported|workflow|client feedback/i, description: 'Validation may appear positive without proving that the product improves a real client workflow.', mitigations: ['Use observed workflow reviews, not only self-reported feedback', 'Test mocks or prototypes against realistic BSA/AML decisions', 'Document contradictions and unresolved objections before gate approval'], warnings: ['Positive feedback lacks observed workflow evidence', 'Pilot users need analyst translation to interpret outputs', 'Contradictory feedback is summarized away'], reduced: ['Observed use shows reduced friction or improved decision confidence', 'More than one review path supports the same conclusion', 'Assumptions remain tagged until confirmed'] },
+  { name: 'Architecture Lock-In Risk', re: /architecture|lock|modular|schema|connector|api|etl|interface|core system/i, description: 'Early technical choices may lock the BU into brittle connectors, data mappings, or vendor assumptions before evidence is mature.', mitigations: ['Define interface boundaries before deep build', 'Separate reusable connector logic from custom ETL exceptions', 'Review architecture decisions against scale and regulatory change scenarios'], warnings: ['Connector work starts before schema coverage is confirmed', 'Custom ETL exceptions become the default path', 'Architecture choices depend on a single client or core system'], reduced: ['Architecture review confirms extension points and exception handling', 'Schema coverage gaps are visible before build commitment', 'Pilot scope can change without major rework'] },
+  { name: 'Scope Expansion Risk', re: /scope|feature creep|generative ai|boundary|excluded|roadmap|full-service|full service/i, description: 'Execution can absorb adjacent feature, service, or AI commitments that blur the Tier 1 boundary.', mitigations: ['Publish explicit in-scope and out-of-scope boundaries', 'Use re-entry criteria for deferred features', 'Gate scope changes through evidence and commercial impact review'], warnings: ['Sales or delivery messages promise excluded capabilities', 'Pilot feedback expands scope without re-prioritization', 'Boundary exceptions are handled informally'], reduced: ['Scope exclusions and re-entry criteria are documented', 'Pilot agreements match product capability', 'Boundary changes are tied to evidence and margin impact'] },
+  { name: 'Under-Investment Risk', re: /under.?investment|bandwidth|capacity|resourcing|engineering|api|delivery cost|consultant-hour|hours/i, description: 'The plan may require more product, engineering, delivery, or governance capacity than the current investment posture supports.', mitigations: ['Tie phase advancement to capacity confirmation', 'Quantify API and delivery bottlenecks before rollout', 'Escalate margin or labor impacts before scope is locked'], warnings: ['Critical-path inputs slip without replanning', 'Manual delivery effort remains hidden in completeness metrics', 'Engineering or delivery dependencies are treated as assumptions'], reduced: ['Capacity constraints are visible in gates', 'Labor and connector complexity are reflected in pricing or scope', 'Blocked inputs have an explicit escalation path'] },
+  { name: 'Regulatory Evolution Risk', re: /regulatory|occ|fincen|compliance|model risk|explainability|audit|examiner/i, description: 'Regulatory or examiner expectations may change after product scope, explainability, or evidence standards are set.', mitigations: ['Keep Compliance and Model Risk inputs as context before scope lock', 'Maintain traceable explainability and exclusion rationale', 'Design validation evidence so it can support audit review'], warnings: ['Compliance review lags product specification', 'Explainability evidence is not tied to actual outputs', 'Regulatory assumptions are treated as final'], reduced: ['Scope and validation decisions have compliance traceability', 'Evidence package can answer examiner-facing questions', 'Open regulatory assumptions remain visible'] },
+]
+
+const PM_PHASES = [
+  { name: 'Problem & Outcome Validation', objective: 'Clarify the priority use case, workflow outcome, and success signal before committing architecture or rollout scope.', options: [['Client workflow interviews', 'Use when the workflow problem is understood at a high level but the decision moment is unclear.', 'Surfaces where users struggle, what they trust, and what outcome matters.', 'Interview notes tied to workflow steps and decision points'], ['Mock explainability output review', 'Use when the team needs fast feedback before engineering build.', 'Tests whether users can interpret the output and whether it supports a real decision.', 'Annotated mock review, hesitation points, accepted/rejected interpretations'], ['SME/advisor review', 'Use when regulatory, domain, or BSA/AML interpretation risk is material.', 'Separates product usefulness from domain correctness and explainability fit.', 'SME disposition notes, unresolved objections, required terminology changes'], ['Support/sales signal analysis', 'Use when existing field conversations reveal recurring pain or adoption barriers.', 'Converts anecdotal demand into patterns that can guide pilot scope.', 'Tagged objection themes, demand signals, buyer confusion patterns'], ['Workflow observation', 'Use when stated needs may not match actual analyst or client behavior.', 'Produces observed evidence of friction, workarounds, and decision confidence.', 'Observation notes, before/after workflow comparison, friction log']], exit: ['Priority workflow is named', 'Outcome signal is observable', 'Unresolved assumptions are tagged before solution comparison'] },
+  { name: 'Solution Path Evaluation', objective: 'Compare build, partner, hybrid, and scope alternatives against evidence, constraints, and commercial fit.', options: [['Build-vs-partner decision matrix', 'Use when external capability could accelerate delivery or reduce risk.', 'Makes tradeoffs explicit instead of burying them in architecture or dependency notes.', 'Option matrix with evidence, cost, control, integration, and timing implications'], ['Partner capability screen', 'Use when vendor claims need verification before roadmap dependency.', 'Tests whether a partner can meet workflow, integration, and explainability needs.', 'Vendor evidence checklist, integration gaps, contract or governance concerns'], ['Internal capability assessment', 'Use when build feasibility depends on scarce product or engineering capacity.', 'Links ambition to available architecture, data, and API bandwidth.', 'Capacity estimate, build risk notes, prerequisite inputs'], ['Commercial boundary comparison', 'Use when Tier 1 versus full-service scope affects margin or positioning.', 'Prevents solution choice from undermining pricing architecture.', 'Boundary scenarios, gross margin sensitivity, delivery labor impact']], exit: ['Preferred solution path is documented', 'Rejected paths have rationale', 'Evidence gaps are assigned to later gates rather than hidden'] },
+  { name: 'Architecture & Delivery Readiness', objective: 'Define product, data, integration, and delivery boundaries before build work creates lock-in.', options: [['Architecture boundary review', 'Use before connector or dashboard build begins.', 'Confirms what is reusable, configurable, custom, deferred, or excluded.', 'Boundary spec, extension points, exception handling notes'], ['Schema and data coverage matrix', 'Use when core-system or use-case coverage determines pilot eligibility.', 'Prevents technical coverage from being confused with functional completeness.', 'Field coverage matrix, gap flags, ETL classification'], ['Delivery templateability audit', 'Use when delivery labor reduction is part of the strategy.', 'Shows which work can be productized and which still depends on consultants.', 'Consultant-hour baseline, manual intervention list, templateability score'], ['Compliance explainability review', 'Use when outputs may carry OCC, FinCEN, or model-risk scrutiny.', 'Ensures architecture and feature scope can support audit and examiner expectations.', 'Explainability memo, restricted fields, disclosure or exclusion rationale']], exit: ['Architecture boundaries are explicit', 'Critical dependencies are confirmed or gated', 'Delivery and compliance constraints are visible before pilot'] },
+  { name: 'Pilot / Controlled Rollout', objective: 'Expose the solution to realistic workflow use while limiting client, regulatory, and delivery risk.', options: [['Controlled client pilot', 'Use when real workflow evidence is needed before broader launch.', 'Tests usefulness, completeness, and delivery effort under bounded conditions.', 'Pilot notes, completeness results, client objections, workflow outcomes'], ['Parallel mock-to-live comparison', 'Use when mock validation may not reflect production behavior.', 'Checks whether prototype assumptions survive real data and users.', 'Variance log between mock expectations and live use'], ['Delivery operations dry run', 'Use when onboarding effort or support load is a major risk.', 'Validates whether the operating model can support rollout without hidden labor.', 'Runbook gaps, escalation events, support burden estimate'], ['Regulatory evidence package review', 'Use when pilot outputs may need audit defensibility.', 'Tests whether the evidence record can explain product decisions and boundaries.', 'Evidence binder, compliance comments, unresolved regulatory assumptions']], exit: ['Pilot evidence meets the validation standard', 'Rework triggers are resolved or accepted', 'Rollout risks are visible before scale'] },
+  { name: 'Scale Decision', objective: 'Decide whether to scale, hold, narrow, or redirect based on observed evidence and dependency readiness.', options: [['Go/no-go gate review', 'Use when leadership needs a clean scale decision.', 'Forces the decision to cite evidence, dependencies, risks, and unresolved assumptions.', 'Gate memo, decision rationale, conditions for scale'], ['Segmented rollout plan', 'Use when evidence is strong for some clients, core systems, or use cases but not all.', 'Avoids all-or-nothing scaling while preserving evidence discipline.', 'Eligible segment list, excluded segment rationale, next validation needs'], ['Scope adjustment workshop', 'Use when validation shows value but boundaries need refinement.', 'Turns pilot learning into a narrower or more durable execution scope.', 'Revised scope, deferred items, Stage 4 requirements candidates'], ['Post-pilot risk burn-down review', 'Use when risks remain material but manageable.', 'Confirms which risks reduced, which remain, and which require coordination.', 'Risk evidence summary, mitigation status, residual risk notes']], exit: ['Scale decision is evidence-backed', 'Deferred work is routed to coordination or Stage 4', 'Source traceability remains available'] },
+]
+
+const STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS = {
+  productIntent: [
+    'Stage 3 compiled strategy is a BU-readable decision-support artifact.',
+    'It converts Stage 2 handoff evidence, Stage 3 atomized detail, shared spine, source references, and review learning into decisions, execution logic, dependencies, mitigated risks, validation criteria, and traceability.',
+    'It should compile, compress, organize, and audit rather than copy Stage 2 or restate atomized Stage 3 buckets.',
+  ],
+  acceptedStructure: [
+    'Strategic Objective',
+    'Critical Decisions',
+    'Execution Sequence',
+    'Dependencies',
+    'Risk & Mitigation',
+    'Validation Framework',
+    'Handoff Coverage / Loss Audit',
+  ],
+  generalLearningSignals: [
+    'Stage 3 should compile, not copy, Stage 2 handoff content.',
+    'Compression must be auditable.',
+    'The compiled view should reduce repetition across strategy, decisions, gates, risks, dependencies, and validation.',
+    'Each BU plan must define what the unit must accomplish.',
+    'Each BU plan must identify decisions that block, shape, or materially change execution.',
+    'Each BU plan must include realistic execution methods appropriate to that BU role.',
+    'Each BU plan must distinguish dependencies from risks.',
+    'Each BU plan must define mitigation options for material risks.',
+    'Each BU plan must define how validation is completed.',
+    'Each BU plan must state what evidence counts and how evidence quality is assessed.',
+    'Handoff content must be classified as used, compressed, converted, deferred, source-only, unused, or possibly lost.',
+    'Cross-BU ownership and reciprocal dependency assignment belong in Cross-BU Coordination, not forced into every BU risk section.',
+    'No generated strategic text should be truncated.',
+    'Do not use first-N-words labels or ellipsis labels as semantic structure.',
+    'The compiled plan should prefer clear, role-specific labels over sliced source text.',
+  ],
+  prohibitedPatterns: [
+    'repeating the same recommendation across multiple compiled sections',
+    'turning every compiled section into a mini-plan',
+    'generating only what statements without how',
+    'generic end-to-end options such as validation first, architecture first, or partner first',
+    'copying large blocks of handoff text into the compiled strategy',
+    'silently dropping Stage 2 handoff content',
+    'risks without mitigation options',
+    'validation criteria that only say pilot metrics achieved',
+    'validation content without completion criteria',
+    'validation content without veracity checks',
+    'dependencies that overlap with risks without clarifying the distinction',
+    'adding owners where ownership belongs in Cross-BU Coordination',
+    'visible labels derived from string slices',
+    'visible strategic content with ellipses or truncation',
+  ],
+  qualityChecks: [
+    { id: 'accepted_structure', label: 'Compiled strategy follows the accepted structure.', category: 'compiledBUExecutionPlan' },
+    { id: 'decision_depth', label: 'Each critical decision includes why it matters and evidence needed.', category: 'criticalDecisions' },
+    { id: 'phase_how_options', label: 'Execution sequence includes phase-specific practical how options.', category: 'executionSequence', minHowOptionsPerPhase: 3 },
+    { id: 'execution_method_fit', label: 'Each execution method explains why it fits the phase objective and identifies evidence produced.', category: 'executionSequence' },
+    { id: 'risk_mitigation_depth', label: 'Risks include mitigation options, early warnings, and evidence of reduction.', category: 'risksAndMitigations', requiredFields: ['mitigationOptions', 'earlyWarningSignals', 'evidenceThatRiskIsReduced'] },
+    { id: 'validation_depth', label: 'Validation includes criteria, completion method, evidence, veracity, and rework triggers.', category: 'validationFramework', requiredFields: ['completionCriteria', 'howToDetermineCompletion', 'evidenceExamples', 'veracityChecks', 'failureOrReworkTriggers'] },
+    { id: 'dependency_distinction', label: 'Dependencies remain distinct from risks and validation.', category: 'dependencies' },
+    { id: 'no_forced_risk_ownership', label: 'Ownership is not forced inside BU risk sections.', category: 'risksAndMitigations' },
+    { id: 'auditable_compression', label: 'Compression is auditable through handoff coverage.', category: 'handoffCoverageAudit' },
+    { id: 'handoff_classification', label: 'Handoff content is classified across coverage buckets.', category: 'handoffCoverageAudit' },
+    { id: 'no_truncated_strategy_text', label: 'No generated strategic text is truncated.', category: 'compiledBUExecutionPlan' },
+    { id: 'reduce_repetition', label: 'Compiled view reduces repetition compared with atomized buckets.', category: 'compiledBUExecutionPlan' },
+  ],
+  buAdaptationGuidance: {
+    executive: ['investment authority', 'decision thresholds', 'governance cadence', 'prioritization tradeoffs', 'escalation criteria'],
+    compliance: ['regulatory interpretation', 'documentation standards', 'review checkpoints', 'evidence sufficiency', 'model-risk concerns', 'examiner readiness'],
+    engineering: ['capacity constraints', 'integration feasibility', 'technical sequencing', 'interface contracts', 'non-functional requirements', 'architecture risk'],
+    goToMarket: ['positioning', 'buyer segmentation', 'launch readiness', 'messaging validation', 'sales enablement', 'commercial signal quality'],
+    partner: ['vendor evaluation', 'commercial terms', 'integration risk', 'substitution rights', 'partner dependency', 'procurement readiness'],
+    delivery: ['workflow validation', 'client readiness', 'operational adoption', 'delivery burden', 'support model', 'implementation feedback loops'],
+    productArchitecture: ['use cases', 'outcomes', 'workflow evidence', 'mock/prototype validation', 'solution path comparison', 'architecture review', 'pilot evidence'],
+  },
+  pmValidationCaseGuidance: {
+    phases: PM_PHASES,
+    risks: PM_RISK_TEMPLATES,
+    evidenceExamples: ['annotated mock review', 'workflow walkthrough notes', 'before/after workflow comparison', 'client feedback summary', 'Managed Client Delivery review notes', 'recorded objections', 'unresolved concerns', 'architecture review notes', 'interface specification', 'comparative vendor scorecard'],
+    veracityChecks: ['evidence is observed, not only self-reported', 'evidence comes from more than one client/workflow where possible', 'contradictory feedback is documented', 'assumptions are tagged unresolved', 'decision rationale is traceable', 'evidence shows decision impact, not just user preference'],
+  },
+}
+
+function Stage3SelectiveRegenerationDiagnostics({ plan }) {
+  const [open, setOpen] = useState(false)
+  if (!plan) return null
+  const changed = plan.handoffChanges || []
+  return (
+    <div style={{ marginTop: 8, border: '1px solid var(--border)', borderRadius: 5, overflow: 'hidden', background: 'var(--surface)' }}>
+      <div
+        onClick={() => setOpen(o => !o)}
+        style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer', padding: '7px 9px', background: 'var(--s2)' }}
+      >
+        <Badge color={plan.willRegenerate ? '#fb923c' : '#00e5b4'} small>{plan.regenerationMode || 'smart'}</Badge>
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', flex: 1 }}>
+          Handoff Changes Driving Regeneration - {plan.staleAtoms || 0} stale / {plan.totalAtoms || 0} atoms, {plan.willRegenerate || 0} will regenerate, {plan.willSkip || 0} will skip
+        </span>
+        <span style={{ fontSize: 8, color: 'var(--muted)' }}>{open ? 'hide' : 'show'}</span>
+      </div>
+      {open && (
+        <div style={{ padding: '8px 9px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+            <Badge color="#3b82f6" small>{plan.totalAtoms || 0} total atoms</Badge>
+            <Badge color="#00e5b4" small>{plan.currentAtoms || 0} current atoms</Badge>
+            <Badge color="#fb923c" small>{plan.staleDueToHandoffItemChange || 0} stale: handoff change</Badge>
+            <Badge color="#fb923c" small>{plan.staleDueToLearningBasisChange || 0} stale: learning basis</Badge>
+            <Badge color="#fb923c" small>{plan.staleDueToMissingMetadata || 0} stale: missing metadata</Badge>
+            <Badge color="#fb923c" small>{plan.staleDueToStage3BasisChange || 0} stale: Stage 3 basis</Badge>
+            <Badge color="#f87171" small>{plan.staleDueToMissingSourceItem || 0} stale: missing source</Badge>
+            <Badge color="#a3e635" small>{plan.sourceHandoffItemsChanged || 0} source items changed</Badge>
+            <Badge color="var(--muted)" small>{plan.sourceHandoffItemsUnchanged || 0} source items unchanged</Badge>
+          </div>
+          <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.45 }}>
+            generationRunId {plan.generationRunId || 'not assigned'} - atom set {plan.atomSetCurrency || 'unknown'}
+          </div>
+          {changed.length > 0 ? (
+            <div>
+              <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>
+                Changed Handoff Items
+              </div>
+              {changed.map(change => (
+                <div key={change.handoffItemId} style={{ border: '1px solid rgba(251,146,60,.25)', borderRadius: 4, padding: '7px 8px', marginBottom: 6, background: 'rgba(251,146,60,.04)' }}>
+                  <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>{change.handoffItemTitle}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 5 }}>
+                    <Field label="previous hash" value={change.previousHash || 'not available'} />
+                    <Field label="current hash" value={change.currentHash || 'not available'} />
+                    <Field label="affected atom count" value={String(change.affectedAtomCount || 0)} />
+                    <Field label="affected fields" value={(change.affectedGeneratedFields || []).join(', ')} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)' }}>
+              No changed handoff items are mapped to stale atoms. Smart regeneration will skip all atoms unless metadata or basis versions require regeneration.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function normalizeHandoffItemForHash(item = {}) {
+  return {
+    key: item.key || item.sourceRefId || item.id || item.label || item.name || '',
+    label: item.label || item.name || item.title || item.elementName || '',
+    text: item.text || '',
+    parsedValue: item.parsedValue || null,
+    childAtoms: item.childAtoms || null,
+    detail: item.detail || '',
+    status: item.status || '',
+    sourceRefId: item.sourceRefId || null,
+  }
+}
+
+function buildStage3HandoffItemBasis(item = {}, idx = 0) {
+  const normalized = normalizeHandoffItemForHash(item)
+  const handoffItemId = String(normalized.key || normalized.sourceRefId || storageSafeName(normalized.label) || idx)
+  const handoffItemTitle = normalized.label || normalized.key || `Handoff item ${idx + 1}`
+  const contentHash = stage3TraceHash(normalized)
+  return {
+    handoffItemId,
+    handoffItemTitle,
+    handoffItemHash: contentHash,
+    handoffItemContentHash: contentHash,
+    handoffItemUpdatedAt: item.updatedAt || item.completedAt || item.lastSavedAt || item.generatedAt || null,
+  }
+}
+
+function buildStage3HandoffBasis(items = []) {
+  const itemBasis = (items || []).map(buildStage3HandoffItemBasis)
+  return {
+    itemBasis,
+    itemHashById: Object.fromEntries(itemBasis.map(item => [item.handoffItemId, item.handoffItemHash])),
+    basisHash: stage3TraceHash(itemBasis.map(item => ({
+      id: item.handoffItemId,
+      hash: item.handoffItemHash,
+      updatedAt: item.handoffItemUpdatedAt,
+    }))),
+  }
+}
+
+function getAtomSourceBasis(atom) {
+  const meta = atom?.metadata || {}
+  const idList = Array.isArray(meta.generatedFromHandoffItemIds)
+    ? meta.generatedFromHandoffItemIds.map(id => String(id || '').trim()).filter(Boolean)
+    : listFromValue(meta.generatedFromHandoffItemIds).map(id => String(id || '').trim()).filter(Boolean)
+  return {
+    generatedFromBUName: meta.generatedFromBUName,
+    generatedFromHandoffBasisHash: meta.generatedFromHandoffBasisHash,
+    generatedFromLearningBasisHash: meta.generatedFromLearningBasisHash,
+    learningSignalsVersion: meta.learningSignalsVersion,
+    generatedFromStage3BasisVersion: meta.generatedFromStage3BasisVersion,
+    generatedFromHandoffItemIds: idList,
+    generatedFromHandoffItemHashes: meta.generatedFromHandoffItemHashes || {},
+  }
+}
+
+function classifyStage3AtomStaleness(atom, unitName, handoffBasis, itemBasis, learningBasisHash = null) {
+  if (!atom || !atomIsValidDraft(atom)) return { stale: true, reason: 'missing metadata', reasonKey: 'missingMetadata' }
+  const source = getAtomSourceBasis(atom)
+  if (!source.generatedFromBUName || source.generatedFromBUName !== unitName) return { stale: true, reason: 'BU name mismatch', reasonKey: 'missingMetadata' }
+  if (source.learningSignalsVersion !== STAGE3_LEARNING_SIGNALS_VERSION || !source.generatedFromLearningBasisHash || (learningBasisHash && source.generatedFromLearningBasisHash !== learningBasisHash)) return { stale: true, reason: 'learning basis changed', reasonKey: 'learningBasisChanged' }
+  if (source.generatedFromStage3BasisVersion !== STAGE3_BASIS_VERSION) return { stale: true, reason: 'Stage 3 basis changed', reasonKey: 'stage3BasisChanged' }
+  if (source.generatedFromHandoffBasisHash && source.generatedFromHandoffBasisHash !== handoffBasis.basisHash) {
+    const ids = source.generatedFromHandoffItemIds
+    const hasItemMapping = ids.length && ids.every(id => source.generatedFromHandoffItemHashes?.[id])
+    if (!hasItemMapping) return { stale: true, reason: 'prior global handoff basis cannot be item-mapped', reasonKey: 'priorGlobalBasis' }
+  }
+  const ids = source.generatedFromHandoffItemIds
+  if (!ids.length) return { stale: true, reason: 'missing handoff item mapping', reasonKey: 'missingMetadata' }
+  for (const id of ids) {
+    const currentHash = handoffBasis.itemHashById[id]
+    const previousHash = source.generatedFromHandoffItemHashes?.[id]
+    if (!currentHash) return { stale: true, reason: 'required source item missing', reasonKey: 'sourceItemMissing' }
+    if (!previousHash || previousHash !== currentHash) {
+      return {
+        stale: true,
+        reason: 'handoff item changed',
+        reasonKey: 'handoffItemChanged',
+        handoffItemId: id,
+        previousHash,
+        currentHash,
+        handoffItemTitle: itemBasis?.handoffItemTitle || id,
+      }
+    }
+  }
+  return { stale: false, reason: 'source hashes match', reasonKey: 'current' }
+}
+
+function firstSentence(text, max = 210) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!clean) return ''
+  const sentence = clean.match(/^.{1,220}?[.!?](\s|$)/)?.[0]?.trim()
+  const chosen = sentence || clean
+  return chosen
+}
+
+function compiledText(value) {
+  if (Array.isArray(value)) return value.map(compiledText).filter(Boolean).join(' ')
+  if (value && typeof value === 'object') return Object.values(value).map(compiledText).filter(Boolean).join(' ')
+  return String(value || '').replace(/\s+/g, ' ').trim()
+}
+
+function normalizeSearchText(value) {
+  if (value == null) return ''
+  if (typeof value === 'string') return value.toLowerCase().trim()
+  if (Array.isArray(value)) return value.map(normalizeSearchText).filter(Boolean).join(' ')
+  if (typeof value === 'object') {
+    return [
+      value.name,
+      value.title,
+      value.label,
+      value.buName,
+      value.unitName,
+      value.teamName,
+      value.domainOfWork,
+      value.sectionName,
+      value.summary,
+    ].map(normalizeSearchText).filter(Boolean).join(' ')
+  }
+  return String(value).toLowerCase().trim()
+}
+
+function normalizeTokenArray(value) {
+  if (value == null) return []
+  if (Array.isArray(value)) {
+    return value
+      .flatMap(normalizeTokenArray)
+      .map(v => String(v).toLowerCase().trim())
+      .filter(Boolean)
+  }
+  if (value instanceof Set) return normalizeTokenArray([...value])
+  if (value instanceof Map) return normalizeTokenArray([...value.values()])
+  if (typeof value === 'string') {
+    return value
+      .toLowerCase()
+      .split(/[^a-z0-9&/.-]+/i)
+      .map(v => v.trim())
+      .filter(Boolean)
+  }
+  if (typeof value === 'object') {
+    return normalizeTokenArray([
+      value.name,
+      value.title,
+      value.label,
+      value.key,
+      value.id,
+      value.summary,
+      value.description,
+      value.text,
+      value.value,
+      value.teamName,
+      value.buName,
+      value.unitName,
+      value.sectionName,
+      value.domainOfWork,
+    ])
+  }
+  return normalizeTokenArray(String(value))
+}
+
+function inferCompiledBUProfile({ draft, legacyPlan, handoffBrief, tree }) {
+  const text = normalizeSearchText([
+    legacyPlan?.buName,
+    legacyPlan?.mission,
+    legacyPlan?.strategicRole,
+    draft?.plan?.buName,
+    draft?.plan?.mission,
+    handoffBrief?.businessUnitName,
+    handoffBrief?.planningPurpose,
+    handoffBrief?.decisionBasisSummary,
+    tree?.sections?.map(section => [section.sectionName, section.semanticLabel].join(' ')),
+  ])
+  if (/product|competitive|architecture|pdlc|roadmap|use case|prototype|mock/.test(text)) return 'productArchitecture'
+  if (/executive|governance|leadership|investment authority|priorit/.test(text)) return 'executive'
+  if (/compliance|model risk|regulatory|occ|fincen|examiner|audit/.test(text)) return 'compliance'
+  if (/api|engineering|integration|technical|interface|infrastructure|platform/.test(text)) return 'engineering'
+  if (/go.to.market|sales|channel|marketing|buyer|positioning|commercial/.test(text)) return 'goToMarket'
+  if (/partner|vendor|procurement|ecosystem/.test(text)) return 'partner'
+  if (/delivery|client|implementation|managed|support|adoption|workflow/.test(text)) return 'delivery'
+  return 'general'
+}
+
+function roleLearningTerms(profile) {
+  return STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.buAdaptationGuidance[profile] || ['operating outcome', 'decision gate', 'execution method', 'dependency input', 'risk mitigation', 'validation evidence']
+}
+
+function stage3SourceRefsFrom(handoffBrief, sectionKey = null) {
+  const refs = handoffBrief?.evidenceRefs || []
+  const matched = sectionKey ? refs.filter(ref => ref.id === sectionKey || ref.pointer?.includes(sectionKey)) : refs
+  return (matched.length ? matched : refs.slice(0, 2)).map(ref => ({
+    sourceTitle: ref.title || ref.id || 'Stage 2 source',
+    sourceType: 'stage2-handoff',
+    sourceId: ref.id || ref.pointer || null,
+    stage2Link: ref.pointer || (ref.id ? `stage2:${handoffBrief?.businessUnitName || 'unknown'}:${ref.id}` : null),
+  }))
+}
+
+function allTreeBullets(tree, fieldKey = null) {
+  return (tree?.sections || []).flatMap(section =>
+    (section.taggedBullets || [])
+      .filter(b => !fieldKey || b.fieldKey === fieldKey)
+      .map(b => ({ ...b, sectionKey: section.sectionKey, sectionName: section.sectionName })),
+  )
+}
+
+function pickBulletTexts(tree, fieldKey, re, max = 4) {
+  return allTreeBullets(tree, fieldKey).filter(b => !re || re.test(b.text)).map(b => b.text).filter(Boolean).slice(0, max)
+}
+
+function genericDecisionPatterns(profile) {
+  const terms = roleLearningTerms(profile)
+  return [
+    { name: `${terms[0] || 'Outcome'} Priority`, re: /outcome|priority|scope|decision|gate|threshold/i, options: ['Proceed with current scope', 'Narrow to strongest evidence path', 'Defer until missing evidence is resolved'] },
+    { name: `${terms[1] || 'Execution'} Boundary`, re: /boundary|constraint|scope|capacity|dependency|handoff/i, options: ['Keep boundary narrow', 'Expand after readiness evidence', 'Route reciprocal ownership to coordination'] },
+    { name: `${terms[2] || 'Readiness'} Standard`, re: /readiness|validation|evidence|review|pilot|approval/i, options: ['Use observed evidence', 'Require cross-functional review', 'Hold until evidence quality improves'] },
+  ]
+}
+
+function buildCompiledCriticalDecisions(tree, handoffBrief, profile) {
+  const allDecisionText = pickBulletTexts(tree, 'decisionsRequired', null, 40)
+  const patterns = profile === 'productArchitecture' ? PM_DECISION_PATTERNS : genericDecisionPatterns(profile)
+  return patterns.map(pattern => {
+    const hits = allDecisionText.filter(text => pattern.re.test(text))
+    const basis = hits[0] || ''
+    return {
+      decisionName: pattern.name,
+      decisionQuestion: basis ? firstSentence(basis, 230) : `What ${pattern.name.toLowerCase()} position should govern execution?`,
+      whyItMatters: hits[1] ? firstSentence(hits[1], 220) : 'This decision changes scope, sequencing, dependency readiness, and the evidence required before rollout.',
+      decisionOptions: pattern.options,
+      decisionEvidenceNeeded: [...hits.slice(0, 2).map(text => firstSentence(text, 180)), 'Observed validation evidence, dependency readiness, and source-traceable rationale.'].filter(Boolean).slice(0, 4),
+      decisionTiming: /before|prior|precede|gate|sprint|pilot/i.test(basis) ? firstSentence(basis, 170) : 'Resolve before the dependent execution phase proceeds.',
+      sourceRefs: stage3SourceRefsFrom(handoffBrief),
+    }
+  })
+}
+
+const GENERAL_PHASES = [
+  { name: 'Operating Outcome Clarification', objective: 'Clarify the BU-specific outcome, decision context, and evidence standard before committing execution capacity.', options: [['Stakeholder workflow review', 'Use when the operating problem or decision moment needs clarification.', 'Connects execution to the work this BU actually performs.', 'Workflow notes and outcome criteria'], ['Current-state evidence review', 'Use when existing artifacts or signals can validate the starting point.', 'Prevents execution from starting on untested assumptions.', 'Evidence inventory and unresolved assumptions'], ['SME review session', 'Use when domain interpretation or operating feasibility matters.', 'Grounds the plan in role-specific judgment.', 'SME findings and decision implications']] },
+  { name: 'Execution Path Selection', objective: 'Compare feasible execution paths and decide which path best fits the BU role and constraints.', options: [['Option comparison', 'Use when multiple execution approaches are viable.', 'Makes tradeoffs explicit before downstream work begins.', 'Option matrix and rationale'], ['Capability readiness check', 'Use when execution depends on capacity, tools, or expertise.', 'Links ambition to available operating capacity.', 'Readiness gaps and prerequisites'], ['Dependency input review', 'Use when other units shape the feasible path.', 'Keeps dependencies distinct from risk statements.', 'Required inputs and consequence notes']] },
+  { name: 'Readiness & Control Design', objective: 'Define controls, handoffs, and evidence needed before execution moves into a controlled run.', options: [['Readiness gate review', 'Use before work crosses into delivery or external exposure.', 'Confirms critical inputs, constraints, and evidence standards.', 'Gate checklist and open blockers'], ['Control/evidence design', 'Use when auditability, governance, or quality assurance matters.', 'Ensures execution can be validated after the fact.', 'Evidence plan and control notes'], ['Dry run or tabletop review', 'Use when coordination or operating behavior needs rehearsal.', 'Surfaces friction before live execution.', 'Dry-run findings and rework list']] },
+  { name: 'Controlled Execution', objective: 'Run the selected approach in a bounded way that produces evidence without overcommitting scale.', options: [['Controlled pilot or operating trial', 'Use when evidence is needed before scale.', 'Tests the approach under bounded conditions.', 'Trial results and observed exceptions'], ['Parallel comparison', 'Use when new and current approaches can be compared.', 'Shows whether execution improves outcomes versus baseline.', 'Before/after or side-by-side comparison'], ['Feedback loop review', 'Use when adoption or operating quality matters.', 'Captures objections and failure signals while changes are still small.', 'Feedback themes and unresolved concerns']] },
+  { name: 'Scale / Continue / Rework Decision', objective: 'Decide whether to scale, hold, narrow, defer, or rework based on evidence quality and dependency readiness.', options: [['Evidence-based gate decision', 'Use when leadership or BU operators need a clear next step.', 'Forces the decision to cite evidence and unresolved assumptions.', 'Gate rationale and decision record'], ['Scope adjustment review', 'Use when the approach works but the boundary needs refinement.', 'Turns learning into a better-bounded execution plan.', 'Revised scope and deferred items'], ['Risk burn-down review', 'Use when risks remain material but manageable.', 'Confirms which risks reduced and which require coordination.', 'Risk evidence and mitigation status']] },
+]
+
+function buildCompiledExecutionSequence(tree, handoffBrief, profile) {
+  const validationEvidence = pickBulletTexts(tree, 'validationSignals', null, 12)
+  const sequencingEvidence = pickBulletTexts(tree, 'sequencingAndGates', null, 12)
+  const phases = profile === 'productArchitecture' ? STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.pmValidationCaseGuidance.phases : GENERAL_PHASES
+  return phases.map((phase, idx) => ({
+    phaseName: phase.name,
+    phaseObjective: phase.objective,
+    howOptions: phase.options.map(([optionName, whenToUse, whyItFits, evidenceProduced]) => ({ optionName, whatItDoes: optionName, whenToUse, whyItFitsThePhaseOutcome: whyItFits, evidenceProduced })),
+    recommendedHow: phase.options[0][0],
+    whyThisFitsThePhase: idx === 0 ? 'The plan should validate workflow value before architecture or rollout commitments harden.' : idx === 1 ? 'Solution alternatives are useful only after the outcome and evidence standard are clear.' : idx === 2 ? 'Readiness work prevents pilot learning from being polluted by unresolved architecture or delivery constraints.' : idx === 3 ? 'A controlled pilot creates observed evidence while limiting risk.' : 'Scale should follow evidence, dependency readiness, and risk burn-down.',
+    exitCriteria: phase.exit,
+    evidenceExamples: [...validationEvidence.slice(idx, idx + 2), ...sequencingEvidence.slice(idx, idx + 1)].filter(Boolean).slice(0, 4),
+    sourceRefs: stage3SourceRefsFrom(handoffBrief),
+  }))
+}
+
+function buildCompiledDependencies(tree, handoffBrief) {
+  return pickBulletTexts(tree, 'dependencies', null, 10).slice(0, 8).map((text, idx) => ({
+    dependencyName: firstSentence(text, 80).replace(/\s+must\b.*$/i, '').replace(/\s+is required\b.*$/i, '').trim() || `Dependency ${idx + 1}`,
+    dependencyDescription: firstSentence(text, 260),
+    whyItMatters: /gate|block|before|prerequisite|required/i.test(text) ? firstSentence(text, 220) : 'This input conditions whether the BU can execute the relevant phase with confidence.',
+    requiredInput: firstSentence(text, 210),
+    consequenceIfMissing: /before|block|gate|cannot|risk/i.test(text) ? 'Execution proceeds on assumptions or blocks the dependent gate.' : 'The plan loses evidence quality and may require rework.',
+    sourceRefs: stage3SourceRefsFrom(handoffBrief),
+  }))
+}
+
+function genericRiskTemplates(tree, profile) {
+  const terms = roleLearningTerms(profile)
+  const riskTexts = pickBulletTexts(tree, 'risks', null, 5)
+  const fallback = [
+    `${terms[0] || 'Operating outcome'} risk`,
+    `${terms[1] || 'Decision gate'} risk`,
+    `${terms[2] || 'Execution method'} readiness risk`,
+  ]
+  return (riskTexts.length ? riskTexts : fallback).slice(0, 5).map((text, idx) => ({
+    name: inferRiskName(text, idx, profile),
+    re: /./,
+    description: firstSentence(text || fallback[idx] || 'Execution risk may reduce confidence in the BU plan.'),
+    mitigations: ['Define the evidence needed before advancing the next gate', 'Use a bounded execution method before scaling commitment', 'Escalate cross-BU ownership or reciprocal dependency questions to coordination'],
+    warnings: ['Required evidence remains assumption-based', 'The BU cannot explain how the risk is reducing', 'Dependencies or constraints change without revisiting the plan'],
+    reduced: ['Observed evidence supports the decision path', 'Residual assumptions are documented and bounded', 'Mitigation status is traceable to source or execution evidence'],
+  }))
+}
+
+function inferRiskName(text, idx, profile) {
+  const normalized = normalizeSearchText(text)
+  if (/regulatory|compliance|examiner|model risk/.test(normalized)) return 'Regulatory Evidence Risk'
+  if (/capacity|bandwidth|resourcing/.test(normalized)) return 'Capacity Constraint Risk'
+  if (/dependency|handoff|input/.test(normalized)) return 'Dependency Readiness Risk'
+  if (/adoption|client|workflow|delivery/.test(normalized)) return 'Operating Adoption Risk'
+  const terms = roleLearningTerms(profile)
+  return `${terms[idx % terms.length] || 'Execution'} Risk`
+}
+
+function buildCompiledRisks(tree, handoffBrief, profile) {
+  const riskTexts = pickBulletTexts(tree, 'risks', null, 40)
+  const templates = profile === 'productArchitecture'
+    ? STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.pmValidationCaseGuidance.risks
+    : genericRiskTemplates(tree, profile)
+  return templates.map(template => {
+    const hits = riskTexts.filter(text => template.re.test(text))
+    const useTemplateText = profile !== 'productArchitecture'
+    return {
+      riskName: template.name,
+      riskDescription: useTemplateText ? template.description : hits[0] ? firstSentence(hits[0], 260) : template.description,
+      whyItMatters: useTemplateText ? template.description : hits[1] ? firstSentence(hits[1], 220) : template.description,
+      mitigationOptions: template.mitigations,
+      earlyWarningSignals: template.warnings,
+      evidenceThatRiskIsReduced: template.reduced,
+      sourceRefs: stage3SourceRefsFrom(handoffBrief),
+    }
+  })
+}
+
+function buildCompiledValidationFramework(tree, handoffBrief, profile) {
+  const validationTexts = pickBulletTexts(tree, 'validationSignals', null, 16)
+  const terms = roleLearningTerms(profile)
+  const questions = profile === 'productArchitecture'
+    ? ['Does the output improve a real BSA/AML or product workflow decision?', 'Is the architecture and data coverage valid enough to support the promised product boundary?', 'Is the pilot standard strong enough to justify rollout or scale?', 'Are regulatory and explainability assumptions traceable enough to proceed?']
+    : [`Does this BU execution path improve the ${terms[0] || 'operating outcome'} it is responsible for?`, `Are the ${terms[1] || 'decision'} and dependency inputs complete enough to proceed?`, `Is the evidence strong enough to advance the next BU-specific gate?`]
+  const evidenceExamples = profile === 'productArchitecture'
+    ? STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.pmValidationCaseGuidance.evidenceExamples
+    : ['observed workflow notes', 'readiness review notes', 'before/after operating comparison', 'stakeholder feedback summary', 'decision record', 'unresolved concerns log']
+  const veracityChecks = profile === 'productArchitecture'
+    ? STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.pmValidationCaseGuidance.veracityChecks
+    : ['evidence is observed or source-traceable, not only asserted', 'contradictory feedback is documented', 'assumptions are tagged unresolved', 'decision rationale is traceable', 'evidence shows operating impact, not only preference']
+  return questions.map((question, idx) => ({
+    validationQuestion: question,
+    completionCriteria: [validationTexts[idx] ? firstSentence(validationTexts[idx], 210) : 'The target user can use the output in a realistic workflow without extra translation.', 'The evidence supports a real workflow decision or reduces observable friction.', 'Contradictory feedback and unresolved assumptions are documented.'],
+    howToDetermineCompletion: ['Observe mock, prototype, or pilot use in a realistic workflow.', 'Compare expected use against actual user interpretation.', 'Document hesitation, rejection, reinterpretation, and decision changes.', 'Confirm whether effort, confidence, or workflow quality improves.'],
+    evidenceExamples,
+    veracityChecks,
+    failureOrReworkTriggers: ['Users cannot interpret the output without analyst translation.', 'The output does not change a decision, reduce effort, or improve confidence.', 'Evidence conflicts are unresolved before the gate.'],
+    sourceRefs: stage3SourceRefsFrom(handoffBrief),
+  }))
+}
+
+function maxIso(values) {
+  const times = (values || []).map(value => Date.parse(value)).filter(Number.isFinite)
+  if (!times.length) return null
+  return new Date(Math.max(...times)).toISOString()
+}
+
+function minIso(values) {
+  const times = (values || []).map(value => Date.parse(value)).filter(Number.isFinite)
+  if (!times.length) return null
+  return new Date(Math.min(...times)).toISOString()
+}
+
+function sourceRefCountFrom(handoffBrief) {
+  return Math.max(
+    handoffBrief?.evidenceRefs?.length || 0,
+    handoffBrief?.sourceStage2SectionIds?.length || 0,
+  )
+}
+
+function buildCoverageDataSources(handoffBrief, handoffItems, tree, compiledPlan) {
+  return {
+    stage2HandoffItems: Array.isArray(handoffItems) ? handoffItems.length : 0,
+    sourceRefs: sourceRefCountFrom(handoffBrief),
+    compiledStrategyText: compiledText(compiledPlan).length,
+    spineText: tree?.spine?.length || 0,
+    atomizedText: allTreeBullets(tree).length,
+  }
+}
+
+function draftIdentityFor(draft, legacyPlan, resolved, handoffBrief) {
+  if (draft?.draftVersionId) return draft.draftVersionId
+  if (draft?.id) return draft.id
+  if (draft?.storageKey) return draft.storageKey
+  const basis = [
+    draft?.version || 'legacy',
+    draft?.sourceBasisRevisionId || draft?.provenance?.stage1Id,
+    draft?.sourceStage2RevisionId || draft?.provenance?.stage2Id,
+    draft?.buName || draft?.businessUnitName || legacyPlan?.buName || handoffBrief?.businessUnitName,
+    draft?.persistedAt || legacyPlan?.generatedAt || resolved?.source,
+  ].filter(Boolean).join(':')
+  return basis ? stage3TraceHash(basis) : 'unknown'
+}
+
+function describeCompiledStrategySource({ draft, legacyPlan, resolved, compiledError = false }) {
+  if (compiledError) return 'atomized fallback'
+  const atoms = resolved?.atoms || []
+  const importedCapture = draft?.source === 'browser_dom_visible_stage3_capture'
+    || atoms.some(atom => atom?.metadata?.captureSource === 'browser_dom_visible_stage3_capture')
+  if (importedCapture) return 'imported runtime capture'
+  if (resolved?.source === 'migrated legacy Stage 3 revision') return 'stale prior draft'
+  if (draft?.lifecycle?.acceptedAt || draft?.acceptedAt || draft?.accepted || draft?.lifecycle?.status === LIFECYCLE_STATES.ACCEPTED) return 'accepted draft'
+  if (draft?.plan || draft?.executionAtoms?.length) return 'current generated-but-unaccepted draft'
+  if (legacyPlan) return 'stale prior draft'
+  return 'atomized fallback'
+}
+
+function buildCompiledStrategyProvenance({ draft, legacyPlan, handoffBrief, handoffItems, tree, resolved, generationState, compiledPlan = null, compiledAt, coverageAuditAt = null, qualityAuditAt = null, compiledError = false }) {
+  const atoms = resolved?.atoms || []
+  const sourceType = describeCompiledStrategySource({ draft, legacyPlan, resolved, compiledError })
+  const dataSourcesUsed = buildCoverageDataSources(handoffBrief, handoffItems, tree, compiledError ? null : compiledPlan)
+  const atomCountUsedByCompiler = renderingEligibleAtoms(atoms).length
+  const generatedAt = draft?.generatedAt || legacyPlan?.generatedAt || null
+  const generationStartedAt = draft?.generationStartedAt || draft?.progress?.startedAt || minIso(atoms.map(atom => atom?.startedAt)) || generatedAt
+  const generationCompletedAt = draft?.generationCompletedAt || draft?.progress?.completedAt || maxIso(atoms.map(atom => atom?.completedAt)) || draft?.updatedAt || null
+  const acceptedAt = draft?.acceptedAt || draft?.lifecycle?.acceptedAt || legacyPlan?.acceptedAt || null
+  const diagnostics = generationState?.diagnostics || draft?.diagnostics || null
+  const skippedThisRun = diagnostics?.atomsSkippedAlreadyValid || 0
+  const requestedThisRun = diagnostics?.atomCountRequested || 0
+  const totalValidPersisted = diagnostics?.atomsGenerated ?? atomCountUsedByCompiler
+  const generatedThisRun = Math.max(0, totalValidPersisted - skippedThisRun)
+  const failedThisRun = diagnostics?.atomsFailed || 0
+  const acceptanceNote = sourceType === 'current generated-but-unaccepted draft'
+    ? 'Regenerate updates the visible compiled strategy after the generated draft is persisted. Accepting is not required for compiled visibility, but this draft is still unaccepted.'
+    : sourceType === 'accepted draft'
+      ? 'The visible compiled strategy is based on the current accepted draft.'
+      : sourceType === 'stale prior draft'
+        ? 'No current accepted generated draft is being used here; the visible compiled strategy is based on a stale prior draft.'
+        : sourceType === 'imported runtime capture'
+          ? 'The visible compiled strategy is based on an imported runtime capture, not a fresh regeneration.'
+          : 'The compiled strategy is unavailable; Atomized Detail is the active fallback.'
+  return {
+    visibleCompiledSource: sourceType,
+    draftVersionId: draftIdentityFor(draft, legacyPlan, resolved, handoffBrief),
+    draftVersion: draft?.version || 'legacy',
+    generatedAt,
+    generationStartedAt,
+    generationCompletedAt,
+    acceptedAt,
+    compiledAt,
+    coverageAuditAt,
+    qualityAuditAt,
+    basisHash: draft?.basisHash || null,
+    handoffBasisHash: draft?.handoffBasisHash || stage3TraceHash({ handoffBrief, handoffItems }),
+    atomCountUsedByCompiler,
+    handoffItemCountUsedByCompiler: Array.isArray(handoffItems) ? handoffItems.length : 0,
+    totalAtomsCurrentlyPersisted: atoms.length,
+    totalValidAtomsCurrentlyPersisted: atomCountUsedByCompiler,
+    compilerAtomSource: resolved?.source || 'unknown',
+    lifecycleStatus: draft?.lifecycle?.status || draft?.status || legacyPlan?.status || 'unknown',
+    generationCounters: {
+      atomsRequestedThisRun: diagnostics?.atomsRequestedThisRun ?? requestedThisRun,
+      atomsGeneratedThisRun: generatedThisRun,
+      atomsSkippedThisRun: skippedThisRun,
+      atomsFailedThisRun: failedThisRun,
+      totalAtomsCurrentlyPersisted: atoms.length,
+      totalAtomsUsedByCompiledStrategy: atomCountUsedByCompiler,
+    },
+    dataSourcesUsed,
+    acceptanceNote,
+    atomSetCurrency: draft?.atomSetCurrency || draft?.stalenessPlan?.atomSetCurrency || null,
+    stalenessPlan: draft?.stalenessPlan || generationState?.stalenessPlan || null,
+  }
+}
+
+function buildHandoffCoverageAudit(handoffBrief, handoffItems, tree, compiledPlan, provenance = null) {
+  const sourceItems = [
+    ...(handoffItems || []).map((item, idx) => ({ id: item?.key || `handoff-${idx}`, title: item?.label || item?.name || item?.key || `Handoff item ${idx + 1}`, text: compiledText(item?.parsedValue || item?.childAtoms || item?.text || item?.label) })),
+    ...(tree?.sections || []).map(section => ({ id: section.sectionKey, title: section.sectionName, text: section.taggedBullets?.map(b => b.text).join(' ') || '' })),
+  ]
+  const audit = {
+    usedInCompiledStrategy: [],
+    compressedIntoSpine: [],
+    representedAsDependency: [],
+    representedAsRisk: [],
+    representedAsValidation: [],
+    deferredToCoordination: [],
+    deferredToStage4: [],
+    sourceOnlyEvidence: [],
+    notUsed: [],
+    unclassified: [],
+    possibleLosses: [],
+    warnings: [],
+    coverageAuditAt: provenance?.coverageAuditAt || new Date().toISOString(),
+    dataSourcesUsed: provenance?.dataSourcesUsed || buildCoverageDataSources(handoffBrief, handoffItems, tree, compiledPlan),
+  }
+  if (!sourceItems.length) {
+    audit.warnings.push('No Stage 2 handoff items were available for coverage classification; compiled strategy was derived from current Stage 3 atoms only.')
+    return audit
+  }
+  const compiledBlob = normalizeSearchText(compiledPlan)
+  sourceItems.forEach(item => {
+    const text = normalizeSearchText([item.title, item.text])
+    const safeTokens = normalizeTokenArray(semanticFingerprint(text))
+    const direct = safeTokens.some(token => compiledBlob.includes(token))
+    let category = direct ? 'usedInCompiledStrategy' : 'unclassified'
+    if ((tree?.spine || []).some(sp => sp.contributingSecKeys?.includes(item.id) || sp.re.test?.(text))) category = 'compressedIntoSpine'
+    if (direct && /depend|input|api|engineering|delivery|compliance|finance|partner|vendor/i.test(text)) category = 'representedAsDependency'
+    if (direct && /risk|lock|scope|regulatory|under.?investment|false validation|explainability/i.test(text)) category = 'representedAsRisk'
+    if (direct && /valid|evidence|pilot|signal|completion|threshold|workflow/i.test(text)) category = 'representedAsValidation'
+    if (!direct && /executive|cross-bu|cross functional|coordination|owner|raci|reciprocal|authority/i.test(text)) category = 'deferredToCoordination'
+    if (!direct && /requirement|acceptance criteria|non-functional|implementation|rollout plan|stage 4|runbook|governance artifact/i.test(text)) category = 'deferredToStage4'
+    if (!direct && /source|evidence|reference|artifact|records?|notes?|documentation/i.test(text)) category = 'sourceOnlyEvidence'
+    if (category === 'unclassified') category = 'notUsed'
+    const record = { sourceItemTitle: item.title, summary: firstSentence(item.text || item.title, 190), sourceRefs: stage3SourceRefsFrom(handoffBrief, item.id) }
+    audit[category].push(record)
+    if (category === 'notUsed' && /decision|risk|dependency|validation|gate|scope|architecture|regulatory|pilot|client|evidence|api|engineering|delivery/i.test(text)) {
+      audit.possibleLosses.push({ ...record, whyItMayMatter: 'This handoff item appears important but was not clearly represented in the compiled strategy, spine, dependencies, risks, validation, coordination deferral, Stage 4 deferral, or source-only evidence.', recommendedAction: /depend|api|engineering|delivery|input/i.test(text) ? 'convert to dependency' : /risk|regulatory|scope|lock/i.test(text) ? 'convert to risk' : /valid|evidence|pilot|gate/i.test(text) ? 'convert to validation criterion' : 'add to compiled strategy' })
+    }
+  })
+  return audit
+}
+
+function asCompiledArray(value) {
+  return Array.isArray(value) ? value : []
+}
+
+function auditPass(rule, details = {}) {
+  return { ruleId: rule.id, label: rule.label, status: 'pass', details }
+}
+
+function auditFail(rule, message, details = {}) {
+  return { ruleId: rule.id, label: rule.label, status: 'fail', message, details }
+}
+
+function repeatedCompiledTextItems(compiledPlan) {
+  const grouped = [
+    ['criticalDecisions', asCompiledArray(compiledPlan?.criticalDecisions).map(d => [d.decisionName, d.decisionQuestion, d.whyItMatters].join(' '))],
+    ['executionSequence', asCompiledArray(compiledPlan?.executionSequence).flatMap(p => [p.phaseObjective, p.whyThisFitsThePhase, ...asCompiledArray(p.exitCriteria), ...asCompiledArray(p.evidenceExamples)])],
+    ['dependencies', asCompiledArray(compiledPlan?.dependencies).map(d => [d.dependencyDescription, d.whyItMatters, d.requiredInput, d.consequenceIfMissing].join(' '))],
+    ['risksAndMitigations', asCompiledArray(compiledPlan?.risksAndMitigations).map(r => [r.riskDescription, r.whyItMatters].join(' '))],
+    ['validationFramework', asCompiledArray(compiledPlan?.validationFramework).flatMap(v => [v.validationQuestion, ...asCompiledArray(v.completionCriteria), ...asCompiledArray(v.failureOrReworkTriggers)])],
+  ]
+  const items = grouped.flatMap(([section, values]) =>
+    values.map(value => ({ section, text: normalizeSearchText(value), fp: semanticFingerprint(value) })).filter(item => item.text.length > 50),
+  )
+  const repeats = []
+  for (let i = 0; i < items.length; i += 1) {
+    for (let j = i + 1; j < items.length; j += 1) {
+      if (items[i].section === items[j].section) continue
+      if (jaccardSim(items[i].fp, items[j].fp) >= 0.78) {
+        repeats.push({ firstSection: items[i].section, secondSection: items[j].section, text: items[i].text })
+      }
+    }
+  }
+  return repeats.slice(0, 6)
+}
+
+function buildStage3CompiledStrategyQualityAudit(compiledPlan, handoffCoverageAudit, rules = STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.qualityChecks) {
+  const results = []
+  const ruleById = Object.fromEntries(rules.map(rule => [rule.id, rule]))
+
+  const requiredTopLevel = ['strategicObjective', 'criticalDecisions', 'executionSequence', 'dependencies', 'risksAndMitigations', 'validationFramework']
+  const missingTopLevel = requiredTopLevel.filter(key => !compiledPlan?.[key] || (Array.isArray(compiledPlan[key]) && !compiledPlan[key].length))
+  results.push(missingTopLevel.length
+    ? auditFail(ruleById.accepted_structure, 'Compiled strategy is missing one or more accepted structure sections.', { missing: missingTopLevel })
+    : auditPass(ruleById.accepted_structure))
+
+  const weakDecisions = asCompiledArray(compiledPlan?.criticalDecisions).filter(decision =>
+    !decision?.whyItMatters || !asCompiledArray(decision?.decisionEvidenceNeeded).length,
+  )
+  results.push(weakDecisions.length
+    ? auditFail(ruleById.decision_depth, 'Some critical decisions are missing why-it-matters or evidence-needed detail.', { decisions: weakDecisions.map(d => d.decisionName) })
+    : auditPass(ruleById.decision_depth, { decisionsChecked: asCompiledArray(compiledPlan?.criticalDecisions).length }))
+
+  const phases = asCompiledArray(compiledPlan?.executionSequence)
+  const weakHowPhases = phases.filter(phase => asCompiledArray(phase.howOptions).length < (ruleById.phase_how_options.minHowOptionsPerPhase || 3))
+  results.push(weakHowPhases.length
+    ? auditFail(ruleById.phase_how_options, 'One or more phases are missing enough practical how options.', { phases: weakHowPhases.map(p => p.phaseName) })
+    : auditPass(ruleById.phase_how_options, { phasesChecked: phases.length }))
+
+  const weakExecutionMethods = phases.flatMap(phase =>
+    asCompiledArray(phase.howOptions)
+      .filter(option => !option?.whyItFitsThePhaseOutcome || !option?.evidenceProduced)
+      .map(option => `${phase.phaseName}: ${option.optionName || option.whatItDoes || 'option'}`),
+  )
+  results.push(weakExecutionMethods.length
+    ? auditFail(ruleById.execution_method_fit, 'Some execution methods are missing why-it-fits or evidence-produced detail.', { options: weakExecutionMethods.slice(0, 8) })
+    : auditPass(ruleById.execution_method_fit, { optionsChecked: phases.reduce((sum, phase) => sum + asCompiledArray(phase.howOptions).length, 0) }))
+
+  const risks = asCompiledArray(compiledPlan?.risksAndMitigations)
+  const weakRisks = risks.filter(risk => (ruleById.risk_mitigation_depth.requiredFields || []).some(field => !asCompiledArray(risk?.[field]).length))
+  results.push(weakRisks.length
+    ? auditFail(ruleById.risk_mitigation_depth, 'Some risks are missing mitigation depth.', { risks: weakRisks.map(r => r.riskName) })
+    : auditPass(ruleById.risk_mitigation_depth, { risksChecked: risks.length }))
+
+  const validation = asCompiledArray(compiledPlan?.validationFramework)
+  const weakValidation = validation.filter(item => (ruleById.validation_depth.requiredFields || []).some(field => !asCompiledArray(item?.[field]).length))
+  results.push(weakValidation.length
+    ? auditFail(ruleById.validation_depth, 'Some validation items are missing criteria, evidence, veracity, or rework triggers.', { questions: weakValidation.map(v => v.validationQuestion) })
+    : auditPass(ruleById.validation_depth, { validationItemsChecked: validation.length }))
+
+  const dependencyBleed = asCompiledArray(compiledPlan?.dependencies).filter(dep => /mitigation|early warning|veracity|completion criteria|failure trigger|risk is reduced/i.test(compiledText(dep)))
+  results.push(dependencyBleed.length
+    ? auditFail(ruleById.dependency_distinction, 'Some dependencies appear to contain risk or validation language.', { dependencies: dependencyBleed.map(d => d.dependencyName) })
+    : auditPass(ruleById.dependency_distinction, { dependenciesChecked: asCompiledArray(compiledPlan?.dependencies).length }))
+
+  const forcedRiskOwnership = risks.filter(risk => /\b(owner|owns|ownership|accountable|responsible|raci)\b/i.test(compiledText(risk)))
+  results.push(forcedRiskOwnership.length
+    ? auditFail(ruleById.no_forced_risk_ownership, 'Some risk sections appear to force ownership inside the BU risk model.', { risks: forcedRiskOwnership.map(r => r.riskName) })
+    : auditPass(ruleById.no_forced_risk_ownership, { risksChecked: risks.length }))
+
+  results.push(handoffCoverageAudit
+    ? auditPass(ruleById.auditable_compression, { possibleLosses: handoffCoverageAudit.possibleLosses?.length || 0 })
+    : auditFail(ruleById.auditable_compression, 'No handoff coverage audit was derived.'))
+
+  const classifiedCount = [
+    'usedInCompiledStrategy',
+    'compressedIntoSpine',
+    'representedAsDependency',
+    'representedAsRisk',
+    'representedAsValidation',
+    'deferredToCoordination',
+    'deferredToStage4',
+    'sourceOnlyEvidence',
+    'notUsed',
+    'possibleLosses',
+  ].reduce((sum, key) => sum + (handoffCoverageAudit?.[key]?.length || 0), 0)
+  results.push(classifiedCount > 0 || handoffCoverageAudit?.warnings?.length
+    ? auditPass(ruleById.handoff_classification, { classifiedCount, warnings: handoffCoverageAudit?.warnings?.length || 0 })
+    : auditFail(ruleById.handoff_classification, 'No handoff content was classified.'))
+
+  const truncated = /\.\.\.|…/.test(compiledText(compiledPlan))
+  results.push(truncated
+    ? auditFail(ruleById.no_truncated_strategy_text, 'Compiled strategy text contains truncation markers.')
+    : auditPass(ruleById.no_truncated_strategy_text))
+
+  const repeats = repeatedCompiledTextItems(compiledPlan)
+  results.push(repeats.length
+    ? auditFail(ruleById.reduce_repetition, 'Repeated content appears across compiled strategy sections.', { repeats })
+    : auditPass(ruleById.reduce_repetition))
+
+  return {
+    rules,
+    results,
+    violations: results.filter(result => result.status === 'fail'),
+    passedCount: results.filter(result => result.status === 'pass').length,
+    failedCount: results.filter(result => result.status === 'fail').length,
+  }
+}
+
+function compileBUExecutionPlan({ draft, legacyPlan, handoffBrief, handoffItems, tree, resolved, generationState }) {
+  const compiledAt = new Date().toISOString()
+  const coverageAuditAt = new Date().toISOString()
+  const qualityAuditAt = new Date().toISOString()
+  const sourceRefs = stage3SourceRefsFrom(handoffBrief)
+  const buProfile = inferCompiledBUProfile({ draft, legacyPlan, handoffBrief, tree })
+  const compiled = {
+    strategicObjective: {
+      summary: firstSentence(legacyPlan?.mission || handoffBrief?.planningPurpose || draft?.plan?.mission || 'Define a focused execution basis for this business unit.'),
+      outcomeFocus: firstSentence(legacyPlan?.strategicRole || handoffBrief?.decisionBasisSummary || 'Convert Stage 2 handoff context into decisions, sequencing, dependencies, risk mitigation, and validation evidence.'),
+      nonGoalsOrBoundaries: [...(handoffBrief?.executionConstraints || []), ...(legacyPlan?.constraints || [])].map(text => firstSentence(text, 180)).filter(Boolean).slice(0, 4),
+      sourceRefs,
+    },
+    criticalDecisions: buildCompiledCriticalDecisions(tree, handoffBrief, buProfile),
+    executionSequence: buildCompiledExecutionSequence(tree, handoffBrief, buProfile),
+    dependencies: buildCompiledDependencies(tree, handoffBrief),
+    risksAndMitigations: buildCompiledRisks(tree, handoffBrief, buProfile),
+    validationFramework: buildCompiledValidationFramework(tree, handoffBrief, buProfile),
+    sourceTraceability: sourceRefs,
+    learningSignalBasis: {
+      profile: buProfile,
+      productIntent: STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.productIntent,
+      acceptedStructure: STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.acceptedStructure,
+      appliedLearningSignals: STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.generalLearningSignals,
+      prohibitedPatterns: STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.prohibitedPatterns,
+      adaptationGuidance: roleLearningTerms(buProfile),
+    },
+  }
+  const provenance = buildCompiledStrategyProvenance({
+    draft,
+    legacyPlan,
+    handoffBrief,
+    handoffItems,
+    tree,
+    resolved,
+    generationState,
+    compiledPlan: compiled,
+    compiledAt,
+    coverageAuditAt,
+    qualityAuditAt,
+  })
+  const handoffCoverageAudit = buildHandoffCoverageAudit(handoffBrief, handoffItems, tree, compiled, provenance)
+  const stage3CompiledStrategyQualityAudit = {
+    ...buildStage3CompiledStrategyQualityAudit(compiled, handoffCoverageAudit),
+    qualityAuditAt,
+    basisSource: provenance.visibleCompiledSource,
+    isCurrentDraftBasis: ['accepted draft', 'current generated-but-unaccepted draft'].includes(provenance.visibleCompiledSource),
+  }
+  return {
+    compiledBUExecutionPlan: compiled,
+    handoffCoverageAudit,
+    stage3CompiledStrategyQualityAudit,
+    provenance: {
+      ...provenance,
+      coverageAuditAt: handoffCoverageAudit.coverageAuditAt,
+      qualityAuditAt,
+    },
+  }
+}
+
+function StrategySection({ title, children, accent = '#00e5b4' }) {
+  return (
+    <div style={{ border: `1px solid ${accent}33`, borderRadius: 5, overflow: 'hidden', background: 'var(--surface)' }}>
+      <div style={{ padding: '7px 10px', background: `${accent}0d`, borderBottom: `1px solid ${accent}22`, fontSize: 10, fontWeight: 700, color: accent }}>{title}</div>
+      <div style={{ padding: '9px 11px', display: 'flex', flexDirection: 'column', gap: 8 }}>{children}</div>
+    </div>
+  )
+}
+
+function TinyList({ items, dot = '#00e5b4' }) {
+  const clean = listFromValue(items).filter(Boolean)
+  if (!clean.length) return null
+  return <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>{clean.map((item, idx) => <div key={idx} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}><span style={{ flexShrink: 0, width: 4, height: 4, borderRadius: '50%', background: dot, marginTop: 6 }} /><div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.55 }}>{item}</div></div>)}</div>
+}
+
+function LabeledText({ label, value }) {
+  if (!value && !(Array.isArray(value) && value.length)) return null
+  return <div><div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 3 }}>{label}</div>{Array.isArray(value) ? <TinyList items={value} /> : <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6 }}>{value}</div>}</div>
+}
+
+function formatPlanTimestamp(value) {
+  if (!value) return 'not available'
+  return String(value)
+}
+
+function CompiledStrategyProvenancePanel({ provenance }) {
+  if (!provenance) return null
+  const sourceColor = provenance.visibleCompiledSource === 'accepted draft'
+    ? '#00e5b4'
+    : provenance.visibleCompiledSource === 'current generated-but-unaccepted draft'
+      ? '#fb923c'
+      : provenance.visibleCompiledSource === 'atomized fallback'
+        ? '#f87171'
+        : '#3b82f6'
+  const rows = [
+    ['draft ID / version', `${provenance.draftVersionId || 'unknown'} / ${provenance.draftVersion || 'unknown'}`],
+    ['generationStartedAt', formatPlanTimestamp(provenance.generationStartedAt)],
+    ['generationCompletedAt', formatPlanTimestamp(provenance.generationCompletedAt)],
+    ['generatedAt', formatPlanTimestamp(provenance.generatedAt)],
+    ['compiledAt', formatPlanTimestamp(provenance.compiledAt)],
+    ['acceptedAt', formatPlanTimestamp(provenance.acceptedAt)],
+    ['coverageAuditAt', formatPlanTimestamp(provenance.coverageAuditAt)],
+    ['qualityAuditAt', formatPlanTimestamp(provenance.qualityAuditAt)],
+    ['handoffBasisHash', provenance.handoffBasisHash || provenance.basisHash || 'not available'],
+    ['compiler atom source', provenance.compilerAtomSource || 'unknown'],
+    ['atom set currency', provenance.atomSetCurrency || 'unknown'],
+    ['atom count used by compiler', provenance.atomCountUsedByCompiler ?? 0],
+    ['handoff item count used by compiler', provenance.handoffItemCountUsedByCompiler ?? 0],
+  ]
+  const counters = provenance.generationCounters || {}
+  return (
+    <div style={{ border: '1px solid rgba(0,229,180,.28)', borderRadius: 5, padding: '9px 10px', background: 'rgba(0,229,180,.04)' }}>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 7 }}>
+        <Badge color={sourceColor} small>{provenance.visibleCompiledSource || 'unknown source'}</Badge>
+        <Badge color="#3b82f6" small>{counters.atomsRequestedThisRun ?? 0} requested this run</Badge>
+        <Badge color="#00e5b4" small>{counters.atomsGeneratedThisRun ?? 0} generated this run</Badge>
+        <Badge color="var(--muted)" small>{counters.atomsSkippedThisRun ?? 0} skipped this run</Badge>
+        <Badge color={counters.atomsFailedThisRun ? '#f87171' : 'var(--muted)'} small>{counters.atomsFailedThisRun ?? 0} failed this run</Badge>
+        <Badge color="#fb923c" small>{counters.totalAtomsCurrentlyPersisted ?? 0} total persisted</Badge>
+        <Badge color="#a3e635" small>{counters.totalAtomsUsedByCompiledStrategy ?? 0} used by compiler</Badge>
+      </div>
+      <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.5, marginBottom: 7 }}>
+        {provenance.acceptanceNote}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 5 }}>
+        {rows.map(([label, value]) => (
+          <div key={label} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '5px 6px', background: 'var(--surface)' }}>
+            <div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 2 }}>{label}</div>
+            <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.35, wordBreak: 'break-word' }}>{String(value)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function HandoffCoverageAuditView({ audit }) {
+  const [open, setOpen] = useState(false)
+  if (!audit) return null
+  const counts = [['used in compiled strategy', audit.usedInCompiledStrategy.length], ['compressed into spine', audit.compressedIntoSpine.length], ['represented as dependencies', audit.representedAsDependency.length], ['represented as risks', audit.representedAsRisk.length], ['represented as validation', audit.representedAsValidation.length], ['deferred to coordination', audit.deferredToCoordination.length], ['deferred to Stage 4', audit.deferredToStage4.length], ['source-only', audit.sourceOnlyEvidence.length], ['unclassified', audit.unclassified?.length || 0], ['possible losses', audit.possibleLosses.length]]
+  return (
+    <div style={{ border: '1px solid rgba(251,146,60,.35)', borderRadius: 5, overflow: 'hidden' }}>
+      <div onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '8px 10px', background: 'rgba(251,146,60,.06)' }}>
+        <div style={{ flex: 1 }}><div style={{ fontSize: 10, fontWeight: 700, color: '#fb923c' }}>Handoff Coverage</div><div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>{audit.possibleLosses.length} possible loss{audit.possibleLosses.length === 1 ? '' : 'es'} flagged</div></div>
+        <span style={{ fontSize: 7, color: 'var(--muted)' }}>{open ? 'hide' : 'show'}</span>
+      </div>
+      {open && <div style={{ padding: '9px 10px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 9 }}>
+        {audit.warnings?.length > 0 && <TinyList items={audit.warnings} dot="#fb923c" />}
+        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>{counts.map(([label, count]) => <Badge key={label} color={label === 'possible losses' && count ? '#f87171' : '#fb923c'} small>{count} {label}</Badge>)}</div>
+        <div style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '7px 8px', background: 'var(--s2)' }}>
+          <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>Coverage Audit Data Sources</div>
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.stage2HandoffItems ?? 0} Stage 2 handoff items</Badge>
+            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.sourceRefs ?? 0} source refs</Badge>
+            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.compiledStrategyText ?? 0} compiled text chars</Badge>
+            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.spineText ?? 0} spine items</Badge>
+            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.atomizedText ?? 0} atomized bullets</Badge>
+          </div>
+          <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginTop: 5 }}>
+            coverageAuditAt {audit.coverageAuditAt || 'not available'}
+          </div>
+        </div>
+        {audit.possibleLosses.length > 0 && <div><div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>Possible Losses</div>{audit.possibleLosses.map((loss, idx) => <div key={idx} style={{ border: '1px solid rgba(248,113,113,.28)', borderRadius: 4, padding: '7px 8px', marginBottom: 6, background: 'rgba(248,113,113,.05)' }}><div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 3 }}>{loss.sourceItemTitle}</div><LabeledText label="summary" value={loss.summary} /><LabeledText label="why it may matter" value={loss.whyItMayMatter} /><LabeledText label="recommended action" value={loss.recommendedAction} /></div>)}</div>}
+      </div>}
+    </div>
+  )
+}
+
+function Stage3CompiledQualityAuditView({ audit }) {
+  const [open, setOpen] = useState(false)
+  if (!audit) return null
+  return (
+    <div style={{ border: '1px solid rgba(59,130,246,.32)', borderRadius: 5, overflow: 'hidden' }}>
+      <div onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '8px 10px', background: 'rgba(59,130,246,.06)' }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: '#3b82f6' }}>Compiled Strategy Quality Audit</div>
+          {audit.isCurrentDraftBasis ? (
+            <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+              {audit.failedCount} violation{audit.failedCount === 1 ? '' : 's'} - {audit.passedCount} rule{audit.passedCount === 1 ? '' : 's'} passed
+            </div>
+          ) : (
+            <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c' }}>
+              Quality claims withheld because this is not based on a current accepted or generated draft.
+            </div>
+          )}
+          <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginTop: 2 }}>
+            basis {audit.basisSource || 'unknown'} - qualityAuditAt {audit.qualityAuditAt || 'not available'}
+          </div>
+        </div>
+        <span style={{ fontSize: 7, color: 'var(--muted)' }}>{open ? 'hide' : 'show'}</span>
+      </div>
+      {open && (
+        <div style={{ padding: '9px 10px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {!audit.isCurrentDraftBasis && (
+            <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.5 }}>
+              The rules were not presented as strategy-quality claims because the compiled view basis is {audit.basisSource || 'unknown'}.
+            </div>
+          )}
+          {audit.isCurrentDraftBasis && audit.violations?.length > 0 && (
+            <div>
+              <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>Violations</div>
+              {audit.violations.map(result => (
+                <div key={result.ruleId} style={{ border: '1px solid rgba(248,113,113,.28)', borderRadius: 4, padding: '7px 8px', marginBottom: 6, background: 'rgba(248,113,113,.05)' }}>
+                  <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 3 }}>{result.label}</div>
+                  <LabeledText label="finding" value={result.message} />
+                  {result.details && Object.keys(result.details).length > 0 && (
+                    <LabeledText label="details" value={compiledText(result.details)} />
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {audit.isCurrentDraftBasis && <div>
+            <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>Rules</div>
+            {audit.results.map(result => (
+              <div key={result.ruleId} style={{ display: 'flex', gap: 7, alignItems: 'flex-start', marginBottom: 5 }}>
+                <Badge color={result.status === 'pass' ? '#00e5b4' : '#f87171'} small>{result.status}</Badge>
+                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.5 }}>{result.label}</div>
+              </div>
+            ))}
+          </div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CompiledStrategyView({ compiled, audit, qualityAudit, provenance }) {
+  if (!compiled) return null
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <CompiledStrategyProvenancePanel provenance={provenance} />
+      <StrategySection title="Strategic Objective"><LabeledText label="summary" value={compiled.strategicObjective.summary} /><LabeledText label="outcome focus" value={compiled.strategicObjective.outcomeFocus} /><LabeledText label="non-goals / boundaries" value={compiled.strategicObjective.nonGoalsOrBoundaries} /></StrategySection>
+      <StrategySection title="Critical Decisions" accent="#3b82f6">{compiled.criticalDecisions.map((decision, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 10, fontWeight: 700, color: '#3b82f6', marginBottom: 6 }}>{decision.decisionName}</div><LabeledText label="question" value={decision.decisionQuestion} /><LabeledText label="why it matters" value={decision.whyItMatters} /><LabeledText label="options" value={decision.decisionOptions} /><LabeledText label="evidence needed" value={decision.decisionEvidenceNeeded} /><LabeledText label="timing" value={decision.decisionTiming} /></div>)}</StrategySection>
+      <StrategySection title="Execution Sequence">{compiled.executionSequence.map((phase, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 10, fontWeight: 700, color: '#00e5b4', marginBottom: 5 }}>{phase.phaseName}</div><LabeledText label="phase objective" value={phase.phaseObjective} /><LabeledText label="recommended how" value={phase.recommendedHow} /><LabeledText label="why this fits the phase" value={phase.whyThisFitsThePhase} /><LabeledText label="exit criteria" value={phase.exitCriteria} /><div style={{ marginTop: 6 }}><div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>how options</div>{phase.howOptions.map((opt, oi) => <div key={oi} style={{ marginBottom: 6, paddingLeft: 7, borderLeft: '2px solid rgba(0,229,180,.35)' }}><div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 2 }}>{opt.optionName}</div><LabeledText label="when to use" value={opt.whenToUse} /><LabeledText label="why it fits" value={opt.whyItFitsThePhaseOutcome} /><LabeledText label="evidence produced" value={opt.evidenceProduced} /></div>)}</div></div>)}</StrategySection>
+      <StrategySection title="Dependencies" accent="#fb923c">{compiled.dependencies.map((dep, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 9, fontWeight: 700, color: '#fb923c', marginBottom: 5 }}>{dep.dependencyName}</div><LabeledText label="description" value={dep.dependencyDescription} /><LabeledText label="required input" value={dep.requiredInput} /><LabeledText label="consequence if missing" value={dep.consequenceIfMissing} /></div>)}</StrategySection>
+      <StrategySection title="Risk & Mitigation" accent="#f87171">{compiled.risksAndMitigations.map((risk, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 9, fontWeight: 700, color: '#f87171', marginBottom: 5 }}>{risk.riskName}</div><LabeledText label="description" value={risk.riskDescription} /><LabeledText label="mitigation options" value={risk.mitigationOptions} /><LabeledText label="early warning signals" value={risk.earlyWarningSignals} /><LabeledText label="evidence risk is reduced" value={risk.evidenceThatRiskIsReduced} /></div>)}</StrategySection>
+      <StrategySection title="Validation Framework" accent="#a3e635">{compiled.validationFramework.map((item, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 9, fontWeight: 700, color: '#a3e635', marginBottom: 5 }}>{item.validationQuestion}</div><LabeledText label="completion criteria" value={item.completionCriteria} /><LabeledText label="how to determine completion" value={item.howToDetermineCompletion} /><LabeledText label="evidence examples" value={item.evidenceExamples} /><LabeledText label="veracity checks" value={item.veracityChecks} /><LabeledText label="failure / rework triggers" value={item.failureOrReworkTriggers} /></div>)}</StrategySection>
+      <HandoffCoverageAuditView audit={audit} />
+      <Stage3CompiledQualityAuditView audit={qualityAudit} />
+    </div>
+  )
+}
+
+function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], unitName, onStage2Action, showHandoffBrief = true, generationState = null }) {
+  const [viewMode,       setViewMode]       = useState('compiled')
   const [briefOpen,      setBriefOpen]      = useState(true)
   const [spineOpen,      setSpineOpen]      = useState(true)
   const [execOpen,       setExecOpen]       = useState(true)
@@ -3610,11 +4840,40 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, unitName, onStage2A
   // Per-spine-item raw-instances expansion
   const [openSpineRaw,   setOpenSpineRaw]   = useState({})
 
+  const resolvedExecutionDraft = React.useMemo(() => resolveExecutionDraftSource(draft, legacyPlan), [draft, legacyPlan])
+
   const tree = React.useMemo(() => {
-    const resolved = resolveExecutionDraftSource(draft, legacyPlan)
-    if (!resolved.atoms?.length) return null
-    return buildPlanTree(resolved.atoms)
-  }, [draft, legacyPlan])
+    if (!resolvedExecutionDraft.atoms?.length) return null
+    return buildPlanTree(resolvedExecutionDraft.atoms)
+  }, [resolvedExecutionDraft])
+
+  const fallbackProvenance = React.useMemo(() => {
+    return buildCompiledStrategyProvenance({
+      draft,
+      legacyPlan,
+      handoffBrief,
+      handoffItems,
+      tree,
+      resolved: resolvedExecutionDraft,
+      generationState,
+      compiledAt: null,
+      compiledError: true,
+    })
+  }, [draft, legacyPlan, handoffBrief, handoffItems, tree, resolvedExecutionDraft, generationState])
+
+  const compiledStrategy = React.useMemo(() => {
+    if (!tree) return null
+    try {
+      return compileBUExecutionPlan({ draft, legacyPlan, handoffBrief, handoffItems, tree, resolved: resolvedExecutionDraft, generationState })
+    } catch (error) {
+      console.warn('Stage 3 compiled strategy derivation failed', {
+        message: error?.message || String(error),
+        buName: legacyPlan?.buName || draft?.plan?.buName || handoffBrief?.businessUnitName || unitName || 'unknown',
+        compilerFunction: 'compileBUExecutionPlan',
+      })
+      return { error: error?.message || 'Compiled strategy derivation failed.', provenance: fallbackProvenance }
+    }
+  }, [draft, legacyPlan, handoffBrief, handoffItems, tree, resolvedExecutionDraft, generationState, fallbackProvenance])
 
   if (!tree || !tree.sections.length) {
     return (
@@ -3666,6 +4925,57 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, unitName, onStage2A
 
   return (
     <div style={{ marginTop: 12, marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+        {['compiled', 'atomized'].map(mode => (
+          <button
+            key={mode}
+            onClick={() => setViewMode(mode)}
+            style={{
+              fontSize: 8,
+              fontFamily: 'var(--fm)',
+              fontWeight: 700,
+              padding: '4px 9px',
+              borderRadius: 4,
+              cursor: 'pointer',
+              background: viewMode === mode ? 'rgba(0,229,180,.12)' : 'var(--s2)',
+              border: `1px solid ${viewMode === mode ? 'rgba(0,229,180,.45)' : 'var(--border)'}`,
+              color: viewMode === mode ? '#00e5b4' : 'var(--muted)',
+            }}
+          >
+            {mode === 'compiled' ? 'Compiled Strategy View' : 'Current Atomized View'}
+          </button>
+        ))}
+      </div>
+
+      {compiledStrategy?.error && (
+        <div style={{
+          fontSize: 9,
+          fontFamily: 'var(--fm)',
+          color: '#fb923c',
+          lineHeight: 1.55,
+          padding: '8px 10px',
+          background: 'rgba(251,146,60,.07)',
+          border: '1px solid rgba(251,146,60,.25)',
+          borderRadius: 5,
+        }}>
+          Compiled strategy could not be derived from the current handoff shape. Showing the current atomized detail view instead. {compiledStrategy.error}
+          {compiledStrategy.provenance?.acceptanceNote && (
+            <div style={{ marginTop: 5 }}>
+              {compiledStrategy.provenance.acceptanceNote}
+            </div>
+          )}
+        </div>
+      )}
+
+      {viewMode === 'compiled' && !compiledStrategy?.error ? (
+        <CompiledStrategyView
+          compiled={compiledStrategy?.compiledBUExecutionPlan}
+          audit={compiledStrategy?.handoffCoverageAudit}
+          qualityAudit={compiledStrategy?.stage3CompiledStrategyQualityAudit}
+          provenance={compiledStrategy?.provenance}
+        />
+      ) : (
+        <>
 
       {/* ══ 1. HANDOFF BRIEF — omitted when already shown by Stage3HandoffBriefCard above ══ */}
       {showHandoffBrief && (
@@ -4011,6 +5321,8 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, unitName, onStage2A
       {/* Supporting Analysis and Source References are now embedded inside each
           Shared Plan Spine item above (constraint + rationale + provenance).
           The Execution Plan below contains derived outcomes and actions.      */}
+        </>
+      )}
     </div>
   )
 }
@@ -4832,12 +6144,24 @@ export default function Stage3View({
   }), [generation, activeStage1Rev, activeStage2Rev, stage1ActiveId, stage2ActiveId, stage3Revisions.length, onSaveRevision])
 
   // ── Unit-level refinement ───────────────────────────────────────────────────
-  async function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = [], lifecycle = {}, diagnostics = null, progress = null) {
+  async function persistBuPlanDraft(unit, plan, readiness, source, executionAtoms = [], lifecycle = {}, diagnostics = null, progress = null, atomPlan = null) {
     const now = new Date().toISOString()
     const atomSummary = summarizeAtoms(executionAtoms)
     const derivedStatus = lifecycle.status || deriveLifecycleState({ atoms: executionAtoms })
+    const validAtomCount = renderingEligibleAtoms(executionAtoms).length
+    const generationStartedAt = progress?.startedAt || minIso(executionAtoms.map(atom => atom?.startedAt)) || now
+    const generationCompletedAt = derivedStatus === LIFECYCLE_STATES.GENERATING
+      ? null
+      : (progress?.completedAt || maxIso(executionAtoms.map(atom => atom?.completedAt)) || now)
+    const handoffBasisHash = stage3TraceHash({
+      handoffBrief: readiness?.planningContext?.handoffBrief || readiness?.handoffBrief || null,
+      structureItems: readiness?.structureItems || [],
+      itemStates: readiness?.itemStates || [],
+    })
+    const draftVersionId = `${STAGE3_DRAFT_PLAN_VERSION}:${storageSafeName(unit.name)}:${handoffBasisHash}:${stage3TraceHash(now)}`
     const draft = {
       version: STAGE3_DRAFT_PLAN_VERSION,
+      draftVersionId,
       workspaceId: effectiveWorkspaceId,
       activePlanId: effectiveWorkspaceId,
       buName: unit.name,
@@ -4881,6 +6205,18 @@ export default function Stage3View({
       tokenUsage: diagnostics ? { inputTokens: diagnostics.inputTokens || 0, outputTokens: diagnostics.outputTokens || 0 } : null,
       diagnostics,
       progress: progress ? { ...progress, lifecycleState: progress.lifecycleState === 'generating' ? 'interrupted' : progress.lifecycleState } : null,
+      generationStartedAt,
+      generationCompletedAt,
+      handoffBasisHash,
+      atomCountUsedByCompiler: validAtomCount,
+      stage3BasisVersion: STAGE3_BASIS_VERSION,
+      learningSignalsVersion: STAGE3_LEARNING_SIGNALS_VERSION,
+      learningBasisHash: atomPlan?.learningBasisHash || stage3TraceHash(STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS),
+      generationRunId: atomPlan?.generationRunId || progress?.generationRunId || null,
+      regenerationMode: atomPlan?.stalenessPlan?.regenerationMode || null,
+      stalenessPlan: atomPlan?.stalenessPlan || null,
+      handoffItemBasis: atomPlan?.handoffBasis?.itemBasis || null,
+      atomSetCurrency: atomPlan?.stalenessPlan?.atomSetCurrency || null,
       generatedAt: executionAtoms.find(a => a.completedAt)?.completedAt || now,
       persistedAt: now,
       updatedAt: now,
@@ -4955,9 +6291,103 @@ export default function Stage3View({
       if (mode === 'stage1_2_only') {
         throw new Error('Product Management needs a compact Stage 2 handoff before Stage 3 generation. Stage 1/2-only fallback output is disabled.')
       }
-      let atoms = buildExecutionAtomsForBU(unit, readiness, priorDraft, mode)
+      const regenerationMode = readiness.regenerationMode || STAGE3_REGENERATION_MODES.SMART
+      const generationRunId = `stage3-run:${storageSafeName(unit.name)}:${stage3TraceHash(new Date().toISOString())}`
+      let atomPlan = buildExecutionAtomPlanForBU(unit, readiness, priorDraft, mode, regenerationMode, generationRunId)
+      let atoms = atomPlan.atoms
       if (!atoms.length) {
         throw new Error('No validated Stage 2 handoff atoms are available for Product Management.')
+      }
+      if (regenerationMode === STAGE3_REGENERATION_MODES.RECOMPILE_ONLY) {
+        const eligibleAtoms = renderingEligibleAtoms(atoms)
+        const plan = eligibleAtoms.length ? assembleAtomizedBUPlan(unit, readiness, atoms, mode) : priorDraft?.plan || null
+        const diagnostics = buildGenerationDiagnostics({
+          buName: unit.name,
+          requestedAtoms: [],
+          runnableAtoms: [],
+          completedAtoms: eligibleAtoms,
+          retryMode: 'recompile only',
+          model: AI_MODEL_LABEL,
+        })
+        const progress = buildStage3Progress({
+          unit,
+          mode: 'recompile only',
+          atoms,
+          lifecycleState: 'recompiled',
+          skippedCount: atoms.length,
+        })
+        const skipAtomPlan = {
+          ...atomPlan,
+          stalenessPlan: { ...atomPlan.stalenessPlan, atomSetCurrency: 'current' },
+        }
+        const { ok: persistOk } = await persistBuPlanDraft(unit, plan, readiness, priorDraft?.source || 'ai', atoms, { status: priorDraft?.lifecycle?.status || LIFECYCLE_STATES.DRAFT_GENERATED }, diagnostics, progress, skipAtomPlan)
+        setBuPlanGeneration(prev => ({
+          ...prev,
+          [unit.name]: {
+            running: false,
+            error: persistOk ? null : 'Recompile-only draft was not persisted.',
+            lifecycleState: persistOk ? (priorDraft?.lifecycle?.status || LIFECYCLE_STATES.DRAFT_GENERATED) : LIFECYCLE_STATES.GENERATION_FAILED,
+            diagnostics,
+            progress,
+            atomSummary: summarizeAtoms(atoms),
+            stalenessPlan: skipAtomPlan.stalenessPlan,
+          },
+        }))
+        return { error: persistOk ? null : 'Recompile-only draft was not persisted.' }
+      }
+
+      const runnableAtoms = atoms.filter(atom => STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status))
+      if (!runnableAtoms.length) {
+        const eligibleAtoms = renderingEligibleAtoms(atoms)
+        const plan = eligibleAtoms.length ? assembleAtomizedBUPlan(unit, readiness, atoms, mode) : priorDraft?.plan || null
+        const diagnostics = buildGenerationDiagnostics({
+          buName: unit.name,
+          requestedAtoms: atoms,
+          runnableAtoms,
+          completedAtoms: eligibleAtoms,
+          retryMode: 'smart - no stale atoms',
+          model: AI_MODEL_LABEL,
+        })
+        const progress = buildStage3Progress({
+          unit,
+          mode: 'smart - no stale atoms',
+          atoms,
+          lifecycleState: 'skipped',
+          skippedCount: atoms.length,
+        })
+        const { ok: persistOk } = await persistBuPlanDraft(unit, plan, readiness, priorDraft?.source || 'ai', atoms, { status: priorDraft?.lifecycle?.status || LIFECYCLE_STATES.DRAFT_GENERATED }, diagnostics, progress, atomPlan)
+        setBuPlanGeneration(prev => ({
+          ...prev,
+          [unit.name]: {
+            running: false,
+            error: persistOk ? null : 'Smart regeneration skipped all atoms, but provenance was not persisted.',
+            lifecycleState: persistOk ? (priorDraft?.lifecycle?.status || LIFECYCLE_STATES.DRAFT_GENERATED) : LIFECYCLE_STATES.GENERATION_FAILED,
+            diagnostics,
+            progress,
+            atomSummary: summarizeAtoms(atoms),
+            stalenessPlan: atomPlan.stalenessPlan,
+          },
+        }))
+        return { error: persistOk ? null : 'Smart regeneration skipped all atoms, but provenance was not persisted.' }
+      }
+
+      if (priorDraft?.plan || priorDraft?.executionAtoms?.length) {
+        const backupKey = stage3BuPlanBackupKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name, new Date().toISOString())
+        const backupOk = await writeArtifact(backupKey, {
+          version: 1,
+          backupType: 'stage3_bu_plan_prior_to_regeneration',
+          businessUnitName: unit.name,
+          sourceKey: stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unit.name),
+          createdAt: new Date().toISOString(),
+          reason: `Preserve prior BU draft before Stage 3 ${regenerationMode} regeneration.`,
+          regenerationMode,
+          generationRunId,
+          stalenessPlan: atomPlan.stalenessPlan,
+          draft: priorDraft,
+        })
+        if (!backupOk) {
+          throw new Error(`Could not preserve prior ${unit.name} draft before regeneration. Regeneration stopped to avoid content loss.`)
+        }
       }
       logExecutiveBoundary(unit, 'C2. executionAtoms', atoms)
 
@@ -4965,12 +6395,11 @@ export default function Stage3View({
         throw new Error(`Anthropic API key is required for Stage 3 generation. Add VITE_ANTHROPIC_API_KEY to your environment.`)
       }
 
-      const runnableAtoms = atoms.filter(atom => STAGE3_RETRYABLE_ATOM_STATUSES.has(atom?.status))
       const retryMode = atoms.some(atom => STAGE3_FAILED_ATOM_STATUSES.has(atom.status))
         ? 'retry failed only'
         : runnableAtoms.length < atoms.length
-          ? 'resume missing'
-          : 'full'
+          ? `smart stale only`
+          : regenerationMode === STAGE3_REGENERATION_MODES.FORCE ? 'force full' : 'full'
       const startingDiagnostics = buildGenerationDiagnostics({
         buName: unit.name,
         requestedAtoms: atoms,
@@ -4995,6 +6424,7 @@ export default function Stage3View({
             latestUsage: null,
           }),
           atomSummary: summarizeAtoms(atoms),
+          stalenessPlan: atomPlan.stalenessPlan,
         },
       }))
 
@@ -5018,7 +6448,7 @@ export default function Stage3View({
             latestFailureReason: currentAtom?.parserError || null,
             latestUsage: diagnostics?.latestUsage || null,
           })
-          const { ok: midWriteOk } = await persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms, { status: lifecycleState }, diagnostics, progress)
+          const { ok: midWriteOk } = await persistBuPlanDraft(unit, plan, readiness, 'ai', allAtoms, { status: lifecycleState }, diagnostics, progress, atomPlan)
           setBuPlanGeneration(prev => ({
             ...prev,
             [unit.name]: {
@@ -5029,6 +6459,7 @@ export default function Stage3View({
               diagnostics,
               progress,
               atomSummary: summarizeAtoms(allAtoms),
+              stalenessPlan: atomPlan.stalenessPlan,
             },
           }))
         },
@@ -5134,7 +6565,14 @@ export default function Stage3View({
         latestUsage: lifecycleResult.diagnostics?.latestUsage || null,
       })
       // Persist BEFORE updating React state — if write fails, block safe render
-      const { ok: persistOk } = await persistBuPlanDraft(unit, finalPlan, readiness, 'ai', updatedAtoms, { status: finalLifecycleState }, lifecycleResult.diagnostics, finalProgress)
+      const finalAtomPlan = {
+        ...atomPlan,
+        stalenessPlan: {
+          ...atomPlan.stalenessPlan,
+          atomSetCurrency: hasFinalFailures ? 'stale' : 'current',
+        },
+      }
+      const { ok: persistOk } = await persistBuPlanDraft(unit, finalPlan, readiness, 'ai', updatedAtoms, { status: finalLifecycleState }, lifecycleResult.diagnostics, finalProgress, finalAtomPlan)
       const persistError = !persistOk ? 'Generated content was not persisted. Do not refresh.' : null
       setBuPlanGeneration(prev => ({
         ...prev,
@@ -5148,6 +6586,7 @@ export default function Stage3View({
           diagnostics: lifecycleResult.diagnostics,
           progress: finalProgress,
           atomSummary: lifecycleResult.atomSummary,
+          stalenessPlan: finalAtomPlan.stalenessPlan,
         },
       }))
       return { error: null }
