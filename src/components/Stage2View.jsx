@@ -11,6 +11,7 @@
 // Revision history remains strictly stage-level — no nested unit histories.
 
 import React, { useState, useCallback, useEffect, useRef } from 'react'
+import { readArtifactAsync, writeArtifact } from '../utils/storageRouter'
 import { hasApiKey, callAI, getApiMode, AI_MODEL_LABEL } from '../api/aiClient'
 import {
   buildStage2Messages,
@@ -18,11 +19,27 @@ import {
   generateMockStage2,
   buildStage2UnitRefinementMessages,
   parseStage2UnitResponse,
+  buildStage2StageRefinementMessages,
+  orderBusinessUnits,
 } from '../utils/stage2Prompts'
 import { buildStage2RevisionRecord, stage2SnapshotToText } from '../utils/stageSnapshots'
+import {
+  buildHandoffStructureMessages, parseHandoffStructureResponse,
+  parseHandoffItemResponse,
+  buildHandoffChildAtomMessages, parseHandoffChildAtomResponse,
+  buildHandoffItemRefinementMessages,
+  buildHandoffChildAtomRefinementMessages,
+  buildSmeLensMessages, parseSmeLensResponse,
+  buildSmeLensRefinementMessages,
+  normalizeSMELensForPrompt,
+  CHILD_ATOM_KEYS,
+} from '../utils/handoffPrompts'
 import RevisionHistory    from './RevisionHistory'
 import RevisionDiffViewer from './RevisionDiffViewer'
 import RefinementPanel    from './RefinementPanel'
+import LearningSignals    from './LearningSignals'
+import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
+import { ATOM_STATUSES } from '../utils/generationAtoms'
 
 // ── Involvement level styles ──────────────────────────────────────────────────
 const LEVEL_COLORS = {
@@ -69,6 +86,1570 @@ function SubList({ label, items, borderColor }) {
       </div>
     </div>
   )
+}
+
+const ITEM_STATE_DEFAULT = {
+  status: ATOM_STATUSES.NOT_STARTED, rawResponse: null, parsedValue: null, parserError: null,
+  isDecomposed: false, assembledFromChildren: false, childAtoms: null,
+  missingChildren: [], failedChildren: [], isStale: false,
+}
+
+// Display label for a handoff structure item (string legacy or new object format)
+function getThemeLabel(theme) {
+  return typeof theme === 'string' ? theme : theme?.label || theme?.key || '(unnamed)'
+}
+
+// Formatted string for passing a structure item into prompt context
+function getThemeContext(theme) {
+  if (typeof theme === 'string') return theme
+  const parts = [theme.label]
+  if (theme.purpose)        parts.push(`Purpose: ${theme.purpose}`)
+  if (theme.SMEReviewFocus) parts.push(`SME Review Focus: ${theme.SMEReviewFocus}`)
+  return parts.filter(Boolean).join('\n')
+}
+
+// Derive a camelCase key from a structure item
+function getThemeKey(theme) {
+  if (typeof theme === 'object' && theme?.key) return theme.key
+  return getThemeLabel(theme)
+    .toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
+    .split(/\s+/).map((w, i) => i === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1)).join('')
+}
+const CHILD_ATOM_STATE_DEFAULT = { status: ATOM_STATUSES.NOT_STARTED, rawResponse: null, parsedValue: null, parserError: null }
+const SME_LENS_STATE_DEFAULT   = { status: ATOM_STATUSES.NOT_STARTED, rawResponse: null, parsedValue: null, parserError: null }
+
+function normalizeHandoffDraftPayload(payload = {}) {
+  const legacyParsed = payload.parsed || null
+  const parsed = legacyParsed || (
+    payload.domainOfWork || payload.handoffStructure
+      ? { domainOfWork: payload.domainOfWork || null, handoffStructure: payload.handoffStructure || null }
+      : null
+  )
+  const smeLensState = {
+    ...SME_LENS_STATE_DEFAULT,
+    ...(payload.smeLensState || payload.SMEReviewLensAtom || {}),
+  }
+  if (!smeLensState.parsedValue && payload.SMEReviewLens) {
+    smeLensState.status = 'complete'
+    smeLensState.parsedValue = payload.SMEReviewLens
+  }
+
+  return {
+    version: 2,
+    parsed,
+    itemStates: payload.itemStates || payload.handoffItems || {},
+    smeLensState,
+    structureIsStale: !!payload.structureIsStale,
+    buHandoff: payload.buHandoff || payload.assembledBuHandoff || null,
+    structureRaw: payload.structureRaw || payload.rawResponses?.handoffStructure || null,
+    savedAt: payload.savedAt || payload.lastSavedAt || null,
+  }
+}
+
+function buildHandoffDraftPayload({ buName, parsed, itemStates, smeLensState, structureIsStale, buHandoff, structureRaw }) {
+  const handoffItems = itemStates || {}
+  const childAtoms = Object.fromEntries(
+    Object.entries(handoffItems)
+      .filter(([, state]) => state?.childAtoms)
+      .map(([key, state]) => [key, state.childAtoms]),
+  )
+  const itemRawResponses = Object.fromEntries(
+    Object.entries(handoffItems).map(([key, state]) => [key, {
+      rawResponse: state?.rawResponse || null,
+      childRawResponses: Object.fromEntries(
+        Object.entries(state?.childAtoms || {}).map(([childKey, child]) => [childKey, child?.rawResponse || null]),
+      ),
+    }]),
+  )
+  const itemParserErrors = Object.fromEntries(
+    Object.entries(handoffItems).map(([key, state]) => [key, {
+      parserError: state?.parserError || null,
+      childParserErrors: Object.fromEntries(
+        Object.entries(state?.childAtoms || {}).map(([childKey, child]) => [childKey, child?.parserError || null]),
+      ),
+    }]),
+  )
+  const itemStatuses = Object.fromEntries(
+    Object.entries(handoffItems).map(([key, state]) => [key, {
+      status: state?.status || 'not_started',
+      childStatuses: Object.fromEntries(
+        Object.entries(state?.childAtoms || {}).map(([childKey, child]) => [childKey, child?.status || 'not_started']),
+      ),
+      isStale: !!state?.isStale,
+    }]),
+  )
+  const savedAt = new Date().toISOString()
+
+  return {
+    version: 2,
+    businessUnitName: buName,
+    domainOfWork: parsed?.domainOfWork || null,
+    SMEReviewLens: smeLensState?.parsedValue || null,
+    SMEReviewLensAtom: smeLensState || SME_LENS_STATE_DEFAULT,
+    smeLensState: smeLensState || SME_LENS_STATE_DEFAULT,
+    handoffStructure: parsed?.handoffStructure || null,
+    handoffItems,
+    itemStates: handoffItems,
+    generatedItems: handoffItems,
+    assembledBuHandoff: buHandoff || null,
+    buHandoff: buHandoff || null,
+    childAtoms,
+    rawResponses: {
+      handoffStructure: structureRaw || null,
+      SMEReviewLens: smeLensState?.rawResponse || null,
+      handoffItems: itemRawResponses,
+    },
+    parsedValues: {
+      SMEReviewLens: smeLensState?.parsedValue || null,
+      handoffItems: Object.fromEntries(Object.entries(handoffItems).map(([key, state]) => [key, state?.parsedValue || null])),
+    },
+    parserErrors: {
+      SMEReviewLens: smeLensState?.parserError || null,
+      handoffItems: itemParserErrors,
+    },
+    statuses: {
+      SMEReviewLens: smeLensState?.status || 'not_started',
+      handoffItems: itemStatuses,
+      structureIsStale: !!structureIsStale,
+    },
+    refinementPrompts: {
+      SMEReviewLens: null,
+      handoffItems: {},
+      childAtoms: {},
+    },
+    staleFlags: {
+      structureIsStale: !!structureIsStale,
+      handoffItems: Object.fromEntries(Object.entries(handoffItems).map(([key, state]) => [key, !!state?.isStale])),
+    },
+    handoffStatus: buHandoff
+      ? (buHandoff.completedCount === buHandoff.totalCount ? 'assembled' : 'partial')
+      : parsed?.handoffStructure ? 'structure_ready' : 'not_started',
+    lastSavedAt: savedAt,
+    savedAt,
+  }
+}
+
+// Renders a string or structured-object SME lens value
+function SmeLensValue({ value }) {
+  if (!value) return null
+  if (typeof value === 'string') {
+    return (
+      <div style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.6 }}>
+        {value}
+      </div>
+    )
+  }
+  if (typeof value === 'object') {
+    const sections = [
+      { key: 'summary',               label: null,                     list: false },
+      { key: 'reviewerProfile',        label: 'Reviewer Profile',        list: false },
+      { key: 'decisionAuthority',      label: 'Decision Authority',      list: true  },
+      { key: 'challengeAreas',         label: 'Challenge Areas',         list: true  },
+      { key: 'evidenceRequired',       label: 'Evidence Required',       list: true  },
+      { key: 'operationalConcerns',    label: 'Operational Concerns',    list: true  },
+      { key: 'planFailureConditions',  label: 'Plan Failure Conditions', list: true  },
+    ]
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        {sections.map(({ key, label, list }) => {
+          const val = value[key]
+          if (!val || (Array.isArray(val) && !val.length)) return null
+          return (
+            <div key={key}>
+              {label && (
+                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 2 }}>
+                  {label}
+                </div>
+              )}
+              {list && Array.isArray(val) ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {val.map((item, idx) => (
+                    <div key={idx} style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.55, paddingLeft: 8, borderLeft: '2px solid rgba(59,130,246,.3)' }}>
+                      {item}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={{ fontSize: 10, color: 'var(--text)', fontFamily: 'var(--fm)', lineHeight: 1.6, fontWeight: key === 'summary' ? 600 : 400 }}>
+                  {typeof val === 'string' ? val : JSON.stringify(val)}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+  return null
+}
+
+function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, workspaceId }) {
+  const [open,              setOpen]              = useState(false)
+  const [isGenerating,      setIsGenerating]      = useState(false)
+  const [structureRaw,      setStructureRaw]      = useState(null)
+  const [parsed,            setParsed]            = useState(null)   // { domainOfWork, handoffStructure }
+  const [genError,          setGenError]          = useState(null)
+  const [itemStates,        setItemStates]        = useState({})     // { [index]: ITEM_STATE_DEFAULT }
+  const [smeLensState,      setSmeLensState]      = useState(SME_LENS_STATE_DEFAULT)
+  const [structureIsStale,  setStructureIsStale]  = useState(false)  // true after SME lens changes
+  const [buHandoff,         setBuHandoff]         = useState(null)   // assembled BU-level handoff
+  // transient UI state — not persisted
+  const [itemOpen,          setItemOpen]          = useState({})     // { [i]: bool }
+  const [smeLensRefineUi,   setSmeLensRefineUi]   = useState({ open: false, prompt: '', busy: false, error: null })
+  const [itemRefineUi,      setItemRefineUi]      = useState({})
+  const [childRefineUi,     setChildRefineUi]     = useState({})
+  const [decompositionOpen, setDecompositionOpen] = useState({})
+
+  // ── Draft persistence ───────────────────────────────────────────────────────
+  const hasHydrated = useRef(false)
+  const skipInitialPersist = useRef(true)
+  const storageKey  = workspaceId ? `bsp_v1_handoff_${workspaceId}_${bu.name}` : null
+  const [lastSavedAt, setLastSavedAt] = useState(null)
+
+  // Hydrate once on mount — uses IDB-aware async read so data survives quota migration
+  useEffect(() => {
+    if (!storageKey) {
+      console.log('[Stage2 Handoff Draft] missing workspaceId — persistence disabled for', bu.name)
+      hasHydrated.current = true
+      return
+    }
+    readArtifactAsync(storageKey).then(raw => {
+      if (raw) {
+        const draft = normalizeHandoffDraftPayload(raw)
+        if (draft.parsed) setParsed(draft.parsed)
+        setItemStates(draft.itemStates || {})
+        setSmeLensState(draft.smeLensState || SME_LENS_STATE_DEFAULT)
+        setStructureIsStale(!!draft.structureIsStale)
+        if (draft.buHandoff) setBuHandoff(draft.buHandoff)
+        if (draft.structureRaw) setStructureRaw(draft.structureRaw)
+        if (draft.savedAt) setLastSavedAt(draft.savedAt)
+        console.log('[Stage2 Handoff Draft] hydrated BU', bu.name, 'keys:', Object.keys(raw))
+        console.log('[Stage2 Handoff Draft] SME lens persisted:', !!draft.smeLensState?.parsedValue)
+        console.log('[Stage2 Handoff Draft] handoff items persisted count:', Object.keys(draft.itemStates || {}).length)
+      } else {
+        console.log('[Stage2 Handoff Draft] no draft found for', bu.name)
+      }
+      hasHydrated.current = true
+    }).catch(e => {
+      console.error('[Stage2 Handoff Draft] hydrate failed for', bu.name, e)
+      hasHydrated.current = true
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Persist whenever persisted state changes (skip initial empty save)
+  useEffect(() => {
+    if (!hasHydrated.current || !storageKey) return
+    if (skipInitialPersist.current) {
+      skipInitialPersist.current = false
+      return
+    }
+    try {
+      const draft = buildHandoffDraftPayload({
+        buName: bu.name,
+        parsed,
+        itemStates,
+        smeLensState,
+        structureIsStale,
+        buHandoff,
+        structureRaw,
+      })
+      writeArtifact(storageKey, draft).then(ok => {
+        if (ok) setLastSavedAt(draft.savedAt)
+      }).catch(() => {})
+      console.log('[Stage2 Handoff Draft] saving BU', bu.name, 'keys:', Object.keys(draft))
+      console.log('[Stage2 Handoff Draft] SME lens persisted:', !!draft.SMEReviewLens)
+      console.log('[Stage2 Handoff Draft] handoff items persisted count:', Object.keys(draft.handoffItems || {}).length)
+    } catch (e) {
+      console.error('[Stage2 Handoff Draft] save failed for', bu.name, e)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parsed, itemStates, smeLensState, structureIsStale, buHandoff, structureRaw, storageKey])
+
+  // ── Structure generation ────────────────────────────────────────────────────
+
+  const hasSmeLens    = !!smeLensState.parsedValue
+  const canGenStructure = apiMode === 'ai' && !!activeStage1Rev && !isGenerating && hasSmeLens
+
+  async function handleGenerateHandoffStructure() {
+    if (!canGenStructure) return
+    setIsGenerating(true)
+    setGenError(null)
+    setStructureRaw(null)
+
+    const { messages } = buildHandoffStructureMessages(
+      activeStage1Rev.contentSnapshot, bu, normalizeSMELensForPrompt(smeLensState.parsedValue), otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 2000 })
+
+    if (error) {
+      setGenError(error)
+      setIsGenerating(false)
+      return
+    }
+
+    setStructureRaw(result)
+    const p = parseHandoffStructureResponse(result)
+
+    if (p.error) {
+      setGenError(p.error)
+      setIsGenerating(false)
+      return
+    }
+
+    setParsed({ domainOfWork: p.domainOfWork, handoffStructure: p.handoffStructure })
+    setItemStates({})
+    setStructureIsStale(false)
+    setIsGenerating(false)
+  }
+
+  // ── SME lens generation ─────────────────────────────────────────────────────
+
+  async function handleGenerateSmeLens() {
+    if (!activeStage1Rev || smeLensState.status === 'generating') return
+    setSmeLensState({ status: 'generating', rawResponse: null, parsedValue: null, parserError: null })
+
+    const completedThemes = parsed?.handoffStructure?.filter((_, idx) => {
+      const s = itemStates[idx]?.status
+      return s === 'complete' || s === 'partial'
+    }) || []
+
+    const { messages } = buildSmeLensMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed?.domainOfWork || null,
+      parsed?.handoffStructure || null,
+      completedThemes,
+      otherBuNames,
+    )
+    const { result, error, stopReason } = await callAI(messages, { temperature: 0.3, maxTokens: 2300 })
+
+    if (error) {
+      setSmeLensState(prev => ({ ...prev, status: 'failed', rawResponse: result ?? null, parserError: error }))
+      return
+    }
+    if (stopReason === 'max_tokens') {
+      setSmeLensState(prev => ({
+        ...prev,
+        status: 'failed',
+        rawResponse: result ?? null,
+        parserError: 'SME lens generation exceeded token limit',
+      }))
+      return
+    }
+
+    const p = parseSmeLensResponse(result)
+    if (p.error) {
+      setSmeLensState(prev => ({ ...prev, status: 'failed', rawResponse: result, parserError: p.error }))
+      return
+    }
+
+    setSmeLensState({ status: 'complete', rawResponse: result, parsedValue: p.parsedValue, parserError: null })
+    // Mark existing structure/items stale when SME lens changes
+    if (parsed?.handoffStructure) {
+      setStructureIsStale(true)
+      setItemStates(prev => {
+        const updated = { ...prev }
+        Object.keys(updated).forEach(idx => {
+          const s = updated[idx]?.status
+          if (s === 'complete' || s === 'partial') {
+            updated[idx] = { ...updated[idx], isStale: true }
+          }
+        })
+        return updated
+      })
+    }
+  }
+
+  async function handleRefineSmeLens() {
+    if (!smeLensState.parsedValue || !activeStage1Rev) return
+    const prompt = smeLensRefineUi.prompt?.trim()
+    if (!prompt) return
+
+    setSmeLensRefineUi(p => ({ ...p, busy: true, error: null }))
+
+    const { messages } = buildSmeLensRefinementMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed?.domainOfWork || null,
+      parsed?.handoffStructure || null,
+      normalizeSMELensForPrompt(smeLensState.parsedValue),
+      prompt,
+      otherBuNames,
+    )
+    const { result, error, stopReason } = await callAI(messages, { temperature: 0.3, maxTokens: 2300 })
+
+    if (error) {
+      setSmeLensRefineUi(p => ({ ...p, busy: false, error }))
+      return
+    }
+    if (stopReason === 'max_tokens') {
+      setSmeLensState(prev => ({
+        ...prev,
+        status: prev.status || 'complete',
+        rawResponse: result ?? prev.rawResponse,
+        parserError: 'SME lens refinement exceeded token limit',
+      }))
+      setSmeLensRefineUi(prev => ({ ...prev, busy: false, error: 'SME lens refinement exceeded token limit' }))
+      return
+    }
+
+    const p = parseSmeLensResponse(result)
+    if (p.error) {
+      setSmeLensRefineUi(prev => ({ ...prev, busy: false, error: p.error }))
+      return
+    }
+
+    setSmeLensState(prev => ({ ...prev, rawResponse: result, parsedValue: p.parsedValue, parserError: null }))
+    setSmeLensRefineUi({ open: false, prompt: '', busy: false, error: null })
+    if (parsed?.handoffStructure) {
+      setStructureIsStale(true)
+      setItemStates(prev => {
+        const updated = { ...prev }
+        Object.keys(updated).forEach(idx => {
+          const s = updated[idx]?.status
+          if (s === 'complete' || s === 'partial') {
+            updated[idx] = { ...updated[idx], isStale: true }
+          }
+        })
+        return updated
+      })
+    }
+  }
+
+  // ── Per-item generation ─────────────────────────────────────────────────────
+
+  function patchItem(i, patch) {
+    setItemStates(prev => ({
+      ...prev,
+      [i]: { ...ITEM_STATE_DEFAULT, ...(prev[i] || {}), ...patch },
+    }))
+  }
+
+  async function handleGenerateItem(i, theme) {
+    if (!activeStage1Rev || !parsed) return
+
+    const structureItemContext = getThemeContext(theme)
+    const themeKey = getThemeKey(theme)
+
+    // Open item to show progress; reset state
+    setItemOpen(prev => ({ ...prev, [i]: true }))
+    patchItem(i, {
+      status: 'generating',
+      isDecomposed: true,
+      assembledFromChildren: false,
+      parsedValue: null,
+      parserError: null,
+      rawResponse: null,
+      isStale: false,
+      childAtoms: Object.fromEntries(CHILD_ATOM_KEYS.map(k => [k, { ...CHILD_ATOM_STATE_DEFAULT }])),
+      missingChildren: [],
+      failedChildren: [],
+    })
+
+    // Track each child result locally so assembly doesn't read stale React state
+    const localResults = {}
+
+    async function runOne(childKey) {
+      patchChildAtom(i, childKey, { status: 'generating', parserError: null, rawResponse: null })
+
+      const { messages } = buildHandoffChildAtomMessages(
+        activeStage1Rev.contentSnapshot,
+        bu,
+        parsed.domainOfWork,
+        normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
+        structureItemContext,
+        childKey,
+        otherBuNames,
+      )
+      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+
+      if (error) {
+        patchChildAtom(i, childKey, { status: 'failed', parserError: error, rawResponse: result ?? null })
+        localResults[childKey] = { status: 'failed' }
+        return
+      }
+
+      const p = parseHandoffChildAtomResponse(result, childKey)
+      if (p.error) {
+        patchChildAtom(i, childKey, { status: 'failed', rawResponse: result, parserError: p.error })
+        localResults[childKey] = { status: 'failed' }
+        return
+      }
+
+      patchChildAtom(i, childKey, { status: 'complete', rawResponse: result, parsedValue: p.value, parserError: null })
+      localResults[childKey] = { status: 'complete', parsedValue: p.value }
+    }
+
+    // Bounded concurrency — process CHILD_ATOM_KEYS in pairs
+    const CONCURRENCY = 2
+    for (let j = 0; j < CHILD_ATOM_KEYS.length; j += CONCURRENCY) {
+      await Promise.all(CHILD_ATOM_KEYS.slice(j, j + CONCURRENCY).map(runOne))
+    }
+
+    // Assemble from local results (avoids reading stale React state)
+    const assembledValue = {}
+    const missingChildren = []
+    const failedChildren  = []
+
+    CHILD_ATOM_KEYS.forEach(key => {
+      const r = localResults[key]
+      if (r?.status === 'complete' && r.parsedValue !== null) {
+        assembledValue[key] = r.parsedValue
+      } else if (r?.status === 'failed') {
+        failedChildren.push(key)
+      } else {
+        missingChildren.push(key)
+      }
+    })
+
+    if (!Object.keys(assembledValue).length) {
+      patchItem(i, { status: 'failed', parserError: 'All child atoms failed to generate.' })
+      return
+    }
+
+    const isPartial = missingChildren.length > 0 || failedChildren.length > 0
+
+    if (!isPartial) {
+      setDecompositionOpen(prev => ({ ...prev, [i]: false }))
+      setItemOpen(prev => ({ ...prev, [i]: false }))  // collapse on full success
+    }
+
+    patchItem(i, {
+      status: isPartial ? 'partial' : 'complete',
+      assembledFromChildren: true,
+      isStale: false,
+      parsedValue: { key: themeKey, value: assembledValue },
+      missingChildren,
+      failedChildren,
+    })
+  }
+
+  // ── Child atom helpers ──────────────────────────────────────────────────────
+
+  function patchChildAtom(i, childKey, patch) {
+    setItemStates(prev => {
+      const item = { ...ITEM_STATE_DEFAULT, ...(prev[i] || {}) }
+      return {
+        ...prev,
+        [i]: {
+          ...item,
+          childAtoms: {
+            ...(item.childAtoms || {}),
+            [childKey]: {
+              ...CHILD_ATOM_STATE_DEFAULT,
+              ...(item.childAtoms?.[childKey] || {}),
+              ...patch,
+            },
+          },
+        },
+      }
+    })
+  }
+
+  async function handleGenerateChildAtom(i, structureItem, childKey) {
+    if (!activeStage1Rev || !parsed) return
+    patchChildAtom(i, childKey, { status: 'generating', parserError: null, rawResponse: null })
+
+    const { messages } = buildHandoffChildAtomMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed.domainOfWork,
+      normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
+      structureItem,
+      childKey,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+
+    if (error) {
+      patchChildAtom(i, childKey, { status: 'failed', parserError: error, rawResponse: result ?? null })
+      return
+    }
+
+    const p = parseHandoffChildAtomResponse(result, childKey)
+    if (p.error) {
+      patchChildAtom(i, childKey, { status: 'failed', rawResponse: result, parserError: p.error })
+      return
+    }
+
+    patchChildAtom(i, childKey, { status: 'complete', rawResponse: result, parsedValue: p.value, parserError: null })
+  }
+
+  function handleAssembleItem(i, theme) {
+    const iState = itemStates[i]
+    if (!iState?.childAtoms) return
+
+    const assembledValue = {}
+    const missingChildren = []
+    const failedChildren  = []
+
+    CHILD_ATOM_KEYS.forEach(key => {
+      const cs = iState.childAtoms[key]
+      if (cs?.status === 'complete' && cs.parsedValue !== null) {
+        assembledValue[key] = cs.parsedValue
+      } else if (cs?.status === 'failed') {
+        failedChildren.push(key)
+      } else {
+        missingChildren.push(key)
+      }
+    })
+
+    if (!Object.keys(assembledValue).length) return
+
+    const isPartial = missingChildren.length > 0 || failedChildren.length > 0
+
+    const existingKey = iState.parsedValue?.key
+    const derivedKey = existingKey || getThemeKey(theme)
+
+    patchItem(i, {
+      status: isPartial ? 'partial' : 'complete',
+      assembledFromChildren: true,
+      parsedValue: { key: derivedKey, value: assembledValue },
+      missingChildren,
+      failedChildren,
+    })
+    // Auto-collapse decomposition on full assembly
+    if (!isPartial) {
+      setDecompositionOpen(prev => ({ ...prev, [i]: false }))
+    }
+  }
+
+  function handleAssembleBuHandoff() {
+    if (!parsed?.handoffStructure) return
+    const items = parsed.handoffStructure.map((theme, i) => {
+      const iState = itemStates[i]
+      return {
+        key: getThemeKey(theme),
+        label: getThemeLabel(theme),
+        status: iState?.status || 'not_started',
+        value: iState?.parsedValue?.value || null,
+      }
+    })
+    const completedItems = items.filter(it => it.value !== null)
+    if (!completedItems.length) return
+    setBuHandoff({
+      assembledAt: new Date().toISOString(),
+      domainOfWork: parsed.domainOfWork,
+      smeLens: smeLensState.parsedValue || null,
+      items,
+      completedCount: completedItems.length,
+      totalCount: items.length,
+    })
+  }
+
+  // ── Refine item helpers ─────────────────────────────────────────────────────
+
+  function patchItemRefineUi(i, patch) {
+    setItemRefineUi(prev => ({
+      ...prev,
+      [i]: { open: false, prompt: '', busy: false, error: null, ...(prev[i] || {}), ...patch },
+    }))
+  }
+
+  function patchChildRefineUi(key, patch) {
+    setChildRefineUi(prev => ({
+      ...prev,
+      [key]: { open: false, prompt: '', busy: false, error: null, ...(prev[key] || {}), ...patch },
+    }))
+  }
+
+  async function handleRefineItem(i, structureItem) {
+    const iState = itemStates[i]
+    if (!iState?.parsedValue || !activeStage1Rev || !parsed) return
+    const ui = itemRefineUi[i] || {}
+    const prompt = ui.prompt?.trim()
+    if (!prompt) return
+
+    patchItemRefineUi(i, { busy: true, error: null })
+
+    const { messages } = buildHandoffItemRefinementMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed.domainOfWork,
+      normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
+      structureItem,
+      iState.parsedValue.value,
+      prompt,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1500 })
+
+    if (error) {
+      patchItemRefineUi(i, { busy: false, error })
+      return
+    }
+
+    const p = parseHandoffItemResponse(result)
+    if (p.error) {
+      patchItemRefineUi(i, { busy: false, error: p.error })
+      return
+    }
+
+    patchItem(i, { rawResponse: result, parsedValue: { key: p.key, value: p.value }, parserError: null })
+    patchItemRefineUi(i, { busy: false, error: null, open: false, prompt: '' })
+  }
+
+  async function handleRefineChildAtom(i, structureItem, childKey) {
+    const iState = itemStates[i]
+    const cs = iState?.childAtoms?.[childKey]
+    if (!cs?.parsedValue || !activeStage1Rev || !parsed) return
+    const uiKey = `${i}/${childKey}`
+    const ui = childRefineUi[uiKey] || {}
+    const prompt = ui.prompt?.trim()
+    if (!prompt) return
+
+    patchChildRefineUi(uiKey, { busy: true, error: null })
+
+    const { messages } = buildHandoffChildAtomRefinementMessages(
+      activeStage1Rev.contentSnapshot,
+      bu,
+      parsed.domainOfWork,
+      normalizeSMELensForPrompt(smeLensState.parsedValue) || null,
+      structureItem,
+      childKey,
+      cs.parsedValue,
+      prompt,
+      otherBuNames,
+    )
+    const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 800 })
+
+    if (error) {
+      patchChildRefineUi(uiKey, { busy: false, error })
+      return
+    }
+
+    const p = parseHandoffChildAtomResponse(result, childKey)
+    if (p.error) {
+      patchChildRefineUi(uiKey, { busy: false, error: p.error })
+      return
+    }
+
+    patchChildAtom(i, childKey, { rawResponse: result, parsedValue: p.value, parserError: null })
+    patchChildRefineUi(uiKey, { busy: false, error: null, open: false, prompt: '' })
+  }
+
+  // ── Derived status label ────────────────────────────────────────────────────
+
+  const itemCount = parsed?.handoffStructure?.length ?? 0
+  const doneCount = Object.values(itemStates).filter(s => s?.status === 'complete' || s?.status === 'partial').length
+
+  function handoffStatusLabel() {
+    if (!parsed) return 'Not started'
+    if (itemCount === 0 || doneCount === 0) return 'Structure ready'
+    if (doneCount === itemCount) return 'All items complete'
+    return `${doneCount} / ${itemCount} items complete`
+  }
+
+  // ── Shared styles ───────────────────────────────────────────────────────────
+
+  const disabledButtonStyle = {
+    fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+    padding: '4px 8px', borderRadius: 4, cursor: 'not-allowed',
+    background: 'var(--surface)', border: '1px solid var(--border)',
+    color: 'var(--muted)', opacity: 0.58,
+  }
+
+  const Field = ({ label, value }) => (
+    <div style={{
+      padding: '7px 9px', border: '1px solid var(--border)',
+      borderRadius: 4, background: 'rgba(255,255,255,.015)',
+    }}>
+      <div style={{
+        fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+        textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3,
+      }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 10, color: value ? 'var(--text)' : 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+        {value || 'Not generated yet'}
+      </div>
+    </div>
+  )
+
+  // ── Item value renderer (string | array | object) ───────────────────────────
+
+  function renderItemValue(value, depth = 0) {
+    if (typeof value === 'string') {
+      return (
+        <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.6, marginTop: 4 }}>
+          {value}
+        </div>
+      )
+    }
+    if (Array.isArray(value)) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 }}>
+          {value.map((v, idx) => (
+            <div key={idx} style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+              · {typeof v === 'string' ? v : JSON.stringify(v)}
+            </div>
+          ))}
+        </div>
+      )
+    }
+    if (value && typeof value === 'object' && depth < 2) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 4 }}>
+          {Object.entries(value).map(([k, v]) => (
+            <div key={k}>
+              <div style={{
+                fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+                textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 1,
+              }}>
+                {k}
+              </div>
+              {renderItemValue(v, depth + 1)}
+            </div>
+          ))}
+        </div>
+      )
+    }
+    return null
+  }
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+
+  return (
+    <div style={{ marginTop: 10, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          gap: 10, fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
+          padding: '6px 9px', borderRadius: 5, cursor: 'pointer',
+          background: open ? 'rgba(59,130,246,.08)' : 'var(--s2)',
+          border: `1px solid ${open ? 'rgba(59,130,246,.28)' : 'var(--border)'}`,
+          color: open ? 'var(--accent)' : 'var(--muted)',
+        }}
+      >
+        <span>Stage 3 Planning Handoff</span>
+        <span style={{ fontSize: 8, color: 'var(--muted)' }}>{open ? '▲' : '▼'}</span>
+      </button>
+
+      {open && (
+        <div style={{
+          marginTop: 8, padding: '10px 11px',
+          background: 'rgba(59,130,246,.035)', border: '1px solid rgba(59,130,246,.14)', borderRadius: 6,
+        }}>
+
+          {/* ── Top metadata row ─────────────────────────────────── */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 9 }}>
+            <Field label="domainOfWork" value={parsed?.domainOfWork} />
+
+            {/* SME lens field with inline refine */}
+            <div style={{
+              padding: '7px 9px', border: `1px solid ${smeLensState.status === 'failed' ? 'rgba(248,113,113,.35)' : 'var(--border)'}`,
+              borderRadius: 4, background: 'rgba(255,255,255,.015)',
+            }}>
+              <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
+                SMEReviewLens
+              </div>
+
+              {smeLensState.status === 'complete' && (
+                <SmeLensValue value={smeLensState.parsedValue} />
+              )}
+              {smeLensState.status === 'generating' && (
+                <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)' }}>Generating…</div>
+              )}
+              {smeLensState.status === 'failed' && (
+                <div>
+                  <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4, display: 'flex', gap: 4 }}>
+                    <span style={{ flexShrink: 0 }}>⚠</span>
+                    <span>{smeLensState.parserError}</span>
+                  </div>
+                  {smeLensState.rawResponse && (
+                    <pre style={{
+                      fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                      background: 'var(--s2)', borderRadius: 3, padding: '4px 6px',
+                      overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                      maxHeight: 80, overflowY: 'auto', margin: '3px 0 0',
+                    }}>
+                      {smeLensState.rawResponse}
+                    </pre>
+                  )}
+                </div>
+              )}
+              {smeLensState.status === 'not_started' && (
+                <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)' }}>Not generated yet</div>
+              )}
+
+              {/* Inline refine for SME lens */}
+              {smeLensState.status === 'complete' && apiMode === 'ai' && (
+                <div style={{ marginTop: 6 }}>
+                  <button
+                    onClick={() => setSmeLensRefineUi(p => ({ ...p, open: !p.open }))}
+                    disabled={smeLensRefineUi.busy}
+                    style={{
+                      fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                      padding: '1px 6px', borderRadius: 3,
+                      cursor: smeLensRefineUi.busy ? 'not-allowed' : 'pointer',
+                      background: smeLensRefineUi.open ? 'rgba(59,130,246,.1)' : 'transparent',
+                      border: `1px solid ${smeLensRefineUi.open ? 'rgba(59,130,246,.3)' : 'var(--border)'}`,
+                      color: smeLensRefineUi.open ? 'var(--accent)' : 'var(--muted)',
+                      opacity: smeLensRefineUi.busy ? 0.5 : 1,
+                    }}
+                  >
+                    ↻ Refine {smeLensRefineUi.open ? '▲' : '▼'}
+                  </button>
+                  {smeLensRefineUi.open && (
+                    <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                      <textarea
+                        value={smeLensRefineUi.prompt}
+                        onChange={e => setSmeLensRefineUi(p => ({ ...p, prompt: e.target.value }))}
+                        rows={2}
+                        disabled={smeLensRefineUi.busy}
+                        placeholder="Refinement instruction…"
+                        style={{
+                          width: '100%', boxSizing: 'border-box',
+                          fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--text)',
+                          background: 'var(--surface)', border: '1px solid var(--border)',
+                          borderRadius: 3, padding: '4px 6px', resize: 'vertical', outline: 'none',
+                          lineHeight: 1.5, opacity: smeLensRefineUi.busy ? 0.5 : 1,
+                        }}
+                      />
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <button
+                          onClick={handleRefineSmeLens}
+                          disabled={smeLensRefineUi.busy || !smeLensRefineUi.prompt.trim()}
+                          style={{
+                            fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                            padding: '2px 7px', borderRadius: 3,
+                            cursor: (smeLensRefineUi.busy || !smeLensRefineUi.prompt.trim()) ? 'not-allowed' : 'pointer',
+                            background: 'rgba(59,130,246,.12)',
+                            border: '1px solid rgba(59,130,246,.3)',
+                            color: 'var(--accent)',
+                            opacity: (smeLensRefineUi.busy || !smeLensRefineUi.prompt.trim()) ? 0.5 : 1,
+                          }}
+                        >
+                          {smeLensRefineUi.busy ? 'Refining…' : 'Apply'}
+                        </button>
+                        {smeLensRefineUi.error && (
+                          <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                            ⚠ {smeLensRefineUi.error}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* ── Stale structure warning ──────────────────────────── */}
+          {structureIsStale && parsed?.handoffStructure && (
+            <div style={{
+              marginBottom: 8, padding: '6px 9px', borderRadius: 4,
+              background: 'rgba(251,146,60,.07)', border: '1px solid rgba(251,146,60,.3)',
+              fontSize: 9, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.5,
+              display: 'flex', gap: 6, alignItems: 'flex-start',
+            }}>
+              <span style={{ flexShrink: 0 }}>⚠</span>
+              <span>SME lens changed — regenerate the handoff structure to align with the updated lens.</span>
+            </div>
+          )}
+
+          {/* ── handoffStructure + per-item generation ───────────── */}
+          <div style={{
+            padding: '7px 9px', border: '1px solid var(--border)',
+            borderRadius: 4, background: 'rgba(255,255,255,.015)', marginBottom: 8,
+          }}>
+            <div style={{
+              fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)',
+              textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6,
+            }}>
+              handoffStructure &amp; items
+            </div>
+
+            {parsed?.handoffStructure ? (() => {
+              const canGenItemBase = apiMode === 'ai' && !!activeStage1Rev && !!parsed.domainOfWork && !isGenerating
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {parsed.handoffStructure.map((theme, i) => {
+                    const iState = itemStates[i] || ITEM_STATE_DEFAULT
+                    const isGenItem = iState.status === 'generating'
+                    const canGenItem = canGenItemBase && !isGenItem
+
+                    const assembled = iState.assembledFromChildren &&
+                      (iState.status === 'complete' || iState.status === 'partial')
+                    const isPartial = iState.status === 'partial'
+
+                    const borderColor =
+                      assembled && isPartial         ? 'rgba(251,146,60,.45)'  :
+                      assembled                      ? 'rgba(139,92,246,.45)'  :
+                      iState.status === 'complete'   ? 'rgba(0,229,180,.45)'   :
+                      iState.status === 'failed'     ? 'rgba(248,113,113,.45)' :
+                      isGenItem                      ? 'rgba(59,130,246,.55)'  :
+                                                       'rgba(59,130,246,.22)'
+
+                    const btnBg =
+                      iState.status === 'failed'   ? 'rgba(248,113,113,.1)'  :
+                      assembled && isPartial       ? 'rgba(251,146,60,.1)'   :
+                      assembled                    ? 'rgba(139,92,246,.1)'   :
+                      iState.status === 'complete' ? 'rgba(0,229,180,.08)'   :
+                      canGenItem                   ? 'rgba(59,130,246,.1)'   : 'var(--surface)'
+
+                    const btnBorder =
+                      iState.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                      assembled && isPartial       ? 'rgba(251,146,60,.35)'  :
+                      assembled                    ? 'rgba(139,92,246,.3)'   :
+                      iState.status === 'complete' ? 'rgba(0,229,180,.3)'    :
+                      canGenItem                   ? 'rgba(59,130,246,.3)'   : 'var(--border)'
+
+                    const btnColor =
+                      iState.status === 'failed'   ? '#f87171'        :
+                      assembled && isPartial       ? '#fb923c'        :
+                      assembled                    ? '#a78bfa'        :
+                      iState.status === 'complete' ? '#00e5b4'        :
+                      canGenItem                   ? 'var(--accent)'  : 'var(--muted)'
+
+                    const genDoneCount = isGenItem && iState.childAtoms
+                      ? Object.values(iState.childAtoms).filter(cs => cs?.status === 'complete' || cs?.status === 'failed').length
+                      : null
+
+                    const btnLabel =
+                      isGenItem                                        ? `Generating… ${genDoneCount !== null ? `(${genDoneCount}/${CHILD_ATOM_KEYS.length})` : ''}`.trim() :
+                      iState.status === 'complete' || isPartial       ? '↻ Regenerate item' :
+                      iState.status === 'failed'                       ? 'Retry item'        :
+                                                                         'Generate item'
+
+                    const canAssemble = !!(iState.childAtoms &&
+                      Object.values(iState.childAtoms).some(cs => cs?.status === 'complete'))
+
+                    const isItemOpen = isGenItem || iState.status === 'failed' || !!itemOpen[i]
+
+                    return (
+                      <div key={i} style={{ paddingLeft: 8, borderLeft: `2px solid ${borderColor}` }}>
+                        {/* Theme row */}
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                          <div style={{ flex: 1, fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+                            {getThemeLabel(theme)}
+                            {iState.isStale && (
+                              <span style={{ marginLeft: 5, fontSize: 7, fontFamily: 'var(--fm)', color: '#fb923c', opacity: .85, fontWeight: 600 }}>
+                                STALE
+                              </span>
+                            )}
+                            {assembled && isPartial && !iState.isStale && (
+                              <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', opacity: .85 }}>
+                                partial
+                              </span>
+                            )}
+                            {assembled && !isPartial && !iState.isStale && (
+                              <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#a78bfa', opacity: .8 }}>
+                                assembled
+                              </span>
+                            )}
+                          </div>
+                          {(iState.status === 'complete' || iState.status === 'partial') && (
+                            <button
+                              onClick={() => setItemOpen(prev => ({ ...prev, [i]: !prev[i] }))}
+                              style={{
+                                flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)',
+                                padding: '1px 5px', borderRadius: 3, cursor: 'pointer',
+                                background: 'transparent', border: '1px solid var(--border)',
+                                color: 'var(--muted)',
+                              }}
+                            >
+                              {isItemOpen ? '▲' : '▼'}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleGenerateItem(i, theme)}
+                            disabled={!canGenItem}
+                            style={{
+                              flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                              padding: '2px 7px', borderRadius: 3,
+                              cursor: canGenItem ? 'pointer' : 'not-allowed',
+                              background: btnBg, border: `1px solid ${btnBorder}`, color: btnColor,
+                              opacity: !canGenItem && !isGenItem ? 0.5 : 1,
+                            }}
+                          >
+                            {btnLabel}
+                          </button>
+                        </div>
+
+                        {/* Generated value — direct or assembled (complete/partial) */}
+                        {isItemOpen && (iState.status === 'complete' || iState.status === 'partial') && iState.parsedValue && (
+                          <div style={{ paddingLeft: 4 }}>
+                            {isPartial && (
+                              <div style={{ marginBottom: 5 }}>
+                                <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.55 }}>
+                                  ⚠ Partial assembly
+                                  {iState.missingChildren?.length > 0 && (
+                                    <span> · not generated: {iState.missingChildren.join(', ')}</span>
+                                  )}
+                                  {iState.failedChildren?.length > 0 && (
+                                    <span> · failed: {iState.failedChildren.join(', ')}</span>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+                            {renderItemValue(iState.parsedValue.value)}
+
+                            {/* UX Fix B — Refine handoff item */}
+                            {apiMode === 'ai' && (() => {
+                              const rui = itemRefineUi[i] || {}
+                              return (
+                                <div style={{ marginTop: 6 }}>
+                                  <button
+                                    onClick={() => patchItemRefineUi(i, { open: !rui.open })}
+                                    disabled={rui.busy}
+                                    style={{
+                                      fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                      padding: '2px 7px', borderRadius: 3,
+                                      cursor: rui.busy ? 'not-allowed' : 'pointer',
+                                      background: rui.open ? 'rgba(59,130,246,.1)' : 'transparent',
+                                      border: `1px solid ${rui.open ? 'rgba(59,130,246,.3)' : 'var(--border)'}`,
+                                      color: rui.open ? 'var(--accent)' : 'var(--muted)',
+                                      opacity: rui.busy ? 0.5 : 1,
+                                    }}
+                                  >
+                                    ↻ Refine item {rui.open ? '▲' : '▼'}
+                                  </button>
+                                  {rui.open && (
+                                    <div style={{ marginTop: 5, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                      <textarea
+                                        value={rui.prompt || ''}
+                                        onChange={e => patchItemRefineUi(i, { prompt: e.target.value })}
+                                        rows={2}
+                                        disabled={rui.busy}
+                                        placeholder="Refinement instruction…"
+                                        style={{
+                                          width: '100%', boxSizing: 'border-box',
+                                          fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--text)',
+                                          background: 'var(--surface)', border: '1px solid var(--border)',
+                                          borderRadius: 3, padding: '5px 7px', resize: 'vertical', outline: 'none',
+                                          lineHeight: 1.5, opacity: rui.busy ? 0.5 : 1,
+                                        }}
+                                      />
+                                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                        <button
+                                          onClick={() => handleRefineItem(i, theme)}
+                                          disabled={rui.busy || !(rui.prompt?.trim())}
+                                          style={{
+                                            fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                            padding: '2px 8px', borderRadius: 3,
+                                            cursor: (rui.busy || !(rui.prompt?.trim())) ? 'not-allowed' : 'pointer',
+                                            background: 'rgba(59,130,246,.12)',
+                                            border: '1px solid rgba(59,130,246,.3)',
+                                            color: 'var(--accent)',
+                                            opacity: (rui.busy || !(rui.prompt?.trim())) ? 0.5 : 1,
+                                          }}
+                                        >
+                                          {rui.busy ? 'Refining…' : 'Apply refinement'}
+                                        </button>
+                                        {rui.error && (
+                                          <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                                            ⚠ {rui.error}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )
+                            })()}
+                          </div>
+                        )}
+
+                        {/* Per-item error + raw + decompose trigger */}
+                        {isItemOpen && iState.status === 'failed' && (
+                          <div style={{ marginTop: 4 }}>
+                            <div style={{
+                              display: 'flex', gap: 4, fontSize: 9, fontFamily: 'var(--fm)',
+                              color: '#f87171', lineHeight: 1.5,
+                            }}>
+                              <span style={{ flexShrink: 0 }}>⚠</span>
+                              <span>{iState.parserError}</span>
+                            </div>
+                            {iState.rawResponse && (
+                              <pre style={{
+                                fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                                background: 'var(--s2)', borderRadius: 4, padding: '6px 8px',
+                                overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                maxHeight: 120, overflowY: 'auto', margin: '4px 0 0',
+                              }}>
+                                {iState.rawResponse}
+                              </pre>
+                            )}
+                          </div>
+                        )}
+
+                        {/* UX Fix C — toggle for decomposition after full assembly */}
+                        {isItemOpen && assembled && !isPartial && iState.isDecomposed && (
+                          <button
+                            onClick={() => setDecompositionOpen(prev => ({ ...prev, [i]: !prev[i] }))}
+                            style={{
+                              marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                              padding: '2px 7px', borderRadius: 3, cursor: 'pointer',
+                              background: 'transparent',
+                              border: '1px solid var(--border)',
+                              color: 'var(--muted)',
+                            }}
+                          >
+                            {decompositionOpen[i] ? '▲ Hide generation details' : '▼ Show generation details'}
+                          </button>
+                        )}
+
+                        {/* Child atoms — shown if isDecomposed AND (partial/not-assembled OR toggle open) */}
+                        {isItemOpen && iState.isDecomposed && iState.childAtoms && (assembled && !isPartial ? decompositionOpen[i] : true) && (
+                          <div style={{
+                            marginTop: 7, padding: '8px 9px',
+                            background: 'rgba(139,92,246,.04)',
+                            border: '1px solid rgba(139,92,246,.18)',
+                            borderRadius: 5,
+                          }}>
+                            <div style={{
+                              fontSize: 8, fontFamily: 'var(--fm)', color: 'rgba(167,139,250,.8)',
+                              textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 7,
+                            }}>
+                              Generation details
+                            </div>
+
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                              {CHILD_ATOM_KEYS.map(childKey => {
+                                const cs = iState.childAtoms[childKey] || CHILD_ATOM_STATE_DEFAULT
+                                const isGenChild = cs.status === 'generating'
+                                const canGenChild = canGenItemBase && !isGenItem && !isGenChild
+
+                                const childBtnLabel =
+                                  isGenChild               ? 'Generating…' :
+                                  cs.status === 'complete' ? '↻'           :
+                                  cs.status === 'failed'   ? 'Retry'       :
+                                                             'Generate'
+
+                                const childBtnColor =
+                                  cs.status === 'failed'   ? '#f87171'           :
+                                  cs.status === 'complete' ? '#00e5b4'           :
+                                  canGenChild              ? '#a78bfa'           : 'var(--muted)'
+
+                                const childBtnBorder =
+                                  cs.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                                  cs.status === 'complete' ? 'rgba(0,229,180,.3)'    :
+                                  canGenChild              ? 'rgba(139,92,246,.35)'  : 'var(--border)'
+
+                                const cuiKey = `${i}/${childKey}`
+                                const crui = childRefineUi[cuiKey] || {}
+
+                                return (
+                                  <div key={childKey}>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                      <div style={{
+                                        flex: 1, fontSize: 9, fontFamily: 'var(--fm)',
+                                        color: cs.status === 'complete' ? 'var(--text)' : 'var(--muted)',
+                                        lineHeight: 1.4,
+                                      }}>
+                                        {childKey}
+                                      </div>
+                                      <button
+                                        onClick={() => handleGenerateChildAtom(i, theme, childKey)}
+                                        disabled={!canGenChild}
+                                        style={{
+                                          flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                          padding: '2px 6px', borderRadius: 3,
+                                          cursor: canGenChild ? 'pointer' : 'not-allowed',
+                                          background: cs.status === 'failed'   ? 'rgba(248,113,113,.08)' :
+                                                      cs.status === 'complete' ? 'rgba(0,229,180,.06)'   :
+                                                      canGenChild              ? 'rgba(139,92,246,.1)'   : 'var(--surface)',
+                                          border: `1px solid ${childBtnBorder}`,
+                                          color: childBtnColor,
+                                          opacity: !canGenChild && !isGenChild ? 0.5 : 1,
+                                        }}
+                                      >
+                                        {childBtnLabel}
+                                      </button>
+                                    </div>
+
+                                    {cs.status === 'complete' && cs.parsedValue !== null && (
+                                      <div style={{ paddingLeft: 10, marginTop: 2 }}>
+                                        {renderItemValue(cs.parsedValue)}
+
+                                        {/* UX Fix A — Refine child atom */}
+                                        {apiMode === 'ai' && (
+                                          <div style={{ marginTop: 4 }}>
+                                            <button
+                                              onClick={() => patchChildRefineUi(cuiKey, { open: !crui.open })}
+                                              disabled={crui.busy}
+                                              style={{
+                                                fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                                                padding: '1px 6px', borderRadius: 3,
+                                                cursor: crui.busy ? 'not-allowed' : 'pointer',
+                                                background: crui.open ? 'rgba(0,229,180,.07)' : 'transparent',
+                                                border: `1px solid ${crui.open ? 'rgba(0,229,180,.25)' : 'var(--border)'}`,
+                                                color: crui.open ? '#00e5b4' : 'var(--muted)',
+                                                opacity: crui.busy ? 0.5 : 1,
+                                              }}
+                                            >
+                                              ↻ Refine {crui.open ? '▲' : '▼'}
+                                            </button>
+                                            {crui.open && (
+                                              <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                                                <textarea
+                                                  value={crui.prompt || ''}
+                                                  onChange={e => patchChildRefineUi(cuiKey, { prompt: e.target.value })}
+                                                  rows={2}
+                                                  disabled={crui.busy}
+                                                  placeholder="Refinement instruction…"
+                                                  style={{
+                                                    width: '100%', boxSizing: 'border-box',
+                                                    fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--text)',
+                                                    background: 'var(--surface)', border: '1px solid var(--border)',
+                                                    borderRadius: 3, padding: '4px 6px', resize: 'vertical', outline: 'none',
+                                                    lineHeight: 1.5, opacity: crui.busy ? 0.5 : 1,
+                                                  }}
+                                                />
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                                  <button
+                                                    onClick={() => handleRefineChildAtom(i, theme, childKey)}
+                                                    disabled={crui.busy || !(crui.prompt?.trim())}
+                                                    style={{
+                                                      fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                                                      padding: '2px 7px', borderRadius: 3,
+                                                      cursor: (crui.busy || !(crui.prompt?.trim())) ? 'not-allowed' : 'pointer',
+                                                      background: 'rgba(0,229,180,.08)',
+                                                      border: '1px solid rgba(0,229,180,.25)',
+                                                      color: '#00e5b4',
+                                                      opacity: (crui.busy || !(crui.prompt?.trim())) ? 0.5 : 1,
+                                                    }}
+                                                  >
+                                                    {crui.busy ? 'Refining…' : 'Apply'}
+                                                  </button>
+                                                  {crui.error && (
+                                                    <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                                                      ⚠ {crui.error}
+                                                    </span>
+                                                  )}
+                                                </div>
+                                              </div>
+                                            )}
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+
+                                    {cs.status === 'failed' && (
+                                      <div style={{ marginTop: 3, paddingLeft: 10 }}>
+                                        <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', lineHeight: 1.4 }}>
+                                          ⚠ {cs.parserError}
+                                        </div>
+                                        {cs.rawResponse && (
+                                          <pre style={{
+                                            fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                                            background: 'var(--s2)', borderRadius: 3, padding: '4px 6px',
+                                            overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                            maxHeight: 80, overflowY: 'auto', margin: '3px 0 0',
+                                          }}>
+                                            {cs.rawResponse}
+                                          </pre>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                )
+                              })}
+                            </div>
+
+                            {canAssemble && (
+                              <button
+                                onClick={() => handleAssembleItem(i, theme)}
+                                style={{
+                                  marginTop: 9, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                  padding: '4px 9px', borderRadius: 4, cursor: 'pointer',
+                                  background: 'rgba(139,92,246,.14)',
+                                  border: '1px solid rgba(139,92,246,.35)',
+                                  color: '#a78bfa',
+                                }}
+                              >
+                                Assemble item from child atoms
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })() : (
+              <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.55 }}>
+                Generate handoff structure first.
+              </div>
+            )}
+          </div>
+
+          {/* ── handoffStatus ────────────────────────────────────── */}
+          <div style={{ marginBottom: 9 }}>
+            <Field label="handoffStatus" value={handoffStatusLabel()} />
+          </div>
+
+          {/* ── Structure-level error ────────────────────────────── */}
+          {genError && (
+            <div style={{
+              marginBottom: 8, fontSize: 9, fontFamily: 'var(--fm)',
+              color: '#f87171', lineHeight: 1.6, padding: '6px 9px', borderRadius: 4,
+              background: 'rgba(248,113,113,.07)', border: '1px solid rgba(248,113,113,.25)',
+            }}>
+              <div style={{ display: 'flex', gap: 5, marginBottom: structureRaw ? 5 : 0 }}>
+                <span style={{ flexShrink: 0 }}>⚠</span>
+                <span>{genError}</span>
+              </div>
+              {structureRaw && (
+                <pre style={{
+                  fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)',
+                  background: 'var(--s2)', borderRadius: 4, padding: '8px 10px',
+                  overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                  maxHeight: 160, overflowY: 'auto', margin: 0,
+                }}>
+                  {structureRaw}
+                </pre>
+              )}
+            </div>
+          )}
+
+          {/* ── Action buttons — SME lens → structure → assemble ─── */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {/* 1. Generate SME lens */}
+            {(() => {
+              const isGenLens = smeLensState.status === 'generating'
+              const canGenLens = apiMode === 'ai' && !!activeStage1Rev && !isGenLens
+              const lensLabel =
+                isGenLens                            ? 'Generating…'           :
+                smeLensState.status === 'complete'   ? '↻ Regenerate SME lens' :
+                smeLensState.status === 'failed'     ? 'Retry SME lens'        :
+                                                       'Generate SME lens'
+              return (
+                <button
+                  onClick={handleGenerateSmeLens}
+                  disabled={!canGenLens}
+                  style={{
+                    fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                    padding: '4px 8px', borderRadius: 4,
+                    cursor: canGenLens ? 'pointer' : 'not-allowed',
+                    background: smeLensState.status === 'failed'   ? 'rgba(248,113,113,.1)' :
+                                smeLensState.status === 'complete' ? 'rgba(0,229,180,.08)'  :
+                                canGenLens                         ? 'rgba(59,130,246,.12)' : 'var(--surface)',
+                    border: `1px solid ${
+                      smeLensState.status === 'failed'   ? 'rgba(248,113,113,.35)' :
+                      smeLensState.status === 'complete' ? 'rgba(0,229,180,.3)'    :
+                      canGenLens                         ? 'rgba(59,130,246,.35)'  : 'var(--border)'
+                    }`,
+                    color: smeLensState.status === 'failed'   ? '#f87171'       :
+                           smeLensState.status === 'complete' ? '#00e5b4'       :
+                           canGenLens                         ? 'var(--accent)' : 'var(--muted)',
+                    opacity: canGenLens ? 1 : 0.58,
+                  }}
+                >
+                  {lensLabel}
+                </button>
+              )
+            })()}
+
+            {/* 2. Generate handoff structure (requires SME lens) */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <button
+                onClick={handleGenerateHandoffStructure}
+                disabled={!canGenStructure}
+                style={{
+                  fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                  padding: '4px 8px', borderRadius: 4,
+                  cursor: canGenStructure ? 'pointer' : 'not-allowed',
+                  background: canGenStructure ? 'rgba(59,130,246,.12)' : 'var(--surface)',
+                  border: `1px solid ${canGenStructure ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
+                  color: canGenStructure ? 'var(--accent)' : 'var(--muted)',
+                  opacity: canGenStructure ? 1 : 0.58,
+                }}
+              >
+                {isGenerating ? 'Generating…' : parsed ? '↻ Regenerate handoff structure' : 'Generate handoff structure'}
+              </button>
+              {!hasSmeLens && apiMode === 'ai' && (
+                <div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', paddingLeft: 1 }}>
+                  Generate SME lens first
+                </div>
+              )}
+            </div>
+
+            {/* 3. Assemble BU handoff */}
+            {(() => {
+              const canAssembleBu = !!parsed?.handoffStructure && doneCount > 0
+              return (
+                <button
+                  onClick={handleAssembleBuHandoff}
+                  disabled={!canAssembleBu}
+                  style={{
+                    fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                    padding: '4px 8px', borderRadius: 4,
+                    cursor: canAssembleBu ? 'pointer' : 'not-allowed',
+                    background: buHandoff     ? 'rgba(0,229,180,.08)'  :
+                                canAssembleBu ? 'rgba(139,92,246,.12)' : 'var(--surface)',
+                    border: `1px solid ${
+                      buHandoff     ? 'rgba(0,229,180,.3)'    :
+                      canAssembleBu ? 'rgba(139,92,246,.35)'  : 'var(--border)'
+                    }`,
+                    color: buHandoff     ? '#00e5b4'  :
+                           canAssembleBu ? '#a78bfa'  : 'var(--muted)',
+                    opacity: canAssembleBu ? 1 : 0.58,
+                  }}
+                >
+                  {buHandoff ? '↻ Re-assemble BU handoff' : 'Assemble BU handoff'}
+                </button>
+              )
+            })()}
+          </div>
+
+          {/* ── Assembled BU handoff summary ─────────────────────── */}
+          {lastSavedAt && (
+            <div style={{ marginTop: 8, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', opacity: .6 }}>
+              Draft saved {new Date(lastSavedAt).toLocaleString()}
+            </div>
+          )}
+
+          {buHandoff && (
+            <div style={{
+              marginTop: 9, padding: '8px 10px', borderRadius: 5,
+              background: 'rgba(0,229,180,.04)', border: '1px solid rgba(0,229,180,.2)',
+            }}>
+              <div style={{
+                fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4',
+                textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6,
+              }}>
+                BU Handoff — {buHandoff.completedCount}/{buHandoff.totalCount} items assembled
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                {buHandoff.items.map(item => (
+                  <div key={item.key} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{
+                      fontSize: 7, fontFamily: 'var(--fm)', fontWeight: 600,
+                      color: item.value ? '#00e5b4' : 'var(--muted)',
+                    }}>
+                      {item.value ? '✓' : '○'}
+                    </span>
+                    <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: item.value ? 'var(--text)' : 'var(--muted2)', lineHeight: 1.4 }}>
+                      {item.label}
+                    </span>
+                    {item.status === 'partial' && (
+                      <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: '#fb923c' }}>partial</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', opacity: .7 }}>
+                Assembled {new Date(buHandoff.assembledAt).toLocaleString()}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+async function collectStage2LearningSignals(context, useAI) {
+  const heuristic = deriveLearningSignals({ stage: 'Stage 2', ...context })
+  if (!useAI) return heuristic
+  const { messages } = buildLearningSignalMessages({ stage: 'Stage 2', ...context })
+  const { result } = await callAI(messages, { temperature: 0.2, maxTokens: 900, timeoutMs: 15000 })
+  return normalizeLearningSignals([...heuristic, ...parseLearningSignalResponse(result, 'Stage 2')], 'Stage 2')
 }
 
 // ── Refinement scope options (shared Stage 2 + Stage 3) ──────────────────────
@@ -126,7 +1707,7 @@ function ScopeSelector({ value, onChange, disabled }) {
 // apiMode:      'ai' | 'mock'
 // globalBusy:   true while a parent-level generation is running
 
-function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
+function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy, activeStage1Rev, otherBuNames, workspaceId }) {
   const [open,          setOpen]          = useState(true)
   const [refineOpen,    setRefineOpen]    = useState(false)
   const [refinePrompt,  setRefinePrompt]  = useState('')
@@ -219,6 +1800,8 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
             <SubList label="Risks & Unknowns"     items={bu.risksAndUnknowns}    borderColor="rgba(248,113,113,.45)" />
             <SubList label="Key Success Metrics"  items={bu.keySuccessMetrics}   borderColor="rgba(0,229,180,.4)"   />
           </div>
+
+          <Stage3HandoffShell bu={bu} otherBuNames={otherBuNames} activeStage1Rev={activeStage1Rev} apiMode={apiMode} workspaceId={workspaceId} />
 
           {/* ── Unit-level refinement panel ───────────────────────────────── */}
           <div style={{
@@ -371,6 +1954,7 @@ function BUCard({ bu, index, onRefineUnit, apiMode, globalBusy }) {
 
 export default function Stage2View({
   workspace,
+  workspaceId,
   stage1Revisions,
   stage1ActiveId,
   stage2Revisions,
@@ -388,10 +1972,11 @@ export default function Stage2View({
   const [rawResponse,    setRawResponse]    = useState(null)  // shown on parse fail
   const [showRaw,        setShowRaw]        = useState(false)
   const [compareRevId,   setCompareRevId]   = useState(null)
+  const [isStageRefining,setIsStageRefining]= useState(false)
 
   // ── Derived state ───────────────────────────────────────────────────────────
   const activeRev     = stage2Revisions.find(r => r.id === stage2ActiveId) ?? null
-  const businessUnits = activeRev?.contentSnapshot?.businessUnits || []
+  const businessUnits = orderBusinessUnits(activeRev?.contentSnapshot?.businessUnits || [])
   const summaryNote   = activeRev?.contentSnapshot?.summaryNote   || ''
 
   // Staleness: latest Stage 2 rev was generated from a different Stage 1 rev
@@ -473,6 +2058,14 @@ export default function Stage2View({
       source = 'mock'
     }
 
+    const learningSignals = await collectStage2LearningSignals({
+      source,
+      prompt: '',
+      impactSummary: `Generated from Stage 1 revision v${activeStage1Rev.revisionNumber}.`,
+      refinementType: null,
+      beforeAfterSummary: 'Stage 2 organizational capability map generated from the active Stage 1 strategy basis.',
+      stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+    }, source === 'ai')
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
       businessUnits:        buList,
@@ -482,6 +2075,7 @@ export default function Stage2View({
       source,
       prompt:        '',
       impactSummary: `Generated from Stage 1 revision v${activeStage1Rev.revisionNumber} via ${source === 'ai' ? AI_MODEL_LABEL : 'mock generator'}.`,
+      learningSignals,
       // refinementType and affectedUnit intentionally omitted (null) for full regeneration
     })
 
@@ -510,6 +2104,16 @@ export default function Stage2View({
 
     const updatedBUs = businessUnits.map((bu, i) => (i === buIndex ? parsed.unit : bu))
     const unitName   = businessUnits[buIndex]?.name || `Unit ${buIndex + 1}`
+    const learningSignals = await collectStage2LearningSignals({
+      source: 'ai',
+      prompt: refinementPrompt,
+      impactSummary: impactSummary || `Regenerated "${unitName}"`,
+      refinementType: 'unit',
+      refinementScope,
+      affectedUnit: unitName,
+      beforeAfterSummary: 'One Stage 2 business unit was regenerated and merged back into the stage-level mapping.',
+      stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+    }, true)
 
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
@@ -523,6 +2127,7 @@ export default function Stage2View({
       refinementType:        'unit',
       affectedUnit:          unitName,
       refinementScope,
+      learningSignals,
     })
 
     onSaveRevision(record)
@@ -532,8 +2137,80 @@ export default function Stage2View({
   // ── Stage-level correction note ─────────────────────────────────────────────
   // Cross-functional / org-wide corrections: saves a full revision snapshot (manual).
   // Does not regenerate via AI — use "Regenerate with AI" for full AI regeneration.
-  function handleStageRefinement({ prompt, impactSummary }) {
+  async function handleStageRefinement({ prompt, impactSummary }) {
     if (!activeRev) return
+
+    if (hasApiKey()) {
+      if (!activeStage1Rev) return { error: 'No active Stage 1 revision.' }
+      setIsStageRefining(true)
+      setGenError(null)
+      setRawResponse(null)
+      setShowRaw(false)
+
+      const { messages } = buildStage2StageRefinementMessages(
+        activeStage1Rev.contentSnapshot,
+        activeRev.contentSnapshot,
+        prompt,
+        impactSummary,
+      )
+      const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 7000 })
+
+      if (error) {
+        setGenError(error)
+        setIsStageRefining(false)
+        return { error }
+      }
+
+      const parsed = parseStage2Response(result)
+      setRawResponse(result)
+
+      if (parsed.error || !parsed.businessUnits) {
+        const parseError = parsed.error || 'Response parse failed.'
+        setGenError(parseError)
+        setIsStageRefining(false)
+        return { error: parseError }
+      }
+
+      const learningSignals = await collectStage2LearningSignals({
+        source: 'ai',
+        prompt,
+        impactSummary: impactSummary || 'Regenerated Stage 2 with AI',
+        refinementType: 'stage',
+        structuralImpact: parsed.structuralImpact,
+        refinementClassification: parsed.refinementClassification,
+        beforeAfterSummary: 'Full Stage 2 organizational capability map regenerated after a stage-level refinement.',
+        stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+      }, true)
+      const nextNum = stage2Revisions.length + 1
+      const record  = buildStage2RevisionRecord({
+        businessUnits:        parsed.businessUnits,
+        summaryNote:          parsed.summaryNote,
+        revisionNumber:       nextNum,
+        sourceBasisRevisionId: stage1ActiveId,
+        source:               'ai',
+        prompt,
+        impactSummary:        impactSummary || `Regenerated Stage 2 with AI: ${prompt.slice(0, 90)}${prompt.length > 90 ? '...' : ''}`,
+        refinementType:       'stage',
+        affectedUnit:         null,
+        structuralImpact:     parsed.structuralImpact,
+        refinementClassification: parsed.refinementClassification,
+        learningSignals,
+      })
+
+      onSaveRevision(record)
+      setIsStageRefining(false)
+      return { error: null }
+    }
+
+    const learningSignals = deriveLearningSignals({
+      stage: 'Stage 2',
+      source: 'manual',
+      prompt,
+      impactSummary,
+      refinementType: 'stage',
+      structuralImpact: 'none',
+      stalenessEvents: stage3HasRevisions ? ['Stage 3'] : [],
+    })
     const nextNum = stage2Revisions.length + 1
     const record  = buildStage2RevisionRecord({
       businessUnits: activeRev.contentSnapshot.businessUnits,
@@ -545,8 +2222,11 @@ export default function Stage2View({
       impactSummary,
       refinementType:        'stage',
       affectedUnit:          null,
+      structuralImpact:      'none',
+      learningSignals,
     })
     onSaveRevision(record)
+    return { error: null }
   }
 
   // ── Source label for the current revision ───────────────────────────────────
@@ -589,7 +2269,7 @@ export default function Stage2View({
       }}>
         <div style={{ flex: 1, minWidth: 200 }}>
           <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>
-            Business Unit Mapping
+        Organisational Capability Mapping
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <Badge color={srcLbl.color}>{srcLbl.text}</Badge>
@@ -702,7 +2382,7 @@ export default function Stage2View({
             textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8,
             display: 'flex', alignItems: 'center', gap: 8,
           }}>
-            Business Units
+            Organisational Capabilities
             <span style={{
               padding: '1px 6px', borderRadius: 3,
               background: 'var(--s2)', border: '1px solid var(--border)',
@@ -723,13 +2403,18 @@ export default function Stage2View({
               index={i}
               apiMode={apiMode}
               globalBusy={isGenerating}
+              activeStage1Rev={activeStage1Rev}
+              otherBuNames={businessUnits.filter((_, j) => j !== i).map(b => b.name)}
               onRefineUnit={(prompt, impact, scope) => handleUnitRegenerate(i, prompt, impact, scope)}
+              workspaceId={workspaceId}
             />
           ))}
         </div>
       )}
 
       {/* ── Diff viewer ────────────────────────────────────────────────── */}
+      <LearningSignals signals={activeRev?.contentSnapshot?.learningSignals || activeRev?.learningSignals} />
+
       {compareRevision && activeRev && (
         <RevisionDiffViewer
           revA={compareRevision}
@@ -752,10 +2437,11 @@ export default function Stage2View({
         onSaveRevision={handleStageRefinement}
         title="Cross-functional Refinements"
         subtitle={
-          'Use this section for organisation-wide or cross-department changes that affect multiple business units or the overall operating model. ' +
-          'This saves a correction note as a new revision — use "Regenerate with AI" above to fully re-generate the BU structure from Stage 1.'
+          apiMode === 'ai'
+            ? 'Use this section for organisation-wide or structural changes. API mode regenerates the full Stage 2 business-unit mapping, including added, removed, merged, or reassigned units when needed.'
+            : 'Use this section to record organisation-wide or cross-department corrections. Add an API key to regenerate the full Stage 2 structure with AI.'
         }
-        saveLabel="Save refinement note"
+        saveLabel={apiMode === 'ai' ? 'Regenerate Stage 2 with AI' : 'Save manual correction note'}
         promptLabel="Refinement instruction"
         promptPlaceholder={
           'Examples:\n' +
@@ -764,7 +2450,8 @@ export default function Stage2View({
           '· Reduce staffing assumptions across all units to reflect the revised budget posture.\n' +
           '· Elevate Legal & Compliance to primary across all units — regulatory risk is now the gating factor.'
         }
-        aiNotice={null}
+        aiNotice={apiMode === 'ai' ? 'AI regeneration enabled' : null}
+        isSaving={isStageRefining}
       />
 
       {/* ── Stage 3 CTA ────────────────────────────────────────────────── */}
@@ -845,12 +2532,12 @@ function EmptyState({
     }}>
       <div style={{ fontSize: 24, opacity: .18, marginBottom: 16, lineHeight: 1 }}>⬡</div>
       <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
-        Business Unit Mapping
+            Organisational Capability Mapping
       </div>
       <div style={{ fontSize: 11, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.7, maxWidth: 420, margin: '0 auto 24px' }}>
         {apiMode === 'ai'
-          ? 'Generate an AI-inferred business-unit structure from the active Stage 1 strategy basis.'
-          : 'Generate a mock business-unit structure from the active Stage 1 strategy basis. Add VITE_ANTHROPIC_API_KEY to .env.local and restart the dev server for AI generation.'}
+          ? 'Generate an AI-inferred organisational capability map from the active Stage 1 strategy basis.'
+          : 'Generate a mock organisational capability map from the active Stage 1 strategy basis. Add VITE_ANTHROPIC_API_KEY to .env.local and restart the dev server for AI generation.'}
       </div>
 
       {!activeStage1Rev && (

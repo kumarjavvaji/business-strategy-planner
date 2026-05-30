@@ -33,6 +33,19 @@ function scopeLabel(scope) {
   return SCOPE_LABELS[scope] || null
 }
 
+const STRUCTURAL_LABELS = {
+  none:                 { text: 'no structure', color: '#94a3b8' },
+  unit_added:           { text: 'unit added',   color: '#00e5b4' },
+  unit_removed:         { text: 'unit removed', color: '#f87171' },
+  unit_merged:          { text: 'unit merged',  color: '#a78bfa' },
+  ownership_changed:    { text: 'ownership',    color: '#f59e0b' },
+  dependencies_changed: { text: 'dependencies', color: '#8b5cf6' },
+}
+
+function structuralLabel(impact) {
+  return STRUCTURAL_LABELS[impact] || null
+}
+
 export default function RevisionHistory({ revisions, activeRevisionId, onCompare, compareRevId }) {
   if (!revisions?.length) {
     return (
@@ -82,6 +95,7 @@ export default function RevisionHistory({ revisions, activeRevisionId, onCompare
           const sl          = sourceLabel(rev.source)
           const rl          = refinementLabel(rev.refinementType)
           const scl         = scopeLabel(rev.refinementScope)
+          const stl         = structuralLabel(rev.structuralImpact)
           const isFirst     = idx === 0  // newest
 
           return (
@@ -158,6 +172,15 @@ export default function RevisionHistory({ revisions, activeRevisionId, onCompare
                         color: scl.color, whiteSpace: 'nowrap',
                       }}>
                         {scl.text}
+                      </span>
+                    )}
+                    {stl && (
+                      <span style={{
+                        fontSize: 7, fontFamily: 'var(--fm)', padding: '1px 5px', borderRadius: 2,
+                        background: `${stl.color}14`, border: `1px solid ${stl.color}30`,
+                        color: stl.color, whiteSpace: 'nowrap',
+                      }}>
+                        {stl.text}
                       </span>
                     )}
                   </div>

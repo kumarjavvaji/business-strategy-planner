@@ -44,8 +44,8 @@ export function getApiMode() {
  * `system` parameter; remaining messages are sent in the `messages` array.
  *
  * @param {Array<{ role: 'system'|'user'|'assistant', content: string }>} messages
- * @param {{ model?: string, temperature?: number, maxTokens?: number }} options
- * @returns {Promise<{ result: string|null, error: string|null }>}
+ * @param {{ model?: string, temperature?: number, maxTokens?: number, timeoutMs?: number }} options
+ * @returns {Promise<{ result: string|null, error: string|null, status?: number, rateLimited?: boolean, stopReason?: string, usage?: object, model?: string }>}
  */
 export async function callAI(messages, options = {}) {
   const key = import.meta.env.VITE_ANTHROPIC_API_KEY
@@ -60,6 +60,7 @@ export async function callAI(messages, options = {}) {
     model       = DEFAULT_MODEL,
     temperature = 0.3,
     maxTokens   = 2500,
+    timeoutMs   = TIMEOUT_MS,
   } = options
 
   // Extract system prompt; Anthropic requires it at the top level, not in messages[]
@@ -71,7 +72,7 @@ export async function callAI(messages, options = {}) {
   }
 
   const controller = new AbortController()
-  const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS)
+  const timer      = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const body = {
@@ -103,20 +104,40 @@ export async function callAI(messages, options = {}) {
         const parsed = JSON.parse(bodyText)
         if (parsed?.error?.message) msg = parsed.error.message
       } catch { /* ignore */ }
-      return { result: null, error: msg }
+      return {
+        result: null,
+        error: msg,
+        status: response.status,
+        rateLimited: response.status === 429,
+        model,
+      }
     }
 
     const data = await response.json()
 
     // Anthropic response shape: { content: [{ type: 'text', text: '...' }] }
     const text = data?.content?.find?.(c => c.type === 'text')?.text ?? null
-    if (!text) return { result: null, error: 'Anthropic API returned an empty response.' }
-    return { result: text, error: null }
+    if (!text) {
+      return {
+        result: null,
+        error: 'Anthropic API returned an empty response.',
+        stopReason: data?.stop_reason,
+        usage: data?.usage || null,
+        model: data?.model || model,
+      }
+    }
+    return {
+      result: text,
+      error: null,
+      stopReason: data?.stop_reason,
+      usage: data?.usage || null,
+      model: data?.model || model,
+    }
 
   } catch (err) {
     clearTimeout(timer)
     if (err.name === 'AbortError') {
-      return { result: null, error: `Request timed out after ${TIMEOUT_MS / 1000} seconds.` }
+      return { result: null, error: `Request timed out after ${timeoutMs / 1000} seconds.` }
     }
     return { result: null, error: err?.message || 'Network error — check your connection.' }
   }

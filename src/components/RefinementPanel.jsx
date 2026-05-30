@@ -1,18 +1,5 @@
-// RefinementPanel — Stage-agnostic correction-intent logger.
-// No AI calls. Prompts the user to describe what changed and why, then
-// saves a new revision snapshot via onSaveRevision().
-//
-// Props:
-//   onSaveRevision    (required) — ({ prompt, impactSummary }) => void
-//   title             (optional) — panel header title. Default: "Refinement & Corrections"
-//   subtitle          (optional) — description below the header. Default: generic Stage 1 text.
-//   saveLabel         (optional) — save button text. Default: "Save Stage 1 revision"
-//   promptLabel       (optional) — label for the prompt field. Default: "Refinement prompt"
-//   promptPlaceholder (optional) — placeholder text for the prompt textarea.
-//   aiNotice          (optional) — string | null | false
-//                                   string → show custom notice badge
-//                                   null/false → hide the notice entirely
-//                                   undefined (not passed) → show default "AI regeneration not enabled"
+// RefinementPanel - stage-agnostic correction/refinement input.
+// Supports synchronous manual note saves and async AI regeneration callbacks.
 
 import React, { useState } from 'react'
 
@@ -23,7 +10,7 @@ const DEFAULT_SUBTITLE = (
 
 const DEFAULT_PLACEHOLDER = (
   'e.g. The target customer should also include VP of Finance, not just CFO. ' +
-  'The readiness level needs updating — internal tooling inventory was just completed.'
+  'The readiness level needs updating because internal tooling inventory was just completed.'
 )
 
 export default function RefinementPanel({
@@ -33,15 +20,28 @@ export default function RefinementPanel({
   saveLabel         = 'Save Stage 1 revision',
   promptLabel       = 'Refinement prompt',
   promptPlaceholder = DEFAULT_PLACEHOLDER,
-  aiNotice,           // undefined → default badge | null/false → hidden | string → custom
+  aiNotice,
+  isSaving = false,
 }) {
   const [prompt,        setPrompt]        = useState('')
   const [impactSummary, setImpactSummary] = useState('')
   const [saved,         setSaved]         = useState(false)
+  const [error,         setError]         = useState(null)
 
-  function handleSave() {
-    if (!prompt.trim()) return
-    onSaveRevision({ prompt: prompt.trim(), impactSummary: impactSummary.trim() })
+  async function handleSave() {
+    if (!prompt.trim() || isSaving) return
+    setError(null)
+
+    const result = await onSaveRevision({
+      prompt:        prompt.trim(),
+      impactSummary: impactSummary.trim(),
+    })
+
+    if (result?.error) {
+      setError(result.error)
+      return
+    }
+
     setSaved(true)
     setTimeout(() => {
       setPrompt('')
@@ -50,9 +50,8 @@ export default function RefinementPanel({
     }, 1800)
   }
 
-  const canSave = prompt.trim().length > 0
+  const canSave = prompt.trim().length > 0 && !isSaving
 
-  // Determine what notice badge (if any) to show
   const showDefaultNotice = aiNotice === undefined
   const noticeText        = showDefaultNotice ? 'AI regeneration not enabled' : (typeof aiNotice === 'string' ? aiNotice : null)
 
@@ -61,14 +60,13 @@ export default function RefinementPanel({
       background: 'var(--surface)', border: '1px solid var(--border)',
       borderRadius: 'var(--r)', overflow: 'hidden', marginBottom: 10,
     }}>
-      {/* Header */}
       <div style={{
         padding: '10px 15px',
         display: 'flex', alignItems: 'center', gap: 8,
         borderBottom: '1px solid var(--border)',
       }}>
         <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--accent)', flexShrink: 0 }}>
-          ↻
+          {'->'}
         </span>
         <span style={{ fontSize: 11, fontWeight: 600, flex: 1 }}>
           {title}
@@ -89,7 +87,6 @@ export default function RefinementPanel({
           {subtitle}
         </div>
 
-        {/* Prompt field */}
         <div style={{ marginBottom: 12 }}>
           <div style={{
             fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)',
@@ -102,18 +99,18 @@ export default function RefinementPanel({
             onChange={e => setPrompt(e.target.value)}
             rows={4}
             placeholder={promptPlaceholder}
+            disabled={isSaving}
             style={{
               width: '100%', boxSizing: 'border-box',
               fontSize: 10, fontFamily: 'var(--fm)',
               color: 'var(--text)', background: 'var(--s2)',
               border: '1px solid var(--border)', borderRadius: 5,
               padding: '8px 10px', resize: 'vertical', outline: 'none',
-              lineHeight: 1.65,
+              lineHeight: 1.65, opacity: isSaving ? 0.65 : 1,
             }}
           />
         </div>
 
-        {/* Impact summary field */}
         <div style={{ marginBottom: 14 }}>
           <div style={{
             fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)',
@@ -125,19 +122,19 @@ export default function RefinementPanel({
             value={impactSummary}
             onChange={e => setImpactSummary(e.target.value)}
             rows={2}
-            placeholder="e.g. Widens persona scope; Stage 2 BU mapping should now include Finance org."
+            placeholder="e.g. Widens persona scope; downstream stages should reflect the new owner."
+            disabled={isSaving}
             style={{
               width: '100%', boxSizing: 'border-box',
               fontSize: 10, fontFamily: 'var(--fm)',
               color: 'var(--text)', background: 'var(--s2)',
               border: '1px solid var(--border)', borderRadius: 5,
               padding: '8px 10px', resize: 'vertical', outline: 'none',
-              lineHeight: 1.65,
+              lineHeight: 1.65, opacity: isSaving ? 0.65 : 1,
             }}
           />
         </div>
 
-        {/* Save button */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <button
             onClick={handleSave}
@@ -149,18 +146,35 @@ export default function RefinementPanel({
               background: canSave && !saved ? 'var(--accent)' : 'var(--s2)',
               border: `1px solid ${canSave && !saved ? 'var(--accent)' : 'var(--border)'}`,
               color: canSave && !saved ? '#000' : 'var(--muted)',
-              opacity: canSave || saved ? 1 : 0.55,
+              opacity: canSave || saved || isSaving ? 1 : 0.55,
               transition: 'background .15s, color .15s, border-color .15s',
             }}
           >
-            {saved ? '✓ Saved' : saveLabel}
+            {isSaving ? 'Regenerating...' : saved ? 'Saved' : saveLabel}
           </button>
-          {!canSave && !saved && (
+          {!canSave && !saved && !isSaving && (
             <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
               Enter a prompt to save.
             </span>
           )}
+          {isSaving && (
+            <span style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>
+              Updating the stage snapshot.
+            </span>
+          )}
         </div>
+
+        {error && (
+          <div style={{
+            marginTop: 8, fontSize: 9, fontFamily: 'var(--fm)',
+            color: '#f87171', lineHeight: 1.6,
+            padding: '6px 9px', borderRadius: 4,
+            background: 'rgba(248,113,113,.07)',
+            border: '1px solid rgba(248,113,113,.25)',
+          }}>
+            {error}
+          </div>
+        )}
       </div>
     </div>
   )

@@ -1,6 +1,7 @@
-import React, { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import './App.css'
 import { useWorkspace }              from './hooks/useWorkspace'
+import { initStorageCache }          from './utils/storageRouter'
 import { DEMO_STRATEGY_BASIS_PACKAGE } from './data/demoPackage'
 import Stage1View                    from './components/Stage1View'
 import Stage2View                    from './components/Stage2View'
@@ -17,8 +18,8 @@ const STAGES = [
 
 // ── Stage placeholder ─────────────────────────────────────────────────────────
 const STAGE_PLACEHOLDER_COPY = {
-  4: 'Stage 4 will translate Stage 3 execution plans into PDLC strategy, epic-level requirements, acceptance criteria, non-functional requirements, delivery sequencing, and implementation governance.',
-  5: 'Stage 5 will synthesise all stages into a unified strategic deliverable.',
+  4: 'Stage 4 will translate Stage 3 execution plans into PDLC strategy, epic-level requirements, acceptance criteria, non-functional requirements, delivery sequencing, implementation governance, and product-delivery learning signals.',
+  5: 'Stage 5 will synthesize learning signals across Stages 1-4 into reusable strategy patterns, prompt improvements, stage-boundary rules, decision-quality heuristics, refinement heuristics, cross-stage failure modes, and execution-planning patterns.',
 }
 
 function StagePlaceholder({ stage }) {
@@ -37,7 +38,7 @@ function StagePlaceholder({ stage }) {
 }
 
 // ── Import panel ──────────────────────────────────────────────────────────────
-function ImportPanel({ onImport }) {
+function ImportPanel({ onImport, activePlanName }) {
   const [json,       setJson]       = useState('')
   const [error,      setError]      = useState(null)
   const [fileStatus, setFileStatus] = useState(null)  // null | 'reading' | filename string
@@ -112,7 +113,7 @@ function ImportPanel({ onImport }) {
             Business Strategy Planner
           </div>
           <div style={{ fontSize: 11, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.6 }}>
-            Import a Strategy Basis Package exported from DomainIQ to begin.
+            Import a Strategy Basis Package exported from DomainIQ into {activePlanName || 'the active plan'}.
           </div>
         </div>
 
@@ -258,20 +259,129 @@ function ImportPanel({ onImport }) {
 }
 
 // ── App shell ─────────────────────────────────────────────────────────────────
+function PlanControls({
+  planIndex,
+  activePlanId,
+  activePlanName,
+  onNewPlan,
+  onDuplicatePlan,
+  onSwitchPlan,
+  onRenamePlan,
+  onDeletePlan,
+  onClearPlan,
+  onExportPlan,
+  onImportPlan,
+  onDeleteAll,
+}) {
+  const importPlanRef = useRef(null)
+
+  function handleRename() {
+    const nextName = window.prompt('Rename active plan:', activePlanName || 'Untitled plan')
+    if (nextName != null) onRenamePlan(nextName)
+  }
+
+  function handleDelete() {
+    if (!activePlanId) return
+    const ok = window.confirm(`Delete only the active plan "${activePlanName}" from local browser storage? Other saved plans will remain.`)
+    if (ok) onDeletePlan()
+  }
+
+  function handleClear() {
+    if (!activePlanId) return
+    const ok = window.confirm(`Clear only the active plan "${activePlanName}"? This keeps the plan slot but removes imported/planner state for this plan only.`)
+    if (ok) onClearPlan()
+  }
+
+  function handleDeleteAll() {
+    const typed = window.prompt('This deletes the plan index and every saved Business Strategy Planner plan in this browser. Type DELETE ALL to confirm.')
+    if (typed === 'DELETE ALL') onDeleteAll()
+  }
+
+  function handleImportPlanFile(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    const reader = new FileReader()
+    reader.onload = (evt) => {
+      try {
+        const parsed = JSON.parse(evt.target.result)
+        const result = onImportPlan(parsed)
+        if (result?.error) window.alert(result.error)
+      } catch {
+        window.alert(`Could not parse "${file.name}" as JSON.`)
+      } finally {
+        if (importPlanRef.current) importPlanRef.current.value = ''
+      }
+    }
+    reader.onerror = () => {
+      window.alert(`Could not read "${file.name}".`)
+      if (importPlanRef.current) importPlanRef.current.value = ''
+    }
+    reader.readAsText(file)
+  }
+
+  return (
+    <div className="plan-controls">
+      <button className="btn-plan" onClick={onNewPlan}>New Plan</button>
+      <button className="btn-plan" onClick={onDuplicatePlan} disabled={!activePlanId}>Duplicate Current Plan</button>
+      <select
+        className="plan-select"
+        value={activePlanId || ''}
+        onChange={e => onSwitchPlan(e.target.value)}
+        aria-label="Switch Plan"
+      >
+        {!planIndex?.plans?.length && <option value="">No saved plans</option>}
+        {(planIndex?.plans || []).map(plan => (
+          <option key={plan.id} value={plan.id}>
+            {plan.name} - {plan.stageProgressSummary}
+          </option>
+        ))}
+      </select>
+      <button className="btn-plan" onClick={handleRename} disabled={!activePlanId}>Rename Plan</button>
+      <button className="btn-plan" onClick={handleDelete} disabled={!activePlanId}>Delete Plan</button>
+      <button className="btn-plan" onClick={onExportPlan} disabled={!activePlanId}>Export Current Plan JSON</button>
+      <input
+        ref={importPlanRef}
+        type="file"
+        accept=".json,application/json"
+        onChange={handleImportPlanFile}
+        style={{ display: 'none' }}
+      />
+      <button className="btn-plan" onClick={() => importPlanRef.current?.click()}>Import Plan JSON</button>
+      <button className="btn-plan btn-clear-active" onClick={handleClear} disabled={!activePlanId}>Clear Active Plan</button>
+      <button className="btn-plan btn-danger" onClick={handleDeleteAll}>Delete All Local Data</button>
+    </div>
+  )
+}
+
 export default function App() {
   const {
     fullWorkspace,
     workspace,
     importedAt,
+    planIndex,
+    activePlanId,
     importPackage,
     saveStageRevision,
     saveRawRevision,
     saveStage1AIRevision,
-    clearWorkspace,
+    createNewPlan,
+    duplicateCurrentPlan,
+    switchPlan,
+    renameCurrentPlan,
+    deleteCurrentPlan,
+    clearCurrentPlan,
+    exportCurrentPlanJson,
+    importPlanJson,
+    deleteAllLocalPlannerData,
   } = useWorkspace()
   const [activeStage,           setActiveStage]           = useState(1)
   const [stage2PendingGenerate, setStage2PendingGenerate] = useState(false)
   const [stage3PendingGenerate, setStage3PendingGenerate] = useState(false)
+
+  // Kick off IDB cache init immediately on mount (non-blocking).
+  // Stage3 and Stage2 hydration effects await storageReady() before reading.
+  useEffect(() => { initStorageCache() }, [])
 
   function handleRegenerateAndGoToStage2() {
     setStage2PendingGenerate(true)
@@ -285,13 +395,30 @@ export default function App() {
 
   // No workspace — show import screen
   if (!workspace) {
+    const activePlanMeta = planIndex?.plans?.find(plan => plan.id === activePlanId)
     return (
       <div className="app">
         <header className="app-header">
           <span className="app-header-title">Business Strategy Planner</span>
           <span className="app-header-sub">v1 · Strategy Basis Import</span>
+          <div className="app-header-actions">
+            <PlanControls
+              planIndex={planIndex}
+              activePlanId={activePlanId}
+              activePlanName={activePlanMeta?.name || 'Untitled plan'}
+              onNewPlan={createNewPlan}
+              onDuplicatePlan={duplicateCurrentPlan}
+              onSwitchPlan={switchPlan}
+              onRenamePlan={renameCurrentPlan}
+              onDeletePlan={deleteCurrentPlan}
+              onClearPlan={clearCurrentPlan}
+              onExportPlan={exportCurrentPlanJson}
+              onImportPlan={importPlanJson}
+              onDeleteAll={deleteAllLocalPlannerData}
+            />
+          </div>
         </header>
-        <ImportPanel onImport={importPackage} />
+        <ImportPanel onImport={importPackage} activePlanName={activePlanMeta?.name} />
       </div>
     )
   }
@@ -301,14 +428,16 @@ export default function App() {
     workspace.entity.industry ||
     workspace.entity.domain   ||
     workspace.entity.name     || ''
+  const activePlanMeta = planIndex?.plans?.find(plan => plan.id === activePlanId)
+  const activePlanName = activePlanMeta?.name || fullWorkspace?.name || entityLabel || 'Untitled plan'
 
   // Stage 1 revision data
   const stage1Revisions = fullWorkspace?.stageRevisions?.stage1 ?? []
   const stage1ActiveId  = fullWorkspace?.activeStageRevisionIds?.stage1 ?? null
 
   // Manual correction note — snapshot of existing workspace
-  function handleSaveStage1Revision({ prompt, impactSummary }) {
-    saveStageRevision('stage1', { prompt, impactSummary })
+  function handleSaveStage1Revision({ prompt, impactSummary, learningSignals }) {
+    saveStageRevision('stage1', { prompt, impactSummary, learningSignals })
   }
 
   // AI-generated revision — updates normalizedWorkspace + appends revision atomically
@@ -367,9 +496,20 @@ export default function App() {
               Imported {new Date(importedAt).toLocaleDateString()}
             </span>
           )}
-          <button className="btn-clear" onClick={clearWorkspace}>
-            Clear
-          </button>
+          <PlanControls
+            planIndex={planIndex}
+            activePlanId={activePlanId}
+            activePlanName={activePlanName}
+            onNewPlan={createNewPlan}
+            onDuplicatePlan={duplicateCurrentPlan}
+            onSwitchPlan={switchPlan}
+            onRenamePlan={renameCurrentPlan}
+            onDeletePlan={deleteCurrentPlan}
+            onClearPlan={clearCurrentPlan}
+            onExportPlan={exportCurrentPlanJson}
+            onImportPlan={importPlanJson}
+            onDeleteAll={deleteAllLocalPlannerData}
+          />
         </div>
       </header>
 
@@ -434,6 +574,7 @@ export default function App() {
         {activeStage === 2 && (
           <Stage2View
             workspace={workspace}
+            workspaceId={fullWorkspace?.id}
             stage1Revisions={stage1Revisions}
             stage1ActiveId={stage1ActiveId}
             stage2Revisions={stage2Revisions}
@@ -450,6 +591,7 @@ export default function App() {
         {activeStage === 3 && (
           <Stage3View
             workspace={workspace}
+            workspaceId={fullWorkspace?.id}
             stage1Revisions={stage1Revisions}
             stage1ActiveId={stage1ActiveId}
             stage2Revisions={stage2Revisions}
@@ -457,6 +599,7 @@ export default function App() {
             stage3Revisions={stage3Revisions}
             stage3ActiveId={stage3ActiveId}
             onSaveRevision={handleSaveStage3Revision}
+            onNavigateToStage2={() => setActiveStage(2)}
             onNavigateToStage4={() => setActiveStage(4)}
             shouldAutoGenerate={stage3PendingGenerate}
             onAutoGenerateComplete={() => setStage3PendingGenerate(false)}
