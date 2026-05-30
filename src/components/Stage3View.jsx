@@ -5726,6 +5726,7 @@ function PrepareStage4HandoffPanel({
   stage3DraftPlans,
   idbReady,
   onNavigateToStage4,
+  stage3ActiveRevision,   // { id, contentSnapshot, sourceBasisRevisionId, sourceStage2RevisionId }
 }) {
   const [phase, setPhase]     = useState(S4_PHASE.NOT_READY)
   const [handoff, setHandoff] = useState(null)
@@ -5771,6 +5772,7 @@ function PrepareStage4HandoffPanel({
       const compiled = await compileStage4Handoff({
         workspaceId, stage1Id: stage1ActiveId,
         stage2Id: stage2ActiveId, stage3Id: stage3ActiveId, buNames,
+        stage3ActiveRevision,
       })
 
       setPhase(S4_PHASE.PERSISTING)
@@ -7410,6 +7412,7 @@ export default function Stage3View({
         stage3DraftPlans={stage3DraftPlans}
         idbReady={idbReady}
         onNavigateToStage4={onNavigateToStage4}
+        stage3ActiveRevision={activeRev}
       />
 
     </div>

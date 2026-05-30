@@ -620,6 +620,123 @@ describe('stage4Handoff — compiler reads only from IDB', () => {
     const result = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'] })
     expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
   })
+
+  // ── Snapshot fallback tests (full Stage 3 rebuild path) ──────────────────────
+
+  function makeStage3Revision(stage3Id, stage1Id, stage2Id, buNames) {
+    return {
+      id: stage3Id,
+      sourceBasisRevisionId:  stage1Id,
+      sourceStage2RevisionId: stage2Id,
+      contentSnapshot: {
+        executionPlans: buNames.map(name => ({
+          buName: name,
+          mission: `${name} mission`,
+          strategicRole: `${name} role`,
+          priorityOutcomes: ['Outcome A'],
+          criticalWorkstreams: ['WS1'],
+          executionSections: [{
+            sectionName: 'Strategy',
+            objective: `Deliver ${name}`,
+            executionStrategy: ['Execute plan'],
+            decisionsRequired: ['Approve budget'],
+            sequencingAndGates: [],
+            dependencies: [],
+            risks: ['Timeline risk'],
+            validationReadinessChecks: [],
+          }],
+        })),
+      },
+    }
+  }
+
+  it('snapshot fallback: full Stage 3 rebuild snapshot feeds Stage 4 handoff when IDB has no per-BU record', async () => {
+    // No per-BU IDB records seeded
+    await storageRouter.initStorageCache()
+    const { compileStage4Handoff, BU_HANDOFF_STATUS, BU_SOURCE_TYPE } = await getHandoffModule()
+
+    const revision = makeStage3Revision(S3, S1, S2, ['Engineering'])
+    const result = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'],
+      stage3ActiveRevision: revision,
+    })
+
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
+    expect(result.buHandoffs[0].sourceType).toBe(BU_SOURCE_TYPE.REVISION_SNAPSHOT)
+    expect(result.buHandoffs[0].sourceTraceabilityLevel).toBe('section')
+    expect(result.buHandoffs[0].sourceSectionIds).toContain('Strategy')
+    expect(result.buHandoffs[0].sourceAtomIds).toHaveLength(0)
+    expect(result.buHandoffs[0].plan?.mission).toBe('Engineering mission')
+  })
+
+  it('per-BU IDB record takes priority over snapshot when both exist', async () => {
+    await seedStage3('Engineering')
+    const { compileStage4Handoff, BU_HANDOFF_STATUS, BU_SOURCE_TYPE } = await getHandoffModule()
+
+    const revision = makeStage3Revision(S3, S1, S2, ['Engineering'])
+    const result = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'],
+      stage3ActiveRevision: revision,
+    })
+
+    // IDB record wins — should be atom-level traceability, not section
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
+    expect(result.buHandoffs[0].sourceType).toBe(BU_SOURCE_TYPE.IDB_RECORD)
+    expect(result.buHandoffs[0].sourceTraceabilityLevel).toBe('atom')
+    expect(result.buHandoffs[0].sourceAtomIds.length).toBeGreaterThan(0)
+  })
+
+  it('missing both IDB record and snapshot still blocks the BU', async () => {
+    await storageRouter.initStorageCache()
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+
+    // Snapshot has Engineering but we ask for Finance — not in snapshot or IDB
+    const revision = makeStage3Revision(S3, S1, S2, ['Engineering'])
+    const result = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Finance'],
+      stage3ActiveRevision: revision,
+    })
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.BLOCKED)
+  })
+
+  it('snapshot-derived records do not require atom IDs', async () => {
+    await storageRouter.initStorageCache()
+    const { compileStage4Handoff } = await getHandoffModule()
+
+    const revision = makeStage3Revision(S3, S1, S2, ['Engineering'])
+    const result = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'],
+      stage3ActiveRevision: revision,
+    })
+    expect(result.buHandoffs[0].sourceAtomIds).toHaveLength(0)
+    expect(result.buHandoffs[0].sourceSectionIds.length).toBeGreaterThan(0)
+  })
+
+  it('stale snapshot (wrong stage1Id) is not used as fallback', async () => {
+    await storageRouter.initStorageCache()
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+
+    // Revision's sourceBasisRevisionId does not match stage1Id passed to compiler
+    const staleRevision = makeStage3Revision(S3, 'wrong_s1', S2, ['Engineering'])
+    const result = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'],
+      stage3ActiveRevision: staleRevision,
+    })
+    // Snapshot is invalid — BU should be BLOCKED
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.BLOCKED)
+  })
+
+  it('snapshot with wrong stage3Id is not used as fallback', async () => {
+    await storageRouter.initStorageCache()
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+
+    const wrongRevision = makeStage3Revision('wrong_s3', S1, S2, ['Engineering'])
+    const result = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'],
+      stage3ActiveRevision: wrongRevision,
+    })
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.BLOCKED)
+  })
 })
 
 // ══════════════════════════════════════════════════════════════════════════════
