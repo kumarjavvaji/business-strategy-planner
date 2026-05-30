@@ -3325,7 +3325,7 @@ function Stage3ReadinessPanels({
                         </button>
                       </div>
                     )}
-                    {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && !blockReason && (
+                    {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && !blockReason && !gen?.persistError && (
                       <button
                         onClick={() => onGenerateBUPlan(unit, { ...readiness, acceptOnly: true })}
                         disabled={disabled || gen?.running}
@@ -3413,6 +3413,34 @@ function Stage3ReadinessPanels({
 
                 {/* Execution plan — rendered here when a draft exists so BU plan
                     appears in one place (the expanded readiness row), not duplicated below */}
+                {gen?.persistError && (
+                  <div style={{
+                    margin: '10px 0 4px',
+                    padding: '9px 13px',
+                    background: 'rgba(248,113,113,.07)',
+                    border: '1px solid rgba(248,113,113,.3)',
+                    borderRadius: 5,
+                    fontSize: 9,
+                    fontFamily: 'var(--fm)',
+                    color: '#f87171',
+                    lineHeight: 1.55,
+                  }}>
+                    <strong>Persistence failed — content below is from the last saved version.</strong>
+                    <br />The most recently generated content was not written to storage and will be lost on refresh.
+                    Do not accept or use this plan until generation succeeds and content is re-persisted.
+                  </div>
+                )}
+                {(draft || legacyPlan) && !gen?.persistError && draft?.persistedAt && !gen?.running && (
+                  <div style={{
+                    margin: '8px 0 2px',
+                    fontSize: 8,
+                    fontFamily: 'var(--fm)',
+                    color: 'var(--muted)',
+                    lineHeight: 1.4,
+                  }}>
+                    ✓ Content verified from storage · saved {new Date(draft.persistedAt).toLocaleString()}
+                  </div>
+                )}
                 {(draft || legacyPlan) && (
                   <Stage3BUPlanTree
                     draft={draft}
@@ -6890,6 +6918,7 @@ export default function Stage3View({
         captureImportRef={captureImportRef}
         captureImportStatus={captureImportStatus}
         onCaptureImport={handleCaptureImport}
+        idbReady={idbReady}
       />
 
       {/* ── C. Cross-BU Coordination ──────────────────────────────────────── */}
