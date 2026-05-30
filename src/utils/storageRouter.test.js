@@ -211,6 +211,39 @@ describe('storageRouter — Stage 3 BU plan persistence', () => {
     expect(ok).toBe(false)
   })
 
+  // ── readArtifactFromIdb — cache-bypass guarantee ───────────────────────────
+
+  it('readArtifactFromIdb returns the draft when IDB has the record', async () => {
+    const key = stage3Key('ws1', 's1', 's2', 'Legal')
+    const draft = makeStage3Draft('Legal')
+    _idbStore.set(key, draft)
+    await storageRouter.initStorageCache()
+
+    const loaded = await storageRouter.readArtifactFromIdb(key)
+    expect(loaded?.plan?.buName).toBe('Legal')
+  })
+
+  it('readArtifactFromIdb returns null even when cache has a value but IDB does not', async () => {
+    // Simulate a failed IDB write: cache gets the value, IDB does not.
+    idbWriteSpy.mockRejectedValueOnce(new Error('IDB unavailable'))
+    const key = stage3Key('ws1', 's1', 's2', 'Risk')
+    await storageRouter.writeArtifact(key, makeStage3Draft('Risk')) // returns false, but cache is set
+
+    // Confirm the stale-cache loophole: readArtifactAsync sees the cached value
+    const fromCache = await storageRouter.readArtifactAsync(key)
+    expect(fromCache?.plan?.buName).toBe('Risk') // loophole confirmed
+
+    // readArtifactFromIdb bypasses the cache and correctly returns null
+    const fromIdb = await storageRouter.readArtifactFromIdb(key)
+    expect(fromIdb).toBeNull()
+  })
+
+  it('readArtifactFromIdb returns null for LS-only (unrouted) keys', async () => {
+    await storageRouter.initStorageCache()
+    const result = await storageRouter.readArtifactFromIdb('some_unrouted_key')
+    expect(result).toBeNull()
+  })
+
   it('isIdbPointer correctly identifies pointer vs real content', () => {
     expect(storageRouter.isIdbPointer({ _idbRef: true, store: 'stage3_bu_plans', idbKey: 'k' })).toBe(true)
     expect(storageRouter.isIdbPointer({ plan: { buName: 'Foo' } })).toBe(false)
@@ -397,6 +430,52 @@ describe('stage4Handoff — compiler reads only from IDB', () => {
 
     const result = await loadStage4Handoff(WID, S1, S2, S3)
     expect(result).toBeNull()
+  })
+
+  // ── Stale-cache loophole regression test ────────────────────────────────────
+  //
+  // The loophole: writeArtifact always calls _cache.set() before the IDB write.
+  // If IDB fails AND the LS fallback also fails (quota), the cache holds the
+  // value but neither disk path does.  readArtifactAsync() would return the
+  // cached value; readArtifactFromIdb() correctly returns null.
+  //
+  // We simulate this by failing IDB and then manually replacing the LS fallback
+  // value with an IDB pointer so the _doInit migration step cannot rescue the
+  // record.  This keeps the IDB empty while the cache is populated.
+
+  it('compiler marks BU BLOCKED when cache has a value but IDB has no record (stale-cache scenario)', async () => {
+    const buKey = stage3Key(WID, S1, S2, 'CacheOnly')
+    const draft = makeStage3Draft('CacheOnly')
+
+    await storageRouter.initStorageCache()
+
+    // Fail IDB write — cache is set, LS fallback writes full JSON
+    idbWriteSpy.mockRejectedValueOnce(new Error('IDB unavailable'))
+    const writeOk = await storageRouter.writeArtifact(buKey, draft)
+    expect(writeOk).toBe(false)
+
+    // Replace the LS full-JSON fallback with a pointer so _doInit migration
+    // cannot rescue the record on the next storageReady() call.
+    ls.setItem(buKey, JSON.stringify({ _idbRef: true, store: 'stage3_bu_plans', idbKey: buKey }))
+
+    // Confirm the loophole in the OLD (current) module instance:
+    // readArtifactAsync sees the cache value and returns it.
+    const fromCache = await storageRouter.readArtifactAsync(buKey)
+    expect(fromCache?.plan?.buName).toBe('CacheOnly') // loophole confirmed
+
+    // readArtifactFromIdb bypasses cache: IDB is empty → null
+    const fromIdb = await storageRouter.readArtifactFromIdb(buKey)
+    expect(fromIdb).toBeNull()
+
+    // Now compile Stage 4. resetModules creates a fresh storageRouter: no stale
+    // cache, _doInit scans LS, sees the pointer, finds nothing in IDB → no
+    // migration. readArtifactFromIdb still returns null → BU is BLOCKED.
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+    const result = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['CacheOnly'] })
+
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.BLOCKED)
+    expect(result.buHandoffs[0].plan).toBeNull()
+    expect(result.buHandoffs[0].blockedReason).toMatch(/No durable Stage 3 record/)
   })
 
   it('full round-trip: compile → persist → loadStage4Handoff verifies from storage', async () => {

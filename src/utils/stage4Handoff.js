@@ -17,7 +17,7 @@
  *   Stage 4 handoff: bsp_v1_stage4_handoff_{wid}_{s1id}_{s2id}_{s3id}
  */
 
-import { readArtifactAsync, writeArtifact } from './storageRouter'
+import { readArtifactFromIdb, readArtifactAsync, writeArtifact } from './storageRouter'
 
 // ── Key helpers ────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,9 @@ async function loadBuDurableRecord(workspaceId, stage1Id, stage2Id, buName) {
   let loadError = null
 
   try {
-    record = await readArtifactAsync(key)
+    // readArtifactFromIdb bypasses the in-memory cache so a failed IDB write
+    // in the same session cannot produce a false-positive durable read.
+    record = await readArtifactFromIdb(key)
   } catch (e) {
     loadError = e?.message || String(e)
   }

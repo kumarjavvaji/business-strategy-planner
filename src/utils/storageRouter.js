@@ -104,6 +104,30 @@ export function readCached(key) {
 }
 
 /**
+ * Reads directly from IDB, bypassing the in-memory cache entirely.
+ *
+ * Use this when you need proof that a value is durably stored in IDB —
+ * not merely present in the optimistic cache that writeArtifact populates
+ * before the IDB write completes.  If the IDB write failed in this session,
+ * readArtifactAsync() would still return the cached (unpersisted) value;
+ * this function will correctly return null.
+ *
+ * Returns null for LS-only keys (no IDB store) or if IDB has no record.
+ */
+export async function readArtifactFromIdb(key) {
+  if (!key) return null
+  await storageReady()
+  const route = routeKey(key)
+  if (!route) return null
+  try {
+    const val = await idbRead(route.store, key)
+    return val ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Async read. Waits for the cache to initialise, then returns from cache
  * or falls back to a direct IDB read.
  */
