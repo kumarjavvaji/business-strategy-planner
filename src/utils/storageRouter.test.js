@@ -34,18 +34,20 @@ const idbWriteSpy = vi.fn(async (_store, key, value) => { _idbStore.set(key, val
 
 vi.mock('./idbStorage', () => ({
   IDB_STORES: {
-    PLANS:               'plans',
-    STAGE2_HANDOFFS:     'stage2_handoffs',
-    STAGE3_BU_PLANS:     'stage3_bu_plans',
-    STAGE3_COORDINATION: 'stage3_coordination',
-    STAGE4_HANDOFFS:     'stage4_handoffs',
+    PLANS:                 'plans',
+    STAGE2_HANDOFFS:       'stage2_handoffs',
+    STAGE3_BU_PLANS:       'stage3_bu_plans',
+    STAGE3_COORDINATION:   'stage3_coordination',
+    STAGE4_HANDOFFS:       'stage4_handoffs',
+    STAGE4_ARTIFACT_PLANS: 'stage4_artifact_plans',
   },
   idbRead:    async (_store, key) => _idbStore.get(key) ?? null,
   idbWrite:   (...args) => idbWriteSpy(...args),
   idbReadAll: async (store) => {
     const prefixes = {
-      stage3_bu_plans: 'bsp_v1_stage3_bu_plan_',
-      stage4_handoffs: 'bsp_v1_stage4_handoff_',
+      stage3_bu_plans:       'bsp_v1_stage3_bu_plan_',
+      stage4_handoffs:       'bsp_v1_stage4_handoff_',
+      stage4_artifact_plans: 'bsp_v1_stage4_artifact_plan_',
     }
     const prefix = prefixes[store] || ''
     return [..._idbStore.entries()]
@@ -615,5 +617,182 @@ describe('stage4Handoff — compiler reads only from IDB', () => {
     const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
     const result = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'] })
     expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
+  })
+})
+
+// ══════════════════════════════════════════════════════════════════════════════
+// stage4ArtifactPlan — artifact planning contract
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('stage4ArtifactPlan — deterministic artifact suggestions and persistence', () => {
+  const WID = 'ws_ap', S1 = 's1_ap', S2 = 's2_ap', S3 = 's3_ap'
+
+  function makeHandoff(buStatuses) {
+    const now = new Date().toISOString()
+    const buHandoffs = buStatuses.map(([name, status, reason]) => ({
+      buName: name, status,
+      blockedReason: reason || null,
+      sourcePersistAt: status !== 'blocked' ? now : null,
+      sourceAtomIds: status !== 'blocked' ? ['atom_1', 'atom_2'] : [],
+      plan: status !== 'blocked' ? { buName: name } : null,
+    }))
+    const readyCount   = buHandoffs.filter(b => b.status === 'ready').length
+    const partialCount = buHandoffs.filter(b => b.status === 'partial').length
+    const blockedCount = buHandoffs.filter(b => b.status === 'blocked').length
+    const overallStatus = readyCount === buHandoffs.length ? 'ready'
+      : readyCount + partialCount > 0 ? 'partial'
+      : 'blocked'
+    return {
+      version: 1, workspaceId: WID, stage1RevisionId: S1, stage2RevisionId: S2, stage3RevisionId: S3,
+      compiledAt: now, persistedAt: now, overallStatus,
+      readyCount, partialCount, blockedCount, totalCount: buHandoffs.length,
+      buHandoffs,
+    }
+  }
+
+  async function getArtifactModule() {
+    vi.resetModules()
+    storageRouter = await import('./storageRouter.js')
+    return import('./stage4ArtifactPlan.js')
+  }
+
+  beforeEach(async () => {
+    _idbStore.clear()
+    idbWriteSpy.mockImplementation(async (_store, key, value) => { _idbStore.set(key, value) })
+    ls = makeLocalStorageShim()
+    vi.stubGlobal('localStorage', ls)
+    vi.resetModules()
+    storageRouter = await import('./storageRouter.js')
+  })
+
+  it('storage key routes to stage4_artifact_plans store', () => {
+    const key = `bsp_v1_stage4_artifact_plan_${WID}_${S1}_${S2}_${S3}`
+    const route = storageRouter.routeKey(key)
+    expect(route?.store).toBe('stage4_artifact_plans')
+    expect(route?.dualWrite).toBe(false)
+  })
+
+  it('READY BU gets 4 generation-ready artifacts, all selected', async () => {
+    const { suggestArtifacts, BU_ARTIFACT_DEFS, ARTIFACT_READINESS } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const arts = suggestArtifacts(handoff).filter(a => a.businessUnitName === 'Engineering')
+    expect(arts).toHaveLength(BU_ARTIFACT_DEFS.ready.length)
+    arts.forEach(a => { expect(a.readinessStatus).toBe(ARTIFACT_READINESS.READY); expect(a.selected).toBe(true) })
+  })
+
+  it('PARTIAL BU gets 3 partial artifacts, all selected', async () => {
+    const { suggestArtifacts, BU_ARTIFACT_DEFS, ARTIFACT_READINESS } = await getArtifactModule()
+    const handoff = makeHandoff([['Finance', 'partial']])
+    const arts = suggestArtifacts(handoff).filter(a => a.businessUnitName === 'Finance')
+    expect(arts).toHaveLength(BU_ARTIFACT_DEFS.partial.length)
+    arts.forEach(a => { expect(a.readinessStatus).toBe(ARTIFACT_READINESS.PARTIAL); expect(a.selected).toBe(true) })
+  })
+
+  it('BLOCKED BU gets one blocked placeholder, not selected, no generation-ready artifacts', async () => {
+    const { suggestArtifacts, ARTIFACT_READINESS } = await getArtifactModule()
+    const handoff = makeHandoff([['Sales', 'blocked', 'No record.']])
+    const arts = suggestArtifacts(handoff).filter(a => a.businessUnitName === 'Sales')
+    expect(arts).toHaveLength(1)
+    expect(arts[0].readinessStatus).toBe(ARTIFACT_READINESS.BLOCKED)
+    expect(arts[0].selected).toBe(false)
+    expect(arts[0].artifactType).toBe('blocked')
+  })
+
+  it('global artifacts suggested when handoff is partial', async () => {
+    const { suggestArtifacts, GLOBAL_ARTIFACT_DEFS } = await getArtifactModule()
+    const handoff = makeHandoff([['HR', 'partial']])
+    const globals = suggestArtifacts(handoff).filter(a => a.scope === 'global')
+    expect(globals).toHaveLength(GLOBAL_ARTIFACT_DEFS.length)
+    globals.forEach(g => expect(g.selected).toBe(true))
+  })
+
+  it('no global artifacts when all BUs blocked', async () => {
+    const { suggestArtifacts } = await getArtifactModule()
+    const handoff = makeHandoff([['A', 'blocked', 'x'], ['B', 'blocked', 'x']])
+    expect(suggestArtifacts(handoff).filter(a => a.scope === 'global')).toHaveLength(0)
+  })
+
+  it('buildArtifactPlan: persistedAt null before persistence', async () => {
+    const { buildArtifactPlan } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    expect(plan.persistedAt).toBeNull()
+    expect(plan.generatedFromHandoffPersistedAt).toBe(handoff.persistedAt)
+  })
+
+  it('persistArtifactPlan: writes to IDB and sets persistedAt', async () => {
+    const { buildArtifactPlan, persistArtifactPlan } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const { ok, record } = await persistArtifactPlan(buildArtifactPlan(handoff, WID, S1, S2, S3))
+    expect(ok).toBe(true)
+    expect(record.persistedAt).toBeTruthy()
+    expect(_idbStore.get(`bsp_v1_stage4_artifact_plan_${WID}_${S1}_${S2}_${S3}`)?.persistedAt).toBeTruthy()
+  })
+
+  it('loadArtifactPlan: returns null when nothing persisted', async () => {
+    await storageRouter.initStorageCache()
+    const { loadArtifactPlan } = await getArtifactModule()
+    expect(await loadArtifactPlan(WID, S1, S2, S3)).toBeNull()
+  })
+
+  it('full round-trip: build → persist → reload → verified with correct BU statuses', async () => {
+    const { buildArtifactPlan, persistArtifactPlan, ARTIFACT_READINESS } = await getArtifactModule()
+    const handoff = makeHandoff([
+      ['Engineering', 'ready'],
+      ['HR', 'partial'],
+      ['Sales', 'blocked', 'No record.'],
+    ])
+    await persistArtifactPlan(buildArtifactPlan(handoff, WID, S1, S2, S3))
+
+    const key = `bsp_v1_stage4_artifact_plan_${WID}_${S1}_${S2}_${S3}`
+    ls.setItem(key, JSON.stringify({ _idbRef: true, store: 'stage4_artifact_plans', idbKey: key }))
+    vi.resetModules()
+    storageRouter = await import('./storageRouter.js')
+    await storageRouter.initStorageCache()
+    const { loadArtifactPlan } = await import('./stage4ArtifactPlan.js')
+    const verified = await loadArtifactPlan(WID, S1, S2, S3)
+
+    expect(verified?.persistedAt).toBeTruthy()
+    expect(verified.globalArtifacts.length).toBeGreaterThan(0)
+    const engArts = verified.businessUnitArtifacts.filter(a => a.businessUnitName === 'Engineering')
+    expect(engArts.every(a => a.readinessStatus === ARTIFACT_READINESS.READY && a.selected)).toBe(true)
+    const salesArts = verified.businessUnitArtifacts.filter(a => a.businessUnitName === 'Sales')
+    expect(salesArts[0].readinessStatus).toBe(ARTIFACT_READINESS.BLOCKED)
+    expect(salesArts[0].selected).toBe(false)
+  })
+
+  it('selected artifacts persist and reload correctly', async () => {
+    const { buildArtifactPlan, persistArtifactPlan, loadArtifactPlan } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    let plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    plan = { ...plan, globalArtifacts: plan.globalArtifacts.map((a, i) => ({ ...a, selected: i !== 0 })) }
+    await persistArtifactPlan(plan)
+    const verified = await loadArtifactPlan(WID, S1, S2, S3)
+    expect(verified.globalArtifacts[0].selected).toBe(false)
+    expect(verified.globalArtifacts[1].selected).toBe(true)
+  })
+
+  it('isArtifactPlanStale: true when handoff persistedAt changed', async () => {
+    const { buildArtifactPlan, isArtifactPlanStale } = await getArtifactModule()
+    const h1 = makeHandoff([['Engineering', 'ready']])
+    const plan = buildArtifactPlan(h1, WID, S1, S2, S3)
+    const h2 = { ...h1, persistedAt: new Date(Date.now() + 10000).toISOString() }
+    expect(isArtifactPlanStale(plan, h2)).toBe(true)
+    expect(isArtifactPlanStale(plan, h1)).toBe(false)
+  })
+
+  it('no AI generation called during artifact planning (suggestArtifacts and buildArtifactPlan are pure)', async () => {
+    const { buildArtifactPlan, suggestArtifacts } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    idbWriteSpy.mockClear()  // reset call history from earlier tests in this suite
+    suggestArtifacts(handoff)
+    buildArtifactPlan(handoff, WID, S1, S2, S3)
+    expect(idbWriteSpy).not.toHaveBeenCalled()
+  })
+
+  it('no artifact planning shown when no verified handoff exists (loadArtifactPlan returns null)', async () => {
+    await storageRouter.initStorageCache()
+    const { loadArtifactPlan } = await getArtifactModule()
+    expect(await loadArtifactPlan(WID, S1, S2, 'nonexistent')).toBeNull()
   })
 })

@@ -6,6 +6,14 @@ import {
   BU_HANDOFF_STATUS,
   HANDOFF_STATUS,
 } from '../utils/stage4Handoff'
+import {
+  buildArtifactPlan,
+  persistArtifactPlan,
+  loadArtifactPlan,
+  isArtifactPlanStale,
+  ARTIFACT_PLAN_STATUS,
+  ARTIFACT_READINESS,
+} from '../utils/stage4ArtifactPlan'
 import { storageReady } from '../utils/storageRouter'
 
 // ── Shared style tokens ────────────────────────────────────────────────────────
@@ -259,6 +267,435 @@ function BuHandoffRow({ entry }) {
               )}
             </>
           )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Artifact planning ──────────────────────────────────────────────────────────
+
+const readinessCfg = {
+  [ARTIFACT_READINESS.READY]:   { color: '#00e5b4', label: 'READY' },
+  [ARTIFACT_READINESS.PARTIAL]: { color: '#fb923c', label: 'PARTIAL' },
+  [ARTIFACT_READINESS.BLOCKED]: { color: '#f87171', label: 'BLOCKED' },
+}
+
+function ReadinessBadge({ status }) {
+  const cfg = readinessCfg[status] || { color: 'var(--muted)', label: String(status).toUpperCase() }
+  return (
+    <span style={{
+      fontSize: 8, fontFamily: fm, fontWeight: 700, letterSpacing: '.04em',
+      color: cfg.color, background: `${cfg.color}18`,
+      border: `1px solid ${cfg.color}44`,
+      borderRadius: 4, padding: '2px 7px',
+    }}>
+      {cfg.label}
+    </span>
+  )
+}
+
+function ArtifactCard({ artifact, selected, onToggle, editing }) {
+  const isBlocked = artifact.readinessStatus === ARTIFACT_READINESS.BLOCKED
+  return (
+    <div style={{
+      background: 'var(--s2)',
+      border: `1px solid ${selected && !isBlocked ? 'rgba(59,130,246,.35)' : 'var(--border)'}`,
+      borderRadius: 5,
+      padding: '9px 12px',
+      opacity: isBlocked ? 0.6 : 1,
+      display: 'flex',
+      gap: 10,
+      alignItems: 'flex-start',
+    }}>
+      {/* Checkbox — only shown in edit mode and when not blocked */}
+      {editing && !isBlocked && (
+        <input
+          type="checkbox"
+          checked={!!selected}
+          onChange={() => onToggle(artifact.artifactId)}
+          style={{ marginTop: 2, flexShrink: 0, cursor: 'pointer' }}
+        />
+      )}
+      {editing && isBlocked && (
+        <div style={{ width: 13, flexShrink: 0 }} />
+      )}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 3 }}>
+          <span style={{ fontSize: 10, fontWeight: 600 }}>{artifact.title}</span>
+          <ReadinessBadge status={artifact.readinessStatus} />
+          {artifact.businessUnitName && (
+            <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 3, padding: '1px 6px' }}>
+              {artifact.businessUnitName}
+            </span>
+          )}
+        </div>
+        <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55 }}>
+          {artifact.purpose}
+        </div>
+        {isBlocked && artifact.blockedReason && (
+          <div style={{ fontSize: 8, fontFamily: fm, color: '#f87171', marginTop: 3, lineHeight: 1.4 }}>
+            Blocked: {artifact.blockedReason}
+          </div>
+        )}
+      </div>
+      {/* Selection indicator when not in edit mode */}
+      {!editing && !isBlocked && (
+        <span style={{ fontSize: 8, fontFamily: fm, color: selected ? '#00e5b4' : 'var(--muted)', flexShrink: 0, marginTop: 2 }}>
+          {selected ? '✓ Selected' : '—'}
+        </span>
+      )}
+    </div>
+  )
+}
+
+function ArtifactGroup({ label, artifacts, selectedIds, onToggle, editing }) {
+  if (!artifacts.length) return null
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 5 }}>
+        {label} ({artifacts.length})
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+        {artifacts.map(a => (
+          <ArtifactCard
+            key={a.artifactId}
+            artifact={a}
+            selected={selectedIds.has(a.artifactId)}
+            onToggle={onToggle}
+            editing={editing}
+          />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId }) {
+  // ap = artifact plan phase
+  const [apPhase, setApPhase]       = useState('checking')  // checking | not_found | suggesting | saving | ready | stale | failed
+  const [plan, setPlan]             = useState(null)         // verified from IDB
+  const [editingPlan, setEditingPlan] = useState(null)       // in-memory plan being composed/edited
+  const [selectedIds, setSelectedIds] = useState(new Set())  // selections during edit
+  const [apError, setApError]       = useState(null)
+  const savingRef                   = useRef(false)
+
+  // On mount and when handoff changes: try to load existing plan from IDB
+  useEffect(() => {
+    if (!workspaceId || !stage1ActiveId || !stage2ActiveId || !stage3ActiveId || !handoff) {
+      setApPhase('not_found')
+      return
+    }
+    let cancelled = false
+    setApPhase('checking')
+    loadArtifactPlan(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      .then(existing => {
+        if (cancelled) return
+        if (existing) {
+          if (isArtifactPlanStale(existing, handoff)) {
+            setPlan(existing)
+            setApPhase('stale')
+          } else {
+            setPlan(existing)
+            setApPhase('ready')
+          }
+        } else {
+          setApPhase('not_found')
+        }
+      })
+      .catch(() => { if (!cancelled) setApPhase('not_found') })
+    return () => { cancelled = true }
+  }, [workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId, handoff?.persistedAt])
+
+  function handleCreate() {
+    const draft = buildArtifactPlan(handoff, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+    const initSelected = new Set(
+      [...draft.globalArtifacts, ...draft.businessUnitArtifacts]
+        .filter(a => a.selected)
+        .map(a => a.artifactId)
+    )
+    setEditingPlan(draft)
+    setSelectedIds(initSelected)
+    setApPhase('suggesting')
+  }
+
+  function handleRebuild() {
+    handleCreate()
+  }
+
+  function handleToggle(artifactId) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      next.has(artifactId) ? next.delete(artifactId) : next.add(artifactId)
+      return next
+    })
+  }
+
+  async function handleSave(status = ARTIFACT_PLAN_STATUS.DRAFT) {
+    if (savingRef.current || !editingPlan) return
+    savingRef.current = true
+    setApError(null)
+    setApPhase('saving')
+
+    const applySelections = artifacts => artifacts.map(a => ({
+      ...a,
+      selected: a.readinessStatus !== ARTIFACT_READINESS.BLOCKED && selectedIds.has(a.artifactId),
+      updatedAt: new Date().toISOString(),
+    }))
+
+    const planToSave = {
+      ...editingPlan,
+      globalArtifacts:      applySelections(editingPlan.globalArtifacts),
+      businessUnitArtifacts: applySelections(editingPlan.businessUnitArtifacts),
+      status,
+    }
+
+    try {
+      const { ok, record } = await persistArtifactPlan(planToSave)
+      if (!ok) {
+        setApError('Artifact plan could not be written to storage. Retry to re-save.')
+        setApPhase('failed')
+        savingRef.current = false
+        return
+      }
+      // Verify by reading back from IDB
+      const verified = await loadArtifactPlan(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!verified) {
+        setApError('Artifact plan was written but could not be read back from storage. Reload and retry.')
+        setApPhase('failed')
+        savingRef.current = false
+        return
+      }
+      setPlan(verified)
+      setEditingPlan(null)
+      setApPhase('ready')
+    } catch (err) {
+      setApError(err?.message || String(err))
+      setApPhase('failed')
+    } finally {
+      savingRef.current = false
+    }
+  }
+
+  function handleEdit() {
+    if (!plan) return
+    const initSelected = new Set(
+      [...plan.globalArtifacts, ...plan.businessUnitArtifacts]
+        .filter(a => a.selected)
+        .map(a => a.artifactId)
+    )
+    setEditingPlan(plan)
+    setSelectedIds(initSelected)
+    setApPhase('suggesting')
+  }
+
+  // Derive display data for ready/stale state
+  const displayPlan   = apPhase === 'suggesting' ? editingPlan : plan
+  const editing       = apPhase === 'suggesting'
+  const selectedCount = apPhase === 'suggesting'
+    ? selectedIds.size
+    : [...(plan?.globalArtifacts || []), ...(plan?.businessUnitArtifacts || [])].filter(a => a.selected).length
+
+  // Group BU artifacts by BU name for display
+  function groupByBU(artifacts) {
+    const map = new Map()
+    for (const a of artifacts) {
+      const k = a.businessUnitName || '(global)'
+      if (!map.has(k)) map.set(k, [])
+      map.get(k).push(a)
+    }
+    return map
+  }
+
+  return (
+    <div>
+      {/* Error banner */}
+      {apError && (
+        <div style={{
+          padding: '10px 14px', marginBottom: 8,
+          background: 'rgba(248,113,113,.07)', border: '1px solid rgba(248,113,113,.3)',
+          borderRadius: 5, fontSize: 10, fontFamily: fm, color: '#f87171', lineHeight: 1.55,
+        }}>
+          <strong>Error:</strong> {apError}
+        </div>
+      )}
+
+      {/* Stale warning */}
+      {apPhase === 'stale' && (
+        <div style={{
+          padding: '10px 14px', marginBottom: 8,
+          background: 'rgba(251,191,36,.07)', border: '1px solid rgba(251,191,36,.3)',
+          borderRadius: 5, fontSize: 10, fontFamily: fm, color: '#fbbf24', lineHeight: 1.55,
+        }}>
+          <strong>Artifact plan is stale</strong> — the Stage 4 handoff was re-compiled after this plan was created.
+          Rebuild to generate updated suggestions from the current handoff.
+        </div>
+      )}
+
+      {/* Phase: checking */}
+      {apPhase === 'checking' && (
+        <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted)', padding: '12px 0' }}>
+          Loading artifact plan from storage…
+        </div>
+      )}
+
+      {/* Phase: saving */}
+      {apPhase === 'saving' && (
+        <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted)', padding: '12px 0' }}>
+          Saving artifact plan to storage…
+        </div>
+      )}
+
+      {/* Phase: not_found */}
+      {apPhase === 'not_found' && (
+        <div style={{
+          ...cardStyle, padding: '16px 18px',
+          border: '1px solid rgba(59,130,246,.25)',
+        }}>
+          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>No artifact plan yet</div>
+          <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 12 }}>
+            Create an artifact plan to decide which execution artifacts should be generated from the verified handoff.
+            Suggestions are derived deterministically from BU readiness — no AI generation occurs during planning.
+          </div>
+          <button
+            onClick={handleCreate}
+            style={{
+              fontSize: 10, fontFamily: fm, fontWeight: 600, padding: '7px 18px',
+              borderRadius: 5, cursor: 'pointer',
+              background: 'var(--accent, #3b82f6)', border: '1px solid var(--accent, #3b82f6)', color: '#000',
+            }}
+          >
+            Create artifact plan from handoff
+          </button>
+        </div>
+      )}
+
+      {/* Phase: suggesting (edit mode) or ready/stale (view mode) */}
+      {displayPlan && (apPhase === 'suggesting' || apPhase === 'ready' || apPhase === 'stale' || apPhase === 'failed') && (
+        <div>
+          {/* Verified banner — only in ready state */}
+          {apPhase === 'ready' && plan?.persistedAt && (
+            <div style={{
+              padding: '8px 12px', marginBottom: 8,
+              background: 'rgba(0,229,180,.06)', border: '1px solid rgba(0,229,180,.25)',
+              borderRadius: 5, fontSize: 9, fontFamily: fm, color: '#00e5b4', lineHeight: 1.5,
+            }}>
+              ✓ Artifact plan saved to storage · {selectedCount} artifact{selectedCount !== 1 ? 's' : ''} selected
+              {plan.status === ARTIFACT_PLAN_STATUS.READY_FOR_GENERATION && ' · Ready for generation'}
+              {' · '}saved {new Date(plan.persistedAt).toLocaleString()}
+            </div>
+          )}
+
+          {/* Selection summary bar */}
+          <div style={{
+            display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap',
+            padding: '9px 12px', marginBottom: 8,
+            background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 5,
+          }}>
+            <span style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)' }}>
+              {editing ? `${selectedIds.size} selected` : `${selectedCount} of ${(displayPlan.globalArtifacts?.length || 0) + (displayPlan.businessUnitArtifacts?.length || 0)} artifacts selected`}
+            </span>
+            {editing && (
+              <>
+                <button
+                  onClick={() => handleSave(ARTIFACT_PLAN_STATUS.DRAFT)}
+                  style={{
+                    fontSize: 9, fontFamily: fm, fontWeight: 600, padding: '5px 14px',
+                    borderRadius: 5, cursor: 'pointer',
+                    background: 'var(--accent, #3b82f6)', border: '1px solid var(--accent, #3b82f6)', color: '#000',
+                  }}
+                >
+                  Save artifact plan
+                </button>
+                <button
+                  onClick={() => handleSave(ARTIFACT_PLAN_STATUS.READY_FOR_GENERATION)}
+                  style={{
+                    fontSize: 9, fontFamily: fm, fontWeight: 600, padding: '5px 14px',
+                    borderRadius: 5, cursor: 'pointer',
+                    background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted2)',
+                  }}
+                >
+                  Save and mark ready for generation
+                </button>
+                <button
+                  onClick={() => { setEditingPlan(null); setApPhase(plan ? (isArtifactPlanStale(plan, handoff) ? 'stale' : 'ready') : 'not_found') }}
+                  style={{
+                    fontSize: 9, fontFamily: fm, padding: '5px 10px',
+                    borderRadius: 5, cursor: 'pointer',
+                    background: 'none', border: 'none', color: 'var(--muted)',
+                  }}
+                >
+                  Cancel
+                </button>
+              </>
+            )}
+            {!editing && apPhase === 'ready' && (
+              <button
+                onClick={handleEdit}
+                style={{
+                  fontSize: 9, fontFamily: fm, fontWeight: 600, padding: '5px 14px',
+                  borderRadius: 5, cursor: 'pointer',
+                  background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted2)',
+                }}
+              >
+                Edit selections
+              </button>
+            )}
+            {(apPhase === 'stale' || apPhase === 'failed') && (
+              <button
+                onClick={handleRebuild}
+                style={{
+                  fontSize: 9, fontFamily: fm, fontWeight: 600, padding: '5px 14px',
+                  borderRadius: 5, cursor: 'pointer',
+                  background: 'var(--accent, #3b82f6)', border: '1px solid var(--accent, #3b82f6)', color: '#000',
+                }}
+              >
+                Rebuild from current handoff
+              </button>
+            )}
+          </div>
+
+          {/* Global artifacts */}
+          <ArtifactGroup
+            label="Global Artifacts"
+            artifacts={displayPlan.globalArtifacts || []}
+            selectedIds={editing ? selectedIds : new Set((displayPlan.globalArtifacts || []).filter(a => a.selected).map(a => a.artifactId))}
+            onToggle={handleToggle}
+            editing={editing}
+          />
+
+          {/* BU artifacts — grouped by BU */}
+          {(() => {
+            const buArtifacts = displayPlan.businessUnitArtifacts || []
+            if (!buArtifacts.length) return null
+            const groups = groupByBU(buArtifacts)
+            const viewSelectedIds = new Set(buArtifacts.filter(a => a.selected).map(a => a.artifactId))
+            return (
+              <div>
+                <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
+                  Business Unit Artifacts
+                </div>
+                {[...groups.entries()].map(([buName, artifacts]) => (
+                  <div key={buName} style={{ marginBottom: 8 }}>
+                    <div style={{ fontSize: 9, fontFamily: fm, fontWeight: 600, color: 'var(--muted2)', marginBottom: 4 }}>
+                      {buName}
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {artifacts.map(a => (
+                        <ArtifactCard
+                          key={a.artifactId}
+                          artifact={a}
+                          selected={editing ? selectedIds.has(a.artifactId) : viewSelectedIds.has(a.artifactId)}
+                          onToggle={handleToggle}
+                          editing={editing}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
         </div>
       )}
     </div>
@@ -557,6 +994,18 @@ export default function Stage4View({
           {handoff.buHandoffs.map(entry => (
             <BuHandoffRow key={entry.buName} entry={entry} />
           ))}
+
+          {/* Artifact planning */}
+          <div style={{ ...labelStyle, marginTop: 8 }}>
+            C · Artifact Planning
+          </div>
+          <ArtifactPlanningSection
+            handoff={handoff}
+            workspaceId={workspaceId}
+            stage1ActiveId={stage1ActiveId}
+            stage2ActiveId={stage2ActiveId}
+            stage3ActiveId={stage3ActiveId}
+          />
 
           {/* Stage 5 CTA */}
           <div style={{
