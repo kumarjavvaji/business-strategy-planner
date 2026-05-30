@@ -7165,6 +7165,47 @@ export default function Stage3View({
           </div>
         )}
         <GenerationProgress generation={generation} onRetry={handleRetryGeneration} />
+
+        {/* ── Save Stage 3 revision ─────────────────────────────────────── */}
+        {persistedExecutionPlans.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid rgba(0,229,180,.25)',
+            borderRadius: 'var(--r)', padding: '14px 16px', marginTop: 8,
+          }}>
+            <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
+              Save Stage 3 revision
+            </div>
+            <div style={{ fontSize: 10, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 10 }}>
+              {persistedExecutionPlans.length} BU plan{persistedExecutionPlans.length !== 1 ? 's' : ''} are persisted and ready.
+              Saving a Stage 3 revision unlocks the Stage 4 handoff panel.
+            </div>
+            <button
+              onClick={() => {
+                const nextNum = (stage3Revisions.length > 0 ? Math.max(...stage3Revisions.map(r => r.revisionNumber)) : 0) + 1
+                const record = buildStage3RevisionRecord({
+                  executionPlans:        persistedExecutionPlans,
+                  summaryNote:           coordinationDraft?.summaryNote || '',
+                  coordinationLayer:     coordinationDraft?.coordinationLayer || null,
+                  revisionNumber:        nextNum,
+                  sourceBasisRevisionId:  stage1ActiveId,
+                  sourceStage2RevisionId: stage2ActiveId,
+                  source:                'ai',
+                  prompt:                '',
+                  impactSummary:         `Stage 3 revision from ${persistedExecutionPlans.length} persisted BU plans.`,
+                  learningSignals:       [],
+                })
+                onSaveRevision(record)
+              }}
+              style={{
+                fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '7px 18px', borderRadius: 5, cursor: 'pointer',
+                background: '#00e5b4', border: '1px solid #00e5b4', color: '#000',
+              }}
+            >
+              Save Stage 3 revision →
+            </button>
+          </div>
+        )}
       </div>
     )
   }
