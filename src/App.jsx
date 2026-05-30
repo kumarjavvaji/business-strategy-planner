@@ -6,6 +6,7 @@ import { DEMO_STRATEGY_BASIS_PACKAGE } from './data/demoPackage'
 import Stage1View                    from './components/Stage1View'
 import Stage2View                    from './components/Stage2View'
 import Stage3View                    from './components/Stage3View'
+import Stage4View                    from './components/Stage4View'
 
 // ── Stage definitions ─────────────────────────────────────────────────────────
 const STAGES = [
@@ -605,7 +606,22 @@ export default function App() {
             onAutoGenerateComplete={() => setStage3PendingGenerate(false)}
           />
         )}
-        {activeStage > 3 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
+        {activeStage === 4 && (
+          <Stage4View
+            workspaceId={fullWorkspace?.id}
+            stage1ActiveId={stage1ActiveId}
+            stage2ActiveId={stage2ActiveId}
+            stage3ActiveId={stage3ActiveId}
+            stage2BUs={
+              (stage2Revisions.find(r => r.id === stage2ActiveId)
+                ?? [...stage2Revisions].sort((a, b) => b.revisionNumber - a.revisionNumber)[0]
+                ?? null
+              )?.contentSnapshot?.businessUnits ?? []
+            }
+            onNavigateToStage3={() => setActiveStage(3)}
+          />
+        )}
+        {activeStage > 4 && <StagePlaceholder stage={STAGES[activeStage - 1]} />}
       </main>
 
     </div>

@@ -2,23 +2,25 @@
  * Low-level IndexedDB CRUD for the Strategy Planner.
  * All exports are async. No direct DOM or React dependency.
  *
- * DB:      bsp_strategy_planner   v1
+ * DB:      bsp_strategy_planner   v2
  * Stores (all keyed by their localStorage key string for cross-reference):
  *   plans                — workspace plan blobs (bsp_plan_v1_*, bsp_v1_workspace)
  *   stage2_handoffs      — handoff drafts (bsp_v1_handoff_*)
  *   stage3_bu_plans      — BU execution plan drafts (bsp_v1_stage3_bu_plan_*)
  *   stage3_coordination  — coordination drafts (bsp_v1_stage3_coordination_*)
+ *   stage4_handoffs      — Stage 3→4 handoff records (bsp_v1_stage4_handoff_*)
  *   migration_audit      — log of migration events
  */
 
 const DB_NAME    = 'bsp_strategy_planner'
-const DB_VERSION = 1
+const DB_VERSION = 2
 
 export const IDB_STORES = {
   PLANS:               'plans',
   STAGE2_HANDOFFS:     'stage2_handoffs',
   STAGE3_BU_PLANS:     'stage3_bu_plans',
   STAGE3_COORDINATION: 'stage3_coordination',
+  STAGE4_HANDOFFS:     'stage4_handoffs',
   MIGRATION_AUDIT:     'migration_audit',
 }
 

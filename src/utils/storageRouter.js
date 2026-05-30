@@ -8,6 +8,7 @@
  *   bsp_v1_handoff_*             → IDB: stage2_handoffs    IDB-primary (LS pointer)
  *   bsp_v1_stage3_bu_plan_*      → IDB: stage3_bu_plans    IDB-primary (LS pointer)
  *   bsp_v1_stage3_coord*         → IDB: stage3_coordination IDB-primary (LS pointer)
+ *   bsp_v1_stage4_handoff_*      → IDB: stage4_handoffs    IDB-primary (LS pointer)
  *   everything else              → LS only
  *
  * Pointer shape stored in localStorage for IDB-primary keys:
@@ -41,6 +42,7 @@ const ROUTES = [
   { prefix: 'bsp_v1_handoff_',            store: IDB_STORES.STAGE2_HANDOFFS,     dualWrite: false },
   { prefix: 'bsp_v1_stage3_bu_plan_',     store: IDB_STORES.STAGE3_BU_PLANS,     dualWrite: false },
   { prefix: 'bsp_v1_stage3_coord',        store: IDB_STORES.STAGE3_COORDINATION, dualWrite: false },
+  { prefix: 'bsp_v1_stage4_handoff_',     store: IDB_STORES.STAGE4_HANDOFFS,     dualWrite: false },
 ]
 
 const IDB_POINTER_MARKER = '_idbRef'
@@ -228,6 +230,7 @@ async function _doInit() {
     IDB_STORES.STAGE2_HANDOFFS,
     IDB_STORES.STAGE3_BU_PLANS,
     IDB_STORES.STAGE3_COORDINATION,
+    IDB_STORES.STAGE4_HANDOFFS,
   ]
   for (const store of storesToLoad) {
     try {
