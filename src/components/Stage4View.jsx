@@ -14,6 +14,20 @@ import {
   ARTIFACT_PLAN_STATUS,
   ARTIFACT_READINESS,
 } from '../utils/stage4ArtifactPlan'
+import {
+  buildArtifactOutput,
+  persistArtifactOutput,
+  loadArtifactOutput,
+  loadAllArtifactOutputs,
+  isArtifactOutputStale,
+} from '../utils/stage4ArtifactOutput'
+import {
+  buildArtifactPrompt,
+  parseArtifactResponse,
+  generateMockArtifactOutput,
+  SUPPORTED_GENERATION_TYPES,
+} from '../utils/stage4ArtifactPrompts'
+import { callAI, getApiMode, hasApiKey } from '../api/aiClient'
 import { storageReady } from '../utils/storageRouter'
 
 // ── Shared style tokens ────────────────────────────────────────────────────────
@@ -295,8 +309,18 @@ function ReadinessBadge({ status }) {
   )
 }
 
-function ArtifactCard({ artifact, selected, onToggle, editing }) {
-  const isBlocked = artifact.readinessStatus === ARTIFACT_READINESS.BLOCKED
+function ArtifactCard({
+  artifact, selected, onToggle, editing,
+  genPhase = null, genError = null, genFailureType = null,
+  hasOutput = false, isOutputStale = false,
+  onGenerate = null, apiMode = 'mock',
+}) {
+  const isBlocked      = artifact.readinessStatus === ARTIFACT_READINESS.BLOCKED
+  const isSupported    = SUPPORTED_GENERATION_TYPES.has(artifact.artifactType)
+  const isGenerating   = ['generating', 'persisting', 'verifying'].includes(genPhase)
+
+  const phaseLabel = { generating: 'Generating…', persisting: 'Saving to storage…', verifying: 'Verifying from storage…' }[genPhase]
+
   return (
     <div style={{
       background: 'var(--s2)',
@@ -308,19 +332,15 @@ function ArtifactCard({ artifact, selected, onToggle, editing }) {
       gap: 10,
       alignItems: 'flex-start',
     }}>
-      {/* Checkbox — only shown in edit mode and when not blocked */}
+      {/* Checkbox — only in edit mode and non-blocked */}
       {editing && !isBlocked && (
-        <input
-          type="checkbox"
-          checked={!!selected}
-          onChange={() => onToggle(artifact.artifactId)}
-          style={{ marginTop: 2, flexShrink: 0, cursor: 'pointer' }}
-        />
+        <input type="checkbox" checked={!!selected} onChange={() => onToggle(artifact.artifactId)}
+          style={{ marginTop: 2, flexShrink: 0, cursor: 'pointer' }} />
       )}
-      {editing && isBlocked && (
-        <div style={{ width: 13, flexShrink: 0 }} />
-      )}
+      {editing && isBlocked && <div style={{ width: 13, flexShrink: 0 }} />}
+
       <div style={{ flex: 1, minWidth: 0 }}>
+        {/* Header row */}
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 3 }}>
           <span style={{ fontSize: 10, fontWeight: 600 }}>{artifact.title}</span>
           <ReadinessBadge status={artifact.readinessStatus} />
@@ -329,7 +349,15 @@ function ArtifactCard({ artifact, selected, onToggle, editing }) {
               {artifact.businessUnitName}
             </span>
           )}
+          {/* Generation status badge */}
+          {!editing && !isBlocked && genPhase === 'done' && (
+            <span style={{ fontSize: 8, fontFamily: fm, fontWeight: 600, color: isOutputStale ? '#fbbf24' : '#00e5b4' }}>
+              {isOutputStale ? '⚠ Stale' : '✓ Generated'}
+            </span>
+          )}
         </div>
+
+        {/* Purpose */}
         <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55 }}>
           {artifact.purpose}
         </div>
@@ -338,13 +366,187 @@ function ArtifactCard({ artifact, selected, onToggle, editing }) {
             Blocked: {artifact.blockedReason}
           </div>
         )}
+
+        {/* Generation controls — view mode, selected, non-blocked */}
+        {!editing && selected && !isBlocked && (
+          <div style={{ marginTop: 7, borderTop: '1px solid var(--border)', paddingTop: 6, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {/* In-flight phases */}
+            {phaseLabel && (
+              <span style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)' }}>
+                ● {phaseLabel}
+              </span>
+            )}
+
+            {/* Unsupported type */}
+            {!isSupported && !isGenerating && (
+              <span style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)', fontStyle: 'italic' }}>
+                Generation not yet implemented for this artifact type.
+              </span>
+            )}
+
+            {/* Generate / Regenerate button */}
+            {isSupported && !isGenerating && genPhase !== 'not_implemented' && (
+              <button
+                onClick={() => onGenerate && onGenerate(artifact)}
+                disabled={isGenerating}
+                style={{
+                  fontSize: 9, fontFamily: fm, fontWeight: 600,
+                  padding: '4px 12px', borderRadius: 4, cursor: 'pointer',
+                  background: hasOutput ? 'var(--s2)' : 'var(--accent, #3b82f6)',
+                  border: hasOutput ? '1px solid var(--border)' : '1px solid var(--accent, #3b82f6)',
+                  color: hasOutput ? 'var(--muted2)' : '#000',
+                }}
+              >
+                {hasOutput ? (isOutputStale ? 'Regenerate (stale)' : 'Regenerate') : 'Generate artifact'}
+              </button>
+            )}
+
+            {/* Error state */}
+            {genPhase === 'failed' && genError && (
+              <>
+                <span style={{ fontSize: 9, fontFamily: fm, color: '#f87171', lineHeight: 1.4 }}>
+                  ⚠ {genFailureType === 'persistence_failed' ? 'Save failed — ' : genFailureType === 'verification_failed' ? 'Verify failed — ' : ''}{genError}
+                </span>
+                {isSupported && (
+                  <button
+                    onClick={() => onGenerate && onGenerate(artifact)}
+                    style={{ fontSize: 8, fontFamily: fm, padding: '3px 9px', borderRadius: 4, cursor: 'pointer', background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted2)' }}
+                  >
+                    Retry
+                  </button>
+                )}
+              </>
+            )}
+
+            {/* View confirmation */}
+            {genPhase === 'done' && hasOutput && !isOutputStale && (
+              <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)' }}>
+                ↓ View below
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Selection indicator — view mode only, no generation controls shown */}
+        {!editing && !isBlocked && genPhase === null && !selected && (
+          <div style={{ marginTop: 4, fontSize: 8, fontFamily: fm, color: 'var(--muted)' }}>—</div>
+        )}
       </div>
-      {/* Selection indicator when not in edit mode */}
-      {!editing && !isBlocked && (
-        <span style={{ fontSize: 8, fontFamily: fm, color: selected ? '#00e5b4' : 'var(--muted)', flexShrink: 0, marginTop: 2 }}>
-          {selected ? '✓ Selected' : '—'}
-        </span>
+    </div>
+  )
+}
+
+// ── Artifact output viewer ─────────────────────────────────────────────────────
+
+function ConfidenceDot({ level }) {
+  const color = level === 'high' ? '#00e5b4' : level === 'low' ? '#f87171' : '#fb923c'
+  return <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: color, marginRight: 4, verticalAlign: 'middle' }} />
+}
+
+function CollapsibleList({ label, items, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen)
+  if (!items?.length) return null
+  return (
+    <div style={{ marginTop: 5 }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, textDecoration: 'underline' }}
+      >
+        {open ? '▼' : '▶'} {label} ({items.length})
+      </button>
+      {open && (
+        <ul style={{ margin: '4px 0 0 12px', padding: 0, listStyle: 'disc' }}>
+          {items.map((item, i) => (
+            <li key={i} style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55, marginBottom: 2 }}>{item}</li>
+          ))}
+        </ul>
       )}
+    </div>
+  )
+}
+
+function ArtifactOutputViewer({ output, isStale }) {
+  const [openSections, setOpenSections] = useState(() => {
+    const init = {}
+    if (output?.contentSections) {
+      output.contentSections.forEach((s, i) => { init[s.sectionId || i] = i < 2 })
+    }
+    return init
+  })
+
+  if (!output) return null
+
+  const toggleSection = id => setOpenSections(prev => ({ ...prev, [id]: !prev[id] }))
+
+  return (
+    <div style={{
+      borderLeft: '2px solid rgba(59,130,246,.3)',
+      marginLeft: 4, marginTop: 3, marginBottom: 4,
+      paddingLeft: 12,
+    }}>
+      {/* Stale warning */}
+      {isStale && (
+        <div style={{ fontSize: 8, fontFamily: fm, color: '#fbbf24', marginBottom: 6, lineHeight: 1.4 }}>
+          ⚠ This output was generated from an earlier version of the handoff or artifact plan. Regenerate to update.
+        </div>
+      )}
+
+      {/* Timestamps */}
+      <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginBottom: 8 }}>
+        Generated · persisted {output.persistedAt ? new Date(output.persistedAt).toLocaleString() : '—'}
+        {output.verifiedAt && ` · verified ${new Date(output.verifiedAt).toLocaleString()}`}
+      </div>
+
+      {/* Content sections */}
+      {(output.contentSections || []).map((s, i) => {
+        const sid = s.sectionId || i
+        const isOpen = !!openSections[sid]
+        return (
+          <div key={sid} style={{ marginBottom: 6 }}>
+            <button
+              onClick={() => toggleSection(sid)}
+              style={{
+                fontSize: 9, fontFamily: fm, fontWeight: 600,
+                color: 'var(--muted2)', background: 'none', border: 'none',
+                cursor: 'pointer', padding: 0, textAlign: 'left', width: '100%',
+                display: 'flex', alignItems: 'center', gap: 4,
+              }}
+            >
+              <span>{isOpen ? '▼' : '▶'}</span>
+              <ConfidenceDot level={s.confidenceLevel} />
+              {s.heading}
+            </button>
+            {isOpen && (
+              <div style={{ marginTop: 4, marginLeft: 14 }}>
+                {s.purpose && (
+                  <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', fontStyle: 'italic', marginBottom: 4, lineHeight: 1.4 }}>
+                    {s.purpose}
+                  </div>
+                )}
+                <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.65, whiteSpace: 'pre-wrap' }}>
+                  {s.body}
+                </div>
+                <CollapsibleList label="Open questions" items={s.openQuestions} />
+                <CollapsibleList label="Source atoms" items={s.sourceAtomIds} />
+              </div>
+            )}
+          </div>
+        )
+      })}
+
+      {/* Plan-level metadata */}
+      <CollapsibleList label="Assumptions" items={output.assumptions} />
+      <CollapsibleList label="Open questions" items={output.openQuestions} />
+      {output.evidenceBasis && (
+        <div style={{ marginTop: 6, fontSize: 8, fontFamily: fm, color: 'var(--muted)', lineHeight: 1.4, fontStyle: 'italic' }}>
+          Evidence basis: {output.evidenceBasis}
+        </div>
+      )}
+      <CollapsibleList label="Source atom IDs" items={output.sourceAtomIds} />
+      {/* Review notes placeholder */}
+      <div style={{ marginTop: 6, fontSize: 8, fontFamily: fm, color: 'var(--muted)', lineHeight: 1.4 }}>
+        Review notes: <em>{output.reviewNotes || '(none yet)'}</em>
+      </div>
     </div>
   )
 }
@@ -373,12 +575,100 @@ function ArtifactGroup({ label, artifacts, selectedIds, onToggle, editing }) {
 
 function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId }) {
   // ap = artifact plan phase
-  const [apPhase, setApPhase]       = useState('checking')  // checking | not_found | suggesting | saving | ready | stale | failed
-  const [plan, setPlan]             = useState(null)         // verified from IDB
-  const [editingPlan, setEditingPlan] = useState(null)       // in-memory plan being composed/edited
-  const [selectedIds, setSelectedIds] = useState(new Set())  // selections during edit
-  const [apError, setApError]       = useState(null)
-  const savingRef                   = useRef(false)
+  const [apPhase, setApPhase]         = useState('checking')
+  const [plan, setPlan]               = useState(null)         // verified from IDB
+  const [editingPlan, setEditingPlan] = useState(null)
+  const [selectedIds, setSelectedIds] = useState(new Set())
+  const [apError, setApError]         = useState(null)
+  const savingRef                     = useRef(false)
+
+  // Artifact generation state
+  const [outputs, setOutputs]   = useState({})   // { artifactId: verifiedOutputRecord }
+  const [genState, setGenState] = useState({})   // { artifactId: { phase, error, failureType } }
+  const generatingRef           = useRef(new Set())
+
+  // Load existing outputs whenever the plan becomes ready
+  useEffect(() => {
+    if (apPhase !== 'ready' || !plan || !workspaceId) return
+    let cancelled = false
+    const allIds = [...(plan.globalArtifacts || []), ...(plan.businessUnitArtifacts || [])]
+      .filter(a => a.readinessStatus !== ARTIFACT_READINESS.BLOCKED)
+      .map(a => a.artifactId)
+    loadAllArtifactOutputs(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId, allIds)
+      .then(loaded => { if (!cancelled) setOutputs(loaded) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [apPhase, plan?.persistedAt, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId])
+
+  async function handleGenerate(artifactItem) {
+    const id = artifactItem.artifactId
+    if (generatingRef.current.has(id)) return
+    generatingRef.current.add(id)
+    setGenState(prev => ({ ...prev, [id]: { phase: 'generating', error: null, failureType: null } }))
+
+    try {
+      // Source invariant: re-read handoff and plan from IDB, not from React state
+      const durableHandoff = await loadStage4Handoff(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!durableHandoff) throw Object.assign(new Error('Verified handoff not found in storage. Return to Stage 3 to prepare the handoff.'), { failureType: 'generation_failed' })
+
+      const durablePlan = await loadArtifactPlan(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!durablePlan) throw Object.assign(new Error('Artifact plan not found in storage. Save the artifact plan before generating.'), { failureType: 'generation_failed' })
+
+      // Verify the artifact is still selected in the persisted plan
+      const allItems = [...(durablePlan.globalArtifacts || []), ...(durablePlan.businessUnitArtifacts || [])]
+      const durableItem = allItems.find(a => a.artifactId === id)
+      if (!durableItem?.selected) throw Object.assign(new Error('This artifact is not selected in the saved plan. Select it and save the plan first.'), { failureType: 'generation_failed' })
+
+      // Check support
+      if (!SUPPORTED_GENERATION_TYPES.has(durableItem.artifactType)) {
+        setGenState(prev => ({ ...prev, [id]: { phase: 'not_implemented', error: 'Generation not yet implemented for this artifact type.', failureType: null } }))
+        generatingRef.current.delete(id)
+        return
+      }
+
+      // Build and call — mock when no API key
+      let contentSections, evidenceBasis, assumptions, openQuestions
+      if (!hasApiKey()) {
+        const mock = generateMockArtifactOutput(durableItem, durableHandoff)
+        ;({ contentSections, evidenceBasis, assumptions, openQuestions } = mock)
+      } else {
+        const { messages } = buildArtifactPrompt(durableItem, durableHandoff)
+        const response = await callAI(messages, { temperature: 0.3, maxTokens: 2000 })
+        if (response.error) throw Object.assign(new Error(response.error), { failureType: 'generation_failed' })
+        const parsed = parseArtifactResponse(response.result)
+        if (parsed.error) throw Object.assign(new Error(parsed.error), { failureType: 'generation_failed' })
+        ;({ contentSections, evidenceBasis, assumptions, openQuestions } = parsed)
+      }
+
+      // Build output record (persistedAt: null until write succeeds)
+      const output = buildArtifactOutput({
+        workspaceId, stage1Id: stage1ActiveId, stage2Id: stage2ActiveId, stage3Id: stage3ActiveId,
+        handoff: durableHandoff, plan: durablePlan, artifactItem: durableItem,
+        contentSections, evidenceBasis, assumptions, openQuestions,
+      })
+
+      // Persist — only write if generation succeeded
+      setGenState(prev => ({ ...prev, [id]: { phase: 'persisting', error: null, failureType: null } }))
+      const { ok } = await persistArtifactOutput(output, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!ok) throw Object.assign(new Error('Output could not be written to storage. The generated content has not been saved.'), { failureType: 'persistence_failed' })
+
+      // Verify by reading back from IDB — do not show as usable until this succeeds
+      setGenState(prev => ({ ...prev, [id]: { phase: 'verifying', error: null, failureType: null } }))
+      const verified = await loadArtifactOutput(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId, id)
+      if (!verified) throw Object.assign(new Error('Output was written but could not be read back from storage. Reload and retry.'), { failureType: 'verification_failed' })
+
+      // Only now update UI — write verifiedAt timestamp
+      const verifiedAt = new Date().toISOString()
+      setOutputs(prev => ({ ...prev, [id]: { ...verified, verifiedAt } }))
+      setGenState(prev => ({ ...prev, [id]: { phase: 'done', error: null, failureType: null } }))
+    } catch (err) {
+      const failureType = err.failureType || 'generation_failed'
+      // A failed generation must not erase a previously verified output
+      setGenState(prev => ({ ...prev, [id]: { phase: 'failed', error: err.message || String(err), failureType } }))
+    } finally {
+      generatingRef.current.delete(id)
+    }
+  }
 
   // On mount and when handoff changes: try to load existing plan from IDB
   useEffect(() => {
@@ -655,45 +945,76 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
             )}
           </div>
 
-          {/* Global artifacts */}
-          <ArtifactGroup
-            label="Global Artifacts"
-            artifacts={displayPlan.globalArtifacts || []}
-            selectedIds={editing ? selectedIds : new Set((displayPlan.globalArtifacts || []).filter(a => a.selected).map(a => a.artifactId))}
-            onToggle={handleToggle}
-            editing={editing}
-          />
-
-          {/* BU artifacts — grouped by BU */}
+          {/* Helper: render a card + output viewer pair */}
           {(() => {
-            const buArtifacts = displayPlan.businessUnitArtifacts || []
-            if (!buArtifacts.length) return null
-            const groups = groupByBU(buArtifacts)
-            const viewSelectedIds = new Set(buArtifacts.filter(a => a.selected).map(a => a.artifactId))
-            return (
-              <div>
-                <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
-                  Business Unit Artifacts
+            const apiMode = getApiMode()
+            function renderArtifact(a, selIds) {
+              const gs      = genState[a.artifactId] || {}
+              const output  = outputs[a.artifactId] || null
+              const isStale = output ? isArtifactOutputStale(output, plan, handoff) : false
+              // Determine effective genPhase for display
+              const effectivePhase = gs.phase || (output ? 'done' : null)
+              return (
+                <div key={a.artifactId}>
+                  <ArtifactCard
+                    artifact={a}
+                    selected={selIds.has(a.artifactId)}
+                    onToggle={handleToggle}
+                    editing={editing}
+                    genPhase={effectivePhase}
+                    genError={gs.error}
+                    genFailureType={gs.failureType}
+                    hasOutput={!!output}
+                    isOutputStale={isStale}
+                    onGenerate={!editing ? handleGenerate : null}
+                    apiMode={apiMode}
+                  />
+                  {!editing && output && (
+                    <ArtifactOutputViewer output={output} isStale={isStale} />
+                  )}
                 </div>
-                {[...groups.entries()].map(([buName, artifacts]) => (
-                  <div key={buName} style={{ marginBottom: 8 }}>
-                    <div style={{ fontSize: 9, fontFamily: fm, fontWeight: 600, color: 'var(--muted2)', marginBottom: 4 }}>
-                      {buName}
+              )
+            }
+
+            const globalSelected  = editing ? selectedIds : new Set((displayPlan.globalArtifacts || []).filter(a => a.selected).map(a => a.artifactId))
+            const buArtifacts     = displayPlan.businessUnitArtifacts || []
+            const viewBuSelected  = new Set(buArtifacts.filter(a => a.selected).map(a => a.artifactId))
+            const buSelected      = editing ? selectedIds : viewBuSelected
+            const groups          = groupByBU(buArtifacts)
+
+            return (
+              <>
+                {/* Global artifacts */}
+                {(displayPlan.globalArtifacts || []).length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 5 }}>
+                      Global Artifacts ({displayPlan.globalArtifacts.length})
                     </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                      {artifacts.map(a => (
-                        <ArtifactCard
-                          key={a.artifactId}
-                          artifact={a}
-                          selected={editing ? selectedIds.has(a.artifactId) : viewSelectedIds.has(a.artifactId)}
-                          onToggle={handleToggle}
-                          editing={editing}
-                        />
-                      ))}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                      {displayPlan.globalArtifacts.map(a => renderArtifact(a, globalSelected))}
                     </div>
                   </div>
-                ))}
-              </div>
+                )}
+
+                {/* BU artifacts — grouped by BU */}
+                {buArtifacts.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
+                      Business Unit Artifacts
+                    </div>
+                    {[...groups.entries()].map(([buName, artifacts]) => (
+                      <div key={buName} style={{ marginBottom: 8 }}>
+                        <div style={{ fontSize: 9, fontFamily: fm, fontWeight: 600, color: 'var(--muted2)', marginBottom: 4 }}>
+                          {buName}
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          {artifacts.map(a => renderArtifact(a, buSelected))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
             )
           })()}
         </div>

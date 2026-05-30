@@ -1,0 +1,378 @@
+/**
+ * Stage 4 artifact prompt builders and response parser.
+ *
+ * Each builder returns { messages } in Anthropic format.
+ * The parser converts the raw model response into contentSections + metadata.
+ *
+ * Supported artifact types (first version):
+ *   executive_decision_brief
+ *   bu_execution_plan / bu_execution_plan_partial
+ *   bu_sme_review_packet / global_sme_review_packet
+ *
+ * For unsupported types the caller receives { isSupported: false }.
+ * Unsupported types must not cause page errors — they just skip generation.
+ *
+ * Source invariant: builders read only from the durable handoff and artifact
+ * item passed by the caller. No React state or rendered UI text is used.
+ */
+
+import { BU_HANDOFF_STATUS } from './stage4Handoff'
+
+// ── Supported types ────────────────────────────────────────────────────────────
+
+export const SUPPORTED_GENERATION_TYPES = new Set([
+  'executive_decision_brief',
+  'bu_execution_plan',
+  'bu_execution_plan_partial',
+  'bu_sme_review_packet',
+  'global_sme_review_packet',
+])
+
+// ── Shared response schema ─────────────────────────────────────────────────────
+
+const RESPONSE_SCHEMA = `{
+  "contentSections": [
+    {
+      "sectionId": "string — snake_case identifier",
+      "heading": "string — section heading",
+      "purpose": "string — one sentence on what this section answers",
+      "body": "string — 3-6 concise sentences or a tight bullet list",
+      "sourceAtomIds": [],
+      "openQuestions": ["string"],
+      "confidenceLevel": "high | medium | low"
+    }
+  ],
+  "evidenceBasis": "string — 1-2 sentences on what data this was derived from",
+  "assumptions": ["string"],
+  "openQuestions": ["string"]
+}`
+
+const SYSTEM_PREAMBLE = `You are a strategic delivery advisor generating structured planning artifacts from verified execution plans. Be concise and specific. Avoid generic filler. Each section body should be 3-6 tight sentences or a short bullet list. Respond ONLY with valid JSON — no markdown fences, no prose outside the JSON.`
+
+// ── Formatting helpers ─────────────────────────────────────────────────────────
+
+function safeList(arr) {
+  return (arr || []).filter(Boolean).join('; ') || '(none)'
+}
+
+function buSummary(bu) {
+  const plan = bu.plan || {}
+  const sections = (bu.executionSections || []).slice(0, 3)  // cap to keep prompt concise
+  return [
+    `BU: ${bu.buName} [${bu.status}]`,
+    plan.mission         ? `Mission: ${plan.mission}`               : null,
+    plan.strategicRole   ? `Strategic role: ${plan.strategicRole}`  : null,
+    plan.priorityOutcomes?.length ? `Priority outcomes: ${safeList(plan.priorityOutcomes)}` : null,
+    sections.length ? `Execution sections:\n${sections.map(s =>
+      `  • ${s.sectionName}: ${s.objective || ''}${s.decisionsRequired?.length ? `; decisions: ${safeList(s.decisionsRequired)}` : ''}${s.dependencies?.length ? `; deps: ${safeList(s.dependencies)}` : ''}`
+    ).join('\n')}` : null,
+    bu.stage4DeliveryImplications?.length ? `Stage 4 implications: ${safeList(bu.stage4DeliveryImplications)}` : null,
+  ].filter(Boolean).join('\n')
+}
+
+function usableBUs(handoff) {
+  return (handoff.buHandoffs || []).filter(b =>
+    b.status === BU_HANDOFF_STATUS.READY || b.status === BU_HANDOFF_STATUS.PARTIAL
+  )
+}
+
+// ── Executive Decision Brief ───────────────────────────────────────────────────
+
+const EXEC_BRIEF_SECTIONS = [
+  { id: 'executive_summary',       heading: 'Executive Summary',        purpose: 'Overall execution readiness in 2-3 sentences.' },
+  { id: 'key_decisions_required',  heading: 'Key Decisions Required',   purpose: 'Specific decisions needed before or during delivery, with decision owner.' },
+  { id: 'cross_bu_commitments',    heading: 'Cross-BU Commitments',     purpose: 'Shared commitments and sequencing dependencies across BUs.' },
+  { id: 'governance_requirements', heading: 'Governance Requirements',  purpose: 'Sign-off requirements, review gates, and escalation paths.' },
+  { id: 'risk_summary',            heading: 'Risk Summary',             purpose: 'Top 3-5 cross-cutting risks with brief mitigation notes.' },
+  { id: 'recommended_next_steps',  heading: 'Recommended Next Steps',   purpose: 'Immediate actions before generation of BU-specific delivery plans.' },
+]
+
+function buildExecutiveDecisionBriefMessages(artifactItem, handoff) {
+  const bus = usableBUs(handoff)
+  const buText = bus.map(buSummary).join('\n\n')
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate an Executive Decision Brief from the Stage 3 execution plans below.
+
+VERIFIED BU EXECUTION PLANS (${bus.length} BUs):
+${buText}
+
+Generate exactly these sections in this order:
+${EXEC_BRIEF_SECTIONS.map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }] }
+}
+
+// ── BU Execution Plan ──────────────────────────────────────────────────────────
+
+const BU_PLAN_SECTIONS = [
+  { id: 'strategic_context',    heading: 'Strategic Context',           purpose: 'BU role in overall delivery and how it connects to the organisation strategy.' },
+  { id: 'execution_workstreams',heading: 'Execution Workstreams',       purpose: 'Key workstreams, activities, and suggested owners.' },
+  { id: 'gate_criteria',        heading: 'Gate Criteria',               purpose: 'What must be true at each delivery gate before proceeding.' },
+  { id: 'dependency_map',       heading: 'Dependency Map',              purpose: 'Internal and cross-BU dependencies that must be resolved during delivery.' },
+  { id: 'risk_controls',        heading: 'Risk Controls',               purpose: 'Specific controls for the identified execution risks.' },
+  { id: 'validation_approach',  heading: 'Validation Approach',         purpose: 'How readiness and delivery quality will be confirmed at each phase.' },
+]
+
+function buildBuExecutionPlanMessages(artifactItem, handoff) {
+  const bu = (handoff.buHandoffs || []).find(b => b.buName === artifactItem.businessUnitName)
+  if (!bu) return null
+
+  const partial = artifactItem.artifactType === 'bu_execution_plan_partial'
+  const plan = bu.plan || {}
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate a ${partial ? 'partial ' : ''}BU Execution Plan for "${bu.buName}".${partial ? '\nNote: the Stage 3 plan is PARTIAL. Clearly flag incomplete sections.' : ''}
+
+BU PROFILE:
+Mission: ${plan.mission || '(not specified)'}
+Strategic role: ${plan.strategicRole || '(not specified)'}
+Priority outcomes: ${safeList(plan.priorityOutcomes)}
+Critical workstreams: ${safeList(plan.criticalWorkstreams)}
+
+EXECUTION SECTIONS:
+${(bu.executionSections || []).map(s => [
+  `Section: ${s.sectionName}`,
+  `  Objective: ${s.objective || '(none)'}`,
+  `  Execution strategy: ${safeList(s.executionStrategy)}`,
+  `  Decisions required: ${safeList(s.decisionsRequired)}`,
+  `  Sequencing/gates: ${safeList(s.sequencingAndGates)}`,
+  `  Dependencies: ${safeList(s.dependencies)}`,
+  `  Risks: ${safeList(s.risks)}`,
+  `  Validation signals: ${safeList(s.validationSignals)}`,
+].join('\n')).join('\n\n')}
+
+Stage 4 delivery implications: ${safeList(bu.stage4DeliveryImplications)}
+
+Generate exactly these sections:
+${BU_PLAN_SECTIONS.map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }] }
+}
+
+// ── SME Review Packet (BU-scoped) ──────────────────────────────────────────────
+
+const BU_SME_SECTIONS = [
+  { id: 'review_scope',          heading: 'Review Scope',              purpose: 'What the SME is being asked to assess.' },
+  { id: 'knowledge_gaps',        heading: 'Knowledge Gaps',            purpose: 'Gaps in the plan that require specialist input to resolve.' },
+  { id: 'specialist_questions',  heading: 'Specialist Questions',      purpose: 'Specific questions for the domain expert, prioritised.' },
+  { id: 'domain_risks',          heading: 'Domain-Specific Risks',     purpose: 'Risks that require expert judgement, not general project oversight.' },
+  { id: 'recommended_experts',   heading: 'Recommended Expert Profiles','purpose': 'Profile descriptions of the specialists who should review this plan.' },
+]
+
+function buildBuSmeReviewMessages(artifactItem, handoff) {
+  const bu = (handoff.buHandoffs || []).find(b => b.buName === artifactItem.businessUnitName)
+  if (!bu) return null
+  const plan = bu.plan || {}
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate a SME Review Packet for "${bu.buName}" to prepare specialist review before delivery commences.
+
+BU PROFILE:
+Mission: ${plan.mission || '(not specified)'}
+Strategic role: ${plan.strategicRole || '(not specified)'}
+Priority outcomes: ${safeList(plan.priorityOutcomes)}
+
+EXECUTION SECTIONS:
+${(bu.executionSections || []).map(s => `${s.sectionName}: ${s.objective || ''} | risks: ${safeList(s.risks)} | decisions: ${safeList(s.decisionsRequired)}`).join('\n')}
+
+Stage 4 implications: ${safeList(bu.stage4DeliveryImplications)}
+
+Generate exactly these sections:
+${BU_SME_SECTIONS.map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }] }
+}
+
+// ── SME Review Packet (global) ─────────────────────────────────────────────────
+
+const GLOBAL_SME_SECTIONS = [
+  { id: 'cross_bu_scope',               heading: 'Cross-BU Review Scope',           purpose: 'What the review covers and which BUs are in scope.' },
+  { id: 'capability_gaps',              heading: 'Capability Gaps',                  purpose: 'Cross-cutting gaps that appear across multiple BU plans.' },
+  { id: 'critical_specialist_questions',heading: 'Critical Specialist Questions',    purpose: 'Questions that must be resolved before delivery commitments are finalised.' },
+  { id: 'systemic_risks',               heading: 'Systemic Risks',                   purpose: 'Risks that span BUs and cannot be owned by any single team.' },
+  { id: 'review_structure',             heading: 'Recommended Review Structure',     purpose: 'How the SME review should be organised across BUs and workstreams.' },
+]
+
+function buildGlobalSmeReviewMessages(artifactItem, handoff) {
+  const bus = usableBUs(handoff)
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate an organisation-wide SME Review Packet covering all verified BU execution plans.
+
+VERIFIED BUs (${bus.length}):
+${bus.map(b => `${b.buName} [${b.status}]: ${safeList(b.plan?.priorityOutcomes)} | risks: ${safeList((b.executionSections || []).flatMap(s => s.risks || []).slice(0, 4))}`).join('\n')}
+
+Generate exactly these sections:
+${GLOBAL_SME_SECTIONS.map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }] }
+}
+
+// ── Public prompt builder ──────────────────────────────────────────────────────
+
+/**
+ * Returns { messages, isSupported } for the given artifact type.
+ * When isSupported is false the caller must not call the AI and should
+ * surface a "not yet implemented" message instead.
+ */
+export function buildArtifactPrompt(artifactItem, handoff) {
+  if (!SUPPORTED_GENERATION_TYPES.has(artifactItem.artifactType)) {
+    return { messages: null, isSupported: false }
+  }
+
+  let result = null
+  switch (artifactItem.artifactType) {
+    case 'executive_decision_brief':
+      result = buildExecutiveDecisionBriefMessages(artifactItem, handoff)
+      break
+    case 'bu_execution_plan':
+    case 'bu_execution_plan_partial':
+      result = buildBuExecutionPlanMessages(artifactItem, handoff)
+      break
+    case 'bu_sme_review_packet':
+      result = buildBuSmeReviewMessages(artifactItem, handoff)
+      break
+    case 'global_sme_review_packet':
+      result = buildGlobalSmeReviewMessages(artifactItem, handoff)
+      break
+  }
+
+  if (!result) return { messages: null, isSupported: false }
+  return { ...result, isSupported: true }
+}
+
+// ── Response parser ────────────────────────────────────────────────────────────
+
+/**
+ * Parses the raw model response text into structured artifact output fields.
+ * Returns { contentSections, evidenceBasis, assumptions, openQuestions, error }.
+ */
+export function parseArtifactResponse(raw) {
+  if (!raw || typeof raw !== 'string') {
+    return { error: 'Empty or non-string response from model.' }
+  }
+
+  let parsed
+  try {
+    // Strip markdown fences if the model wrapped the JSON despite the instruction
+    const cleaned = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim()
+    parsed = JSON.parse(cleaned)
+  } catch {
+    return { error: `Response was not valid JSON. First 200 chars: ${raw.slice(0, 200)}` }
+  }
+
+  const sections = parsed.contentSections
+  if (!Array.isArray(sections) || !sections.length) {
+    return { error: 'Response did not contain a contentSections array.' }
+  }
+
+  const contentSections = sections.map((s, i) => ({
+    sectionId:       s.sectionId       || `section_${i}`,
+    heading:         s.heading         || `Section ${i + 1}`,
+    purpose:         s.purpose         || '',
+    body:            s.body            || '',
+    sourceAtomIds:   Array.isArray(s.sourceAtomIds) ? s.sourceAtomIds : [],
+    openQuestions:   Array.isArray(s.openQuestions)  ? s.openQuestions  : [],
+    confidenceLevel: ['high', 'medium', 'low'].includes(s.confidenceLevel) ? s.confidenceLevel : 'medium',
+  }))
+
+  return {
+    contentSections,
+    evidenceBasis: typeof parsed.evidenceBasis === 'string' ? parsed.evidenceBasis : '',
+    assumptions:   Array.isArray(parsed.assumptions)   ? parsed.assumptions   : [],
+    openQuestions: Array.isArray(parsed.openQuestions) ? parsed.openQuestions : [],
+    error:         null,
+  }
+}
+
+// ── Mock generator (no API key required) ──────────────────────────────────────
+
+/**
+ * Returns deterministic mock artifact output for testing and mock-mode use.
+ * Content is structurally valid but placeholder — clearly marked as mock.
+ */
+export function generateMockArtifactOutput(artifactItem, handoff) {
+  const bu      = artifactItem.businessUnitName || 'organisation'
+  const title   = artifactItem.title
+  const bus     = usableBUs(handoff)
+  const buNames = bus.map(b => b.buName).join(', ') || 'available BUs'
+
+  const mkSection = (sectionId, heading, body) => ({
+    sectionId,
+    heading,
+    purpose: `Mock purpose for ${heading}`,
+    body,
+    sourceAtomIds: artifactItem.sourceAtomIds?.slice(0, 3) || [],
+    openQuestions: [`[Mock] What additional context is needed for ${heading}?`],
+    confidenceLevel: 'low',
+  })
+
+  let contentSections
+  switch (artifactItem.artifactType) {
+    case 'executive_decision_brief':
+      contentSections = [
+        mkSection('executive_summary',      'Executive Summary',      `[Mock] ${bus.length} BUs are ready for Stage 4 delivery planning: ${buNames}. Overall readiness is ${handoff.overallStatus}. Mock mode — replace with AI-generated content.`),
+        mkSection('key_decisions_required', 'Key Decisions Required', `[Mock] Key decisions required before delivery: resource allocation, governance ownership, and milestone sequencing. Specific decisions depend on ${buNames}.`),
+        mkSection('cross_bu_commitments',   'Cross-BU Commitments',   `[Mock] Coordination commitments between ${buNames} are required. Shared milestones and dependency sequences need alignment.`),
+        mkSection('governance_requirements','Governance Requirements', `[Mock] Executive sponsor sign-off required at phase gates. Review cadence to be established across ${bus.length} BUs.`),
+        mkSection('risk_summary',           'Risk Summary',           `[Mock] Top risks: timeline compression, cross-BU dependency delays, resource contention. Mock — regenerate with API key for real content.`),
+        mkSection('recommended_next_steps', 'Recommended Next Steps', `[Mock] 1. Confirm BU leads. 2. Schedule phase-gate reviews. 3. Generate BU-level execution plans. 4. Align on shared dependency map.`),
+      ]
+      break
+    case 'bu_execution_plan':
+    case 'bu_execution_plan_partial':
+      contentSections = [
+        mkSection('strategic_context',    'Strategic Context',    `[Mock] ${bu} plays a key role in the delivery programme. ${artifactItem.artifactType === 'bu_execution_plan_partial' ? 'Note: partial plan — incomplete sections are flagged.' : ''}`),
+        mkSection('execution_workstreams','Execution Workstreams', `[Mock] Primary workstreams for ${bu}: platform delivery, stakeholder engagement, and validation. Owners to be confirmed.`),
+        mkSection('gate_criteria',        'Gate Criteria',        `[Mock] Phase 1 gate: delivery infrastructure ready. Phase 2 gate: pilot validation complete. Phase 3 gate: production sign-off.`),
+        mkSection('dependency_map',       'Dependency Map',       `[Mock] External dependencies: data infrastructure, compliance review. Cross-BU: coordination with ${buNames}.`),
+        mkSection('risk_controls',        'Risk Controls',        `[Mock] Timeline risk: weekly status reviews. Dependency risk: shared tracking board. Quality risk: structured acceptance criteria.`),
+        mkSection('validation_approach',  'Validation Approach',  `[Mock] Validation via observed workflow reviews, structured pilot, and sign-off against acceptance criteria.`),
+      ]
+      break
+    case 'bu_sme_review_packet':
+      contentSections = [
+        mkSection('review_scope',         'Review Scope',           `[Mock] SME review covers ${bu} execution plan, focusing on domain-specific risks and delivery assumptions.`),
+        mkSection('knowledge_gaps',       'Knowledge Gaps',         `[Mock] Key gaps: regulatory interpretation, technical feasibility of proposed workstreams, and pilot design.`),
+        mkSection('specialist_questions', 'Specialist Questions',   `[Mock] 1. Are the delivery timelines realistic? 2. Which regulatory constraints apply? 3. What validation evidence is sufficient?`),
+        mkSection('domain_risks',         'Domain-Specific Risks',  `[Mock] Regulatory compliance risk, specialist availability, and domain-specific quality standards require expert review.`),
+        mkSection('recommended_experts',  'Recommended Expert Profiles', `[Mock] Domain expert: regulatory background in the target domain. Delivery expert: experience with similar-scale programmes.`),
+      ]
+      break
+    case 'global_sme_review_packet':
+      contentSections = [
+        mkSection('cross_bu_scope',               'Cross-BU Review Scope',         `[Mock] Review covers ${bus.length} BUs: ${buNames}. Focus on cross-cutting risks and shared capability gaps.`),
+        mkSection('capability_gaps',              'Capability Gaps',                `[Mock] Identified gaps across BUs: delivery governance, shared data infrastructure, and cross-BU coordination capacity.`),
+        mkSection('critical_specialist_questions','Critical Specialist Questions',  `[Mock] 1. Are cross-BU dependencies correctly sequenced? 2. Which shared risks require central governance? 3. Are timeline assumptions valid across BUs?`),
+        mkSection('systemic_risks',               'Systemic Risks',                 `[Mock] Systemic risks include: coordinated timeline compression, single points of failure in shared dependencies, and governance overhead.`),
+        mkSection('review_structure',             'Recommended Review Structure',   `[Mock] Phase 1: per-BU specialist review. Phase 2: cross-BU alignment workshop. Phase 3: executive sponsor sign-off.`),
+      ]
+      break
+    default:
+      contentSections = [mkSection('content', title, `[Mock] Content for ${title} (${bu}). Regenerate with an API key for real output.`)]
+  }
+
+  return {
+    contentSections,
+    evidenceBasis: `[Mock] Derived from ${bus.length} verified BU handoff records. Regenerate with API key for AI-generated evidence basis.`,
+    assumptions:   [`[Mock] All BU plans are current`, `[Mock] Resource availability as estimated`],
+    openQuestions: [`[Mock] What is the preferred delivery sequencing?`, `[Mock] Who owns cross-BU governance?`],
+  }
+}

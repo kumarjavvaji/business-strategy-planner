@@ -34,20 +34,22 @@ const idbWriteSpy = vi.fn(async (_store, key, value) => { _idbStore.set(key, val
 
 vi.mock('./idbStorage', () => ({
   IDB_STORES: {
-    PLANS:                 'plans',
-    STAGE2_HANDOFFS:       'stage2_handoffs',
-    STAGE3_BU_PLANS:       'stage3_bu_plans',
-    STAGE3_COORDINATION:   'stage3_coordination',
-    STAGE4_HANDOFFS:       'stage4_handoffs',
-    STAGE4_ARTIFACT_PLANS: 'stage4_artifact_plans',
+    PLANS:                   'plans',
+    STAGE2_HANDOFFS:         'stage2_handoffs',
+    STAGE3_BU_PLANS:         'stage3_bu_plans',
+    STAGE3_COORDINATION:     'stage3_coordination',
+    STAGE4_HANDOFFS:         'stage4_handoffs',
+    STAGE4_ARTIFACT_PLANS:   'stage4_artifact_plans',
+    STAGE4_ARTIFACT_OUTPUTS: 'stage4_artifact_outputs',
   },
   idbRead:    async (_store, key) => _idbStore.get(key) ?? null,
   idbWrite:   (...args) => idbWriteSpy(...args),
   idbReadAll: async (store) => {
     const prefixes = {
-      stage3_bu_plans:       'bsp_v1_stage3_bu_plan_',
-      stage4_handoffs:       'bsp_v1_stage4_handoff_',
-      stage4_artifact_plans: 'bsp_v1_stage4_artifact_plan_',
+      stage3_bu_plans:         'bsp_v1_stage3_bu_plan_',
+      stage4_handoffs:         'bsp_v1_stage4_handoff_',
+      stage4_artifact_plans:   'bsp_v1_stage4_artifact_plan_',
+      stage4_artifact_outputs: 'bsp_v1_stage4_artifact_output_',
     }
     const prefix = prefixes[store] || ''
     return [..._idbStore.entries()]
@@ -794,5 +796,250 @@ describe('stage4ArtifactPlan — deterministic artifact suggestions and persiste
     await storageRouter.initStorageCache()
     const { loadArtifactPlan } = await getArtifactModule()
     expect(await loadArtifactPlan(WID, S1, S2, 'nonexistent')).toBeNull()
+  })
+})
+
+// ══════════════════════════════════════════════════════════════════════════════
+// stage4ArtifactOutput — generation persistence contract
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe('stage4ArtifactOutput — generation persist/verify contract', () => {
+  const WID = 'ws_ao', S1 = 's1_ao', S2 = 's2_ao', S3 = 's3_ao'
+
+  function makeMockHandoff(buStatuses) {
+    const now = new Date().toISOString()
+    const buHandoffs = buStatuses.map(([name, status]) => ({
+      buName: name, status, blockedReason: status === 'blocked' ? 'No record.' : null,
+      sourcePersistAt: status !== 'blocked' ? now : null,
+      sourceAtomIds: status !== 'blocked' ? ['a1', 'a2'] : [],
+      plan: status !== 'blocked' ? { buName: name, mission: `${name} mission`, strategicRole: 'role', priorityOutcomes: ['Outcome A'], criticalWorkstreams: ['WS1'] } : null,
+      executionSections: status !== 'blocked' ? [{ sectionName: 'Core', objective: 'Deliver', executionStrategy: ['Do it'], decisionsRequired: ['Dec 1'], sequencingAndGates: [], dependencies: [], risks: ['Risk 1'], validationSignals: [] }] : [],
+      stage4DeliveryImplications: status !== 'blocked' ? ['Implication'] : [],
+    }))
+    const readyCount   = buHandoffs.filter(b => b.status === 'ready').length
+    const partialCount = buHandoffs.filter(b => b.status === 'partial').length
+    return {
+      version: 1, workspaceId: WID, stage1RevisionId: S1, stage2RevisionId: S2, stage3RevisionId: S3,
+      compiledAt: now, persistedAt: now, overallStatus: readyCount > 0 ? 'ready' : 'partial',
+      readyCount, partialCount, blockedCount: buHandoffs.length - readyCount - partialCount,
+      totalCount: buHandoffs.length, buHandoffs,
+    }
+  }
+
+  function makeMockPlan(handoff) {
+    return {
+      version: 1, workspaceId: WID, stage1RevisionId: S1, stage2RevisionId: S2, stage3RevisionId: S3,
+      handoffKey: `bsp_v1_stage4_handoff_${WID}_${S1}_${S2}_${S3}`,
+      persistedAt: handoff.persistedAt, generatedFromHandoffPersistedAt: handoff.persistedAt,
+      globalArtifacts: [{
+        artifactId: 'global_executive_decision_brief', artifactType: 'executive_decision_brief',
+        scope: 'global', businessUnitName: null, title: 'Executive Decision Brief',
+        readinessStatus: 'ready', selected: true, sourceAtomIds: ['a1'], sourceHandoffStatus: 'ready',
+      }],
+      businessUnitArtifacts: [{
+        artifactId: 'bu_engineering_bu_execution_plan', artifactType: 'bu_execution_plan',
+        scope: 'business_unit', businessUnitName: 'Engineering', title: 'BU Execution Plan',
+        readinessStatus: 'ready', selected: true, sourceAtomIds: ['a1', 'a2'], sourceHandoffStatus: 'ready',
+      }],
+    }
+  }
+
+  async function getOutputModule() {
+    vi.resetModules()
+    storageRouter = await import('./storageRouter.js')
+    return import('./stage4ArtifactOutput.js')
+  }
+
+  async function getPromptModule() {
+    vi.resetModules()
+    storageRouter = await import('./storageRouter.js')
+    return import('./stage4ArtifactPrompts.js')
+  }
+
+  beforeEach(async () => {
+    _idbStore.clear()
+    idbWriteSpy.mockImplementation(async (_store, key, value) => { _idbStore.set(key, value) })
+    ls = makeLocalStorageShim()
+    vi.stubGlobal('localStorage', ls)
+    vi.resetModules()
+    storageRouter = await import('./storageRouter.js')
+  })
+
+  it('artifact output key routes to stage4_artifact_outputs (IDB-primary, dualWrite=false)', () => {
+    const key = `bsp_v1_stage4_artifact_output_${WID}_${S1}_${S2}_${S3}_global_executive_decision_brief`
+    const route = storageRouter.routeKey(key)
+    expect(route?.store).toBe('stage4_artifact_outputs')
+    expect(route?.dualWrite).toBe(false)
+  })
+
+  it('buildArtifactOutput: persistedAt and verifiedAt are null before persistence', async () => {
+    const { buildArtifactOutput } = await getOutputModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const plan    = makeMockPlan(handoff)
+    const output  = buildArtifactOutput({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      handoff, plan, artifactItem: plan.globalArtifacts[0],
+      contentSections: [], evidenceBasis: '', assumptions: [], openQuestions: [],
+    })
+    expect(output.persistedAt).toBeNull()
+    expect(output.verifiedAt).toBeNull()
+    expect(output.generationStatus).toBe('generated')
+  })
+
+  it('persistArtifactOutput: writes to IDB and stamps persistedAt', async () => {
+    const { buildArtifactOutput, persistArtifactOutput } = await getOutputModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const plan    = makeMockPlan(handoff)
+    const output  = buildArtifactOutput({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      handoff, plan, artifactItem: plan.globalArtifacts[0],
+      contentSections: [{ sectionId: 's1', heading: 'H', purpose: 'P', body: 'B', sourceAtomIds: [], openQuestions: [], confidenceLevel: 'high' }],
+      evidenceBasis: 'E', assumptions: [], openQuestions: [],
+    })
+    const { ok, record } = await persistArtifactOutput(output, WID, S1, S2, S3)
+    expect(ok).toBe(true)
+    expect(record.persistedAt).toBeTruthy()
+    const key = `bsp_v1_stage4_artifact_output_${WID}_${S1}_${S2}_${S3}_global_executive_decision_brief`
+    expect(_idbStore.get(key)?.persistedAt).toBeTruthy()
+  })
+
+  it('loadArtifactOutput: returns null when not persisted', async () => {
+    await storageRouter.initStorageCache()
+    const { loadArtifactOutput } = await getOutputModule()
+    expect(await loadArtifactOutput(WID, S1, S2, S3, 'global_executive_decision_brief')).toBeNull()
+  })
+
+  it('single artifact: persist + reload-verify round-trip', async () => {
+    const { buildArtifactOutput, persistArtifactOutput, loadArtifactOutput } = await getOutputModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const plan    = makeMockPlan(handoff)
+    const output  = buildArtifactOutput({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      handoff, plan, artifactItem: plan.globalArtifacts[0],
+      contentSections: [{ sectionId: 'summary', heading: 'Executive Summary', purpose: 'P', body: 'Test output.', sourceAtomIds: [], openQuestions: [], confidenceLevel: 'high' }],
+      evidenceBasis: 'From verified BU records.', assumptions: ['A1'], openQuestions: ['Q1'],
+    })
+    await persistArtifactOutput(output, WID, S1, S2, S3)
+    const key = `bsp_v1_stage4_artifact_output_${WID}_${S1}_${S2}_${S3}_global_executive_decision_brief`
+    ls.setItem(key, JSON.stringify({ _idbRef: true, store: 'stage4_artifact_outputs', idbKey: key }))
+    vi.resetModules()
+    storageRouter = await import('./storageRouter.js')
+    await storageRouter.initStorageCache()
+    const { loadArtifactOutput: loadFresh } = await import('./stage4ArtifactOutput.js')
+    const verified = await loadFresh(WID, S1, S2, S3, 'global_executive_decision_brief')
+    expect(verified).not.toBeNull()
+    expect(verified.persistedAt).toBeTruthy()
+    expect(verified.contentSections[0].body).toBe('Test output.')
+    expect(verified.assumptions).toEqual(['A1'])
+  })
+
+  it('failed generation does not overwrite a previously generated output', async () => {
+    const { buildArtifactOutput, persistArtifactOutput, loadArtifactOutput } = await getOutputModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const plan    = makeMockPlan(handoff)
+    const item    = plan.globalArtifacts[0]
+    const output1 = buildArtifactOutput({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      handoff, plan, artifactItem: item,
+      contentSections: [{ sectionId: 's', heading: 'H', purpose: 'P', body: 'First good output.', sourceAtomIds: [], openQuestions: [], confidenceLevel: 'high' }],
+      evidenceBasis: '', assumptions: [], openQuestions: [],
+    })
+    await persistArtifactOutput(output1, WID, S1, S2, S3)
+    // Simulate failure: caller catches error and does NOT call persistArtifactOutput for the bad output
+    const surviving = await loadArtifactOutput(WID, S1, S2, S3, item.artifactId)
+    expect(surviving?.contentSections[0].body).toBe('First good output.')
+  })
+
+  it('isArtifactOutputStale: true when plan or handoff persistedAt changes', async () => {
+    const { isArtifactOutputStale, buildArtifactOutput } = await getOutputModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const plan    = makeMockPlan(handoff)
+    const output  = buildArtifactOutput({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      handoff, plan, artifactItem: plan.globalArtifacts[0],
+      contentSections: [], evidenceBasis: '', assumptions: [], openQuestions: [],
+    })
+    const stalePlan    = { ...plan,    persistedAt: new Date(Date.now() + 5000).toISOString() }
+    const staleHandoff = { ...handoff, persistedAt: new Date(Date.now() + 5000).toISOString() }
+    expect(isArtifactOutputStale(output, plan, handoff)).toBe(false)
+    expect(isArtifactOutputStale(output, stalePlan, handoff)).toBe(true)
+    expect(isArtifactOutputStale(output, plan, staleHandoff)).toBe(true)
+  })
+
+  it('loadAllArtifactOutputs: loads multiple in parallel, skips absent', async () => {
+    const { buildArtifactOutput, persistArtifactOutput, loadAllArtifactOutputs } = await getOutputModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const plan    = makeMockPlan(handoff)
+    const out1 = buildArtifactOutput({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      handoff, plan, artifactItem: plan.globalArtifacts[0],
+      contentSections: [], evidenceBasis: '', assumptions: [], openQuestions: [],
+    })
+    await persistArtifactOutput(out1, WID, S1, S2, S3)
+    const results = await loadAllArtifactOutputs(WID, S1, S2, S3, ['global_executive_decision_brief', 'nonexistent'])
+    expect(Object.keys(results)).toHaveLength(1)
+    expect(results['global_executive_decision_brief']).toBeTruthy()
+  })
+
+  it('buildArtifactPrompt: isSupported=false for unsupported artifact type', async () => {
+    const { buildArtifactPrompt } = await getPromptModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const { isSupported, messages } = buildArtifactPrompt(
+      { artifactId: 'x', artifactType: 'pdlc_epic_outline', scope: 'business_unit', businessUnitName: 'Engineering', title: 'PDLC', sourceAtomIds: [] },
+      handoff
+    )
+    expect(isSupported).toBe(false)
+    expect(messages).toBeNull()
+  })
+
+  it('buildArtifactPrompt: returns messages for executive_decision_brief', async () => {
+    const { buildArtifactPrompt } = await getPromptModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const { isSupported, messages } = buildArtifactPrompt(
+      { artifactId: 'x', artifactType: 'executive_decision_brief', scope: 'global', businessUnitName: null, title: 'EB', sourceAtomIds: [] },
+      handoff
+    )
+    expect(isSupported).toBe(true)
+    expect(messages[0].content).toContain('Engineering')
+  })
+
+  it('parseArtifactResponse: parses valid JSON', async () => {
+    const { parseArtifactResponse } = await getPromptModule()
+    const raw = JSON.stringify({
+      contentSections: [{ sectionId: 's1', heading: 'H', purpose: 'P', body: 'B', sourceAtomIds: [], openQuestions: [], confidenceLevel: 'high' }],
+      evidenceBasis: 'E', assumptions: ['A1'], openQuestions: ['Q1'],
+    })
+    const result = parseArtifactResponse(raw)
+    expect(result.error).toBeNull()
+    expect(result.contentSections[0].body).toBe('B')
+  })
+
+  it('parseArtifactResponse: returns error for invalid JSON', async () => {
+    const { parseArtifactResponse } = await getPromptModule()
+    expect(parseArtifactResponse('not json').error).toBeTruthy()
+  })
+
+  it('generateMockArtifactOutput: returns valid sections without any storage writes', async () => {
+    const { generateMockArtifactOutput } = await getPromptModule()
+    idbWriteSpy.mockClear()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const item = { artifactId: 'x', artifactType: 'executive_decision_brief', scope: 'global', businessUnitName: null, title: 'EB', sourceAtomIds: ['a1'] }
+    const result = generateMockArtifactOutput(item, handoff)
+    expect(result.contentSections.length).toBeGreaterThan(0)
+    expect(idbWriteSpy).not.toHaveBeenCalled()
+  })
+
+  it('unselected artifacts tracked in persisted plan — generation caller must check selected', async () => {
+    const { buildArtifactPlan, persistArtifactPlan, loadArtifactPlan } = await import('./stage4ArtifactPlan.js')
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    let plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    plan = {
+      ...plan,
+      globalArtifacts:       plan.globalArtifacts.map(a => ({ ...a, selected: false })),
+      businessUnitArtifacts: plan.businessUnitArtifacts.map(a => ({ ...a, selected: false })),
+    }
+    await persistArtifactPlan(plan)
+    const loaded = await loadArtifactPlan(WID, S1, S2, S3)
+    expect([...loaded.globalArtifacts, ...loaded.businessUnitArtifacts].some(a => a.selected)).toBe(false)
   })
 })
