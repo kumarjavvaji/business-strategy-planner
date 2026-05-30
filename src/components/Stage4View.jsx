@@ -451,23 +451,38 @@ export default function Stage4View({
           {phase === 'idle' && (
             <>
               <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6 }}>
-                No Stage 4 handoff compiled yet
+                No Stage 4 handoff found
               </div>
               <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 12 }}>
-                Compiling reads each BU's durable Stage 3 execution-plan record from storage.
-                Only records with a confirmed <code>persistedAt</code> timestamp and completed
-                execution atoms are forwarded. Blocked BUs are identified explicitly.
+                The Stage 4 handoff is prepared from Stage 3.
+                Return to Stage 3, generate BU execution plans, then use the
+                <strong> Prepare Stage 4 Handoff</strong> panel at the bottom of Stage 3.
               </div>
-              <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)', marginBottom: 12, lineHeight: 1.5 }}>
-                {buNames.length} BU{buNames.length !== 1 ? 's' : ''} in scope: {buNames.join(', ')}
-              </div>
-              <button
-                onClick={handleCompileAndPersist}
-                disabled={!idbReady}
-                style={{ ...btnPrimary, opacity: idbReady ? 1 : 0.5 }}
-              >
-                Compile Stage 4 handoff
-              </button>
+              {onNavigateToStage3 && (
+                <button
+                  onClick={onNavigateToStage3}
+                  style={{ ...btnPrimary, marginBottom: 12 }}
+                >
+                  ← Go to Stage 3 to prepare handoff
+                </button>
+              )}
+              <details style={{ marginTop: 4 }}>
+                <summary style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)', cursor: 'pointer', userSelect: 'none' }}>
+                  Recovery: rebuild handoff from durable Stage 3 records
+                </summary>
+                <div style={{ marginTop: 8, fontSize: 9, fontFamily: fm, color: 'var(--muted)', lineHeight: 1.5, marginBottom: 8 }}>
+                  Use this only if the Stage 3 handoff panel is unavailable.
+                  Reads each BU's durable execution-plan record directly from IDB.
+                  {buNames.length > 0 && ` ${buNames.length} BU${buNames.length !== 1 ? 's' : ''} in scope: ${buNames.join(', ')}`}
+                </div>
+                <button
+                  onClick={handleCompileAndPersist}
+                  disabled={!idbReady}
+                  style={{ ...btnSecondary, opacity: idbReady ? 1 : 0.5 }}
+                >
+                  Rebuild handoff from durable Stage 3 records
+                </button>
+              </details>
             </>
           )}
 
@@ -523,7 +538,7 @@ export default function Stage4View({
                 onClick={handleCompileAndPersist}
                 style={btnSecondary}
               >
-                Recompile handoff
+                Rebuild handoff
               </button>
             </div>
           </div>

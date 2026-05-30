@@ -46,6 +46,13 @@ import {
 } from '../utils/generationLifecycle'
 import { stage3ExecutiveLeadershipFixture } from '../fixtures/stage3ExecutiveLeadershipFixture'
 import { readCached, readArtifactAsync, writeArtifact, storageReady, getStorageDiagnostics } from '../utils/storageRouter'
+import {
+  compileStage4Handoff,
+  persistStage4Handoff,
+  loadStage4Handoff,
+  BU_HANDOFF_STATUS as S4_BU_STATUS,
+  HANDOFF_STATUS as S4_STATUS,
+} from '../utils/stage4Handoff'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -5670,6 +5677,314 @@ function ApiModeStatus({ apiMode }) {
   )
 }
 
+// ── Prepare Stage 4 Handoff panel ────────────────────────────────────────────
+
+const S4_PHASE = {
+  NOT_READY:       'not_ready',
+  CHECKING:        'checking',
+  READY_TO_PREPARE:'ready_to_prepare',
+  COMPILING:       'compiling',
+  PERSISTING:      'persisting',
+  VERIFYING:       'verifying',
+  VERIFIED:        'verified',
+  FAILED:          'failed',
+}
+
+const HANDOFF_ELIGIBLE_STATUSES = new Set([
+  LIFECYCLE_STATES.DRAFT_GENERATED,
+  LIFECYCLE_STATES.PARTIAL_DRAFT,
+  LIFECYCLE_STATES.ACCEPTED,
+])
+
+function HandoffBadge({ status }) {
+  const cfg = {
+    [S4_BU_STATUS.READY]:   { color: '#00e5b4', label: 'READY' },
+    [S4_BU_STATUS.PARTIAL]: { color: '#fb923c', label: 'PARTIAL' },
+    [S4_BU_STATUS.BLOCKED]: { color: '#f87171', label: 'BLOCKED' },
+    [S4_STATUS.READY]:      { color: '#00e5b4', label: 'READY' },
+    [S4_STATUS.PARTIAL]:    { color: '#fb923c', label: 'PARTIAL' },
+    [S4_STATUS.BLOCKED]:    { color: '#f87171', label: 'BLOCKED' },
+  }[status] || { color: 'var(--muted)', label: String(status || '').toUpperCase() }
+  return (
+    <span style={{
+      fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700,
+      color: cfg.color, background: `${cfg.color}18`,
+      border: `1px solid ${cfg.color}44`,
+      borderRadius: 4, padding: '2px 7px', letterSpacing: '.04em',
+    }}>
+      {cfg.label}
+    </span>
+  )
+}
+
+function PrepareStage4HandoffPanel({
+  workspaceId,
+  stage1ActiveId,
+  stage2ActiveId,
+  stage3ActiveId,
+  orderedStage2BUs,
+  stage3DraftPlans,
+  idbReady,
+  onNavigateToStage4,
+}) {
+  const [phase, setPhase]     = useState(S4_PHASE.NOT_READY)
+  const [handoff, setHandoff] = useState(null)
+  const [error, setError]     = useState(null)
+  const preparingRef          = React.useRef(false)
+
+  const hasRequiredIds = !!(workspaceId && stage1ActiveId && stage2ActiveId && stage3ActiveId)
+  const buNames = orderedStage2BUs.map(bu => bu.name).filter(Boolean)
+
+  // On mount / when IDs or idbReady changes, check for an existing persisted handoff
+  useEffect(() => {
+    if (!hasRequiredIds || !idbReady) {
+      setPhase(S4_PHASE.NOT_READY)
+      setHandoff(null)
+      setError(null)
+      return
+    }
+    let cancelled = false
+    setPhase(S4_PHASE.CHECKING)
+    loadStage4Handoff(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      .then(record => {
+        if (cancelled) return
+        if (record) {
+          setHandoff(record)
+          setPhase(S4_PHASE.VERIFIED)
+        } else {
+          setPhase(S4_PHASE.READY_TO_PREPARE)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPhase(S4_PHASE.READY_TO_PREPARE)
+      })
+    return () => { cancelled = true }
+  }, [workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId, idbReady])
+
+  async function handlePrepare() {
+    if (preparingRef.current) return
+    preparingRef.current = true
+    setError(null)
+    setHandoff(null)
+    try {
+      setPhase(S4_PHASE.COMPILING)
+      const compiled = await compileStage4Handoff({
+        workspaceId, stage1Id: stage1ActiveId,
+        stage2Id: stage2ActiveId, stage3Id: stage3ActiveId, buNames,
+      })
+
+      setPhase(S4_PHASE.PERSISTING)
+      const { ok } = await persistStage4Handoff(compiled)
+      if (!ok) {
+        setError('Handoff could not be written to storage. Retry to re-attempt.')
+        setPhase(S4_PHASE.FAILED)
+        preparingRef.current = false
+        return
+      }
+
+      setPhase(S4_PHASE.VERIFYING)
+      const verified = await loadStage4Handoff(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!verified) {
+        setError('Handoff was written but could not be read back. Reload and retry.')
+        setPhase(S4_PHASE.FAILED)
+        preparingRef.current = false
+        return
+      }
+
+      setHandoff(verified)
+      setPhase(S4_PHASE.VERIFIED)
+    } catch (err) {
+      setError(err?.message || String(err))
+      setPhase(S4_PHASE.FAILED)
+    } finally {
+      preparingRef.current = false
+    }
+  }
+
+  // Derive per-BU readiness from the IDB-sourced draft plans (hydration state)
+  const buReadiness = buNames.map(name => {
+    const draft = stage3DraftPlans?.[name]
+    const lcStatus = draft?.lifecycle?.status || draft?.status || null
+    const eligible = HANDOFF_ELIGIBLE_STATUSES.has(lcStatus)
+    const hasAtoms  = (draft?.executionAtoms || []).some(a => a?.status === 'complete')
+    const handoffEntry = handoff?.buHandoffs?.find(b => b.buName === name)
+    return { name, eligible, lcStatus, hasAtoms, handoffEntry }
+  })
+  const eligibleCount  = buReadiness.filter(b => b.eligible && b.hasAtoms).length
+  const canPrepare     = idbReady && hasRequiredIds && eligibleCount > 0
+
+  // Compact phase label for in-progress states
+  const phaseLabel = {
+    [S4_PHASE.CHECKING]:  'Checking storage…',
+    [S4_PHASE.COMPILING]: 'Reading Stage 3 BU records from storage…',
+    [S4_PHASE.PERSISTING]:'Writing handoff to storage…',
+    [S4_PHASE.VERIFYING]: 'Verifying handoff from storage…',
+  }[phase]
+
+  const cardS = {
+    background: 'var(--surface)', border: '1px solid var(--border)',
+    borderRadius: 'var(--r)', padding: '14px 16px', marginBottom: 10,
+  }
+  const fm = 'var(--fm)'
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+        E · Prepare Stage 4 Handoff
+      </div>
+
+      {/* Error banner */}
+      {error && (
+        <div style={{
+          padding: '10px 14px', marginBottom: 8,
+          background: 'rgba(248,113,113,.07)', border: '1px solid rgba(248,113,113,.3)',
+          borderRadius: 5, fontSize: 10, fontFamily: fm, color: '#f87171', lineHeight: 1.55,
+        }}>
+          <strong>Error:</strong> {error}
+        </div>
+      )}
+
+      {/* Main card */}
+      <div style={cardS}>
+
+        {/* Title row */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 3 }}>
+              Prepare Stage 4 Handoff
+            </div>
+            <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.6 }}>
+              {phase === S4_PHASE.VERIFIED
+                ? 'Stage 4 handoff is prepared and verified from durable storage.'
+                : 'Compiles a handoff from durable Stage 3 BU execution-plan records. Only BUs with persisted records and completed atoms are forwarded.'}
+            </div>
+          </div>
+          {phase === S4_PHASE.VERIFIED && handoff && (
+            <HandoffBadge status={handoff.overallStatus} />
+          )}
+        </div>
+
+        {/* In-progress spinner states */}
+        {phaseLabel && (
+          <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted)', marginBottom: 8 }}>
+            {phaseLabel}
+          </div>
+        )}
+
+        {/* BU readiness rows — shown in ready_to_prepare and verified states */}
+        {(phase === S4_PHASE.READY_TO_PREPARE || phase === S4_PHASE.VERIFIED || phase === S4_PHASE.FAILED) && (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>
+              BU readiness — {eligibleCount}/{buNames.length} eligible
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {buReadiness.map(({ name, eligible, hasAtoms, lcStatus, handoffEntry }) => {
+                const s4Status = handoffEntry?.status || null
+                const showS4 = phase === S4_PHASE.VERIFIED && s4Status
+                return (
+                  <div key={name} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '6px 10px', borderRadius: 4,
+                    background: 'var(--s2)', border: '1px solid var(--border)',
+                  }}>
+                    <span style={{ fontSize: 10, fontWeight: 600, flex: 1 }}>{name}</span>
+                    {showS4 ? (
+                      <HandoffBadge status={s4Status} />
+                    ) : (
+                      <span style={{
+                        fontSize: 8, fontFamily: fm, fontWeight: 600,
+                        color: eligible && hasAtoms ? '#00e5b4' : '#f87171',
+                      }}>
+                        {eligible && hasAtoms ? 'ELIGIBLE' : !eligible ? `NOT READY (${lcStatus || 'no plan'})` : 'NO COMPLETED ATOMS'}
+                      </span>
+                    )}
+                    {showS4 && handoffEntry?.blockedReason && (
+                      <span style={{ fontSize: 8, fontFamily: fm, color: '#f87171', flex: 1, textAlign: 'right' }}>
+                        {handoffEntry.blockedReason}
+                      </span>
+                    )}
+                    {showS4 && handoffEntry?.sourcePersistAt && !handoffEntry?.blockedReason && (
+                      <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)' }}>
+                        persisted {new Date(handoffEntry.sourcePersistAt).toLocaleString()}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Verified summary */}
+        {phase === S4_PHASE.VERIFIED && handoff && (
+          <div style={{
+            padding: '8px 12px', marginBottom: 10,
+            background: 'rgba(0,229,180,.06)', border: '1px solid rgba(0,229,180,.25)',
+            borderRadius: 5, fontSize: 9, fontFamily: fm, color: '#00e5b4', lineHeight: 1.5,
+          }}>
+            ✓ Verified from storage
+            {' · '}{handoff.readyCount} ready · {handoff.partialCount} partial · {handoff.blockedCount} blocked / {handoff.totalCount} BUs
+            <br />
+            Compiled {new Date(handoff.compiledAt).toLocaleString()}
+            {' · '}Persisted {new Date(handoff.persistedAt).toLocaleString()}
+          </div>
+        )}
+
+        {/* Actions row */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          {/* Primary action: prepare / recompile */}
+          {phase !== S4_PHASE.NOT_READY && !phaseLabel && (
+            <button
+              onClick={handlePrepare}
+              disabled={!canPrepare || !!phaseLabel}
+              style={{
+                fontSize: 10, fontFamily: fm, fontWeight: 600,
+                padding: '7px 18px', borderRadius: 5, cursor: canPrepare ? 'pointer' : 'default',
+                background: phase === S4_PHASE.VERIFIED ? 'var(--s2)' : 'var(--accent, #3b82f6)',
+                border: phase === S4_PHASE.VERIFIED ? '1px solid var(--border)' : '1px solid var(--accent, #3b82f6)',
+                color: phase === S4_PHASE.VERIFIED ? 'var(--muted2)' : '#000',
+                opacity: canPrepare ? 1 : 0.45,
+              }}
+            >
+              {phase === S4_PHASE.VERIFIED ? 'Recompile handoff' : 'Prepare Stage 4 Handoff'}
+            </button>
+          )}
+
+          {/* Continue to Stage 4 — only after verified */}
+          {phase === S4_PHASE.VERIFIED && onNavigateToStage4 && (
+            <button
+              onClick={onNavigateToStage4}
+              style={{
+                fontSize: 10, fontFamily: fm, fontWeight: 700,
+                padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
+                background: 'var(--accent, #3b82f6)',
+                border: '1px solid var(--accent, #3b82f6)',
+                color: '#000',
+              }}
+            >
+              Continue to Stage 4 →
+            </button>
+          )}
+
+          {/* Not ready explanation */}
+          {phase === S4_PHASE.NOT_READY && (
+            <span style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)' }}>
+              {!hasRequiredIds ? 'Stage 1, 2, and 3 revisions required.' : !idbReady ? 'Waiting for storage…' : 'No eligible BU plans.'}
+            </span>
+          )}
+
+          {/* Can't prepare explanation */}
+          {phase === S4_PHASE.READY_TO_PREPARE && !canPrepare && (
+            <span style={{ fontSize: 9, fontFamily: fm, color: '#f87171' }}>
+              No BUs have durable completed plans. Generate and persist Stage 3 BU plans first.
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main Stage 3 view ─────────────────────────────────────────────────────────
 
 export default function Stage3View({
@@ -7044,32 +7359,17 @@ export default function Stage3View({
         isSaving={isStageRefining}
       />
 
-      {/* ── Stage 4 CTA ───────────────────────────────────────────────────── */}
-      <div style={{
-        background: 'var(--surface)', border: '1px solid rgba(59,130,246,.3)',
-        borderRadius: 'var(--r)', padding: '16px 18px',
-        display: 'flex', alignItems: 'center', gap: 16,
-      }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
-            Continue to Stage 4 — Product Delivery
-          </div>
-          <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.65 }}>
-            Stage 4 will translate these execution plans into PDLC strategy, epic-level requirements,
-            acceptance criteria, non-functional requirements, delivery sequencing, and implementation governance.
-          </div>
-        </div>
-        <button
-          onClick={onNavigateToStage4}
-          style={{
-            flexShrink: 0, fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
-            padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
-            background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted2)',
-          }}
-        >
-          Stage 4 →
-        </button>
-      </div>
+      {/* ── E. Prepare Stage 4 Handoff ────────────────────────────────────── */}
+      <PrepareStage4HandoffPanel
+        workspaceId={effectiveWorkspaceId}
+        stage1ActiveId={stage1ActiveId}
+        stage2ActiveId={stage2ActiveId}
+        stage3ActiveId={stage3ActiveId}
+        orderedStage2BUs={orderedStage2BUs}
+        stage3DraftPlans={stage3DraftPlans}
+        idbReady={idbReady}
+        onNavigateToStage4={onNavigateToStage4}
+      />
 
     </div>
   )

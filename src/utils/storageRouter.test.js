@@ -501,4 +501,119 @@ describe('stage4Handoff — compiler reads only from IDB', () => {
     expect(verified.persistedAt).toBeTruthy()
     expect(verified.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
   })
+
+  // ── Stage 3 trigger tests — handoff creation flow ────────────────────────────
+
+  it('Stage 3 trigger: handoff is not shown as usable until persistedAt is confirmed', async () => {
+    await seedStage3('Engineering')
+    const { compileStage4Handoff, persistStage4Handoff, loadStage4Handoff } = await getHandoffModule()
+
+    const compiled = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'] })
+
+    // Before persist: compiledAt exists, persistedAt is null — not usable
+    expect(compiled.compiledAt).toBeTruthy()
+    expect(compiled.persistedAt).toBeNull()
+
+    // Before persist: loadStage4Handoff returns null (nothing written yet)
+    const beforePersist = await loadStage4Handoff(WID, S1, S2, S3)
+    expect(beforePersist).toBeNull()
+
+    // After persist + verify: usable
+    await persistStage4Handoff(compiled)
+    const verified = await loadStage4Handoff(WID, S1, S2, S3)
+    expect(verified?.persistedAt).toBeTruthy()
+  })
+
+  it('Stage 3 trigger: verified handoff summary shows per-BU status', async () => {
+    await seedStage3('Engineering')
+    await seedStage3('Finance', { lifecycle: { status: 'partial_draft' }, status: 'partial_draft' })
+    const { compileStage4Handoff, persistStage4Handoff, loadStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+
+    const compiled = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      buNames: ['Engineering', 'Finance', 'Ghost'],
+    })
+    await persistStage4Handoff(compiled)
+    const verified = await loadStage4Handoff(WID, S1, S2, S3)
+
+    expect(verified.readyCount).toBe(1)
+    expect(verified.partialCount).toBe(1)
+    expect(verified.blockedCount).toBe(1)         // Ghost has no IDB record
+    expect(verified.totalCount).toBe(3)
+
+    const eng = verified.buHandoffs.find(b => b.buName === 'Engineering')
+    expect(eng.status).toBe(BU_HANDOFF_STATUS.READY)
+    expect(eng.sourcePersistAt).toBeTruthy()
+
+    const ghost = verified.buHandoffs.find(b => b.buName === 'Ghost')
+    expect(ghost.status).toBe(BU_HANDOFF_STATUS.BLOCKED)
+    expect(ghost.plan).toBeNull()
+    expect(ghost.blockedReason).toBeTruthy()
+  })
+
+  it('Stage 3 trigger: blocks when no BU has durable Stage 3 records', async () => {
+    // No Stage 3 records seeded at all
+    await storageRouter.initStorageCache()
+    const { compileStage4Handoff, HANDOFF_STATUS } = await getHandoffModule()
+
+    const compiled = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3,
+      buNames: ['A', 'B', 'C'],
+    })
+    expect(compiled.overallStatus).toBe(HANDOFF_STATUS.BLOCKED)
+    expect(compiled.readyCount).toBe(0)
+    expect(compiled.blockedCount).toBe(3)
+    compiled.buHandoffs.forEach(b => {
+      expect(b.plan).toBeNull()
+      expect(b.blockedReason).toBeTruthy()
+    })
+  })
+
+  it('Stage 4 consumer: loadStage4Handoff returns null when no handoff prepared', async () => {
+    await storageRouter.initStorageCache()
+    const { loadStage4Handoff } = await getHandoffModule()
+    const result = await loadStage4Handoff(WID, S1, S2, 'nonexistent_stage3_rev')
+    expect(result).toBeNull()
+  })
+
+  it('Stage 4 consumer: loadStage4Handoff returns null for wrong stage3Id', async () => {
+    await seedStage3('Engineering')
+    const { compileStage4Handoff, persistStage4Handoff, loadStage4Handoff } = await getHandoffModule()
+
+    const compiled = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'] })
+    await persistStage4Handoff(compiled)
+
+    // Different stage3Id — handoff is keyed per-revision
+    const result = await loadStage4Handoff(WID, S1, S2, 'different_s3_rev')
+    expect(result).toBeNull()
+  })
+
+  it('source invariant: compiler uses readArtifactFromIdb, not readArtifactAsync or cache', async () => {
+    // Seed Engineering into IDB properly
+    await seedStage3('Engineering')
+
+    // Populate cache with a DIFFERENT (incorrect) version for the same key
+    const buKey = stage3Key(WID, S1, S2, 'Engineering')
+    const poisonedDraft = makeStage3Draft('Engineering', {
+      plan: null,  // no plan — would cause BLOCKED if used
+      executionAtoms: [],
+    })
+    // Write poison to cache only (not IDB)
+    idbWriteSpy.mockRejectedValueOnce(new Error('IDB write blocked for poison'))
+    await storageRouter.writeArtifact(buKey, poisonedDraft)
+    // Restore LS pointer so migration doesn't fix it
+    ls.setItem(buKey, JSON.stringify({ _idbRef: true, store: 'stage3_bu_plans', idbKey: buKey }))
+
+    // Confirm: cache has the poisoned draft, IDB has the good one
+    const fromCache = await storageRouter.readArtifactAsync(buKey)
+    expect(fromCache?.executionAtoms?.length).toBe(0) // poisoned
+
+    const fromIdb = await storageRouter.readArtifactFromIdb(buKey)
+    expect(fromIdb?.executionAtoms?.length).toBeGreaterThan(0) // good
+
+    // Compiler must use the IDB path — result should be READY (not BLOCKED)
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+    const result = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'] })
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
+  })
 })
