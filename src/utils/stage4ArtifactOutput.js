@@ -28,6 +28,24 @@ export const OUTPUT_STATUS = {
   STALE:     'stale',
 }
 
+export const REVIEW_STATUS = {
+  NOT_REVIEWED:   'not_reviewed',
+  NEEDS_REVISION: 'needs_revision',
+  USABLE:         'usable',
+  STRONG:         'strong',
+}
+
+// Ordered list of review dimensions shown in the UI
+export const REVIEW_DIMENSIONS = [
+  { key: 'strategicClarity',          label: 'Strategic clarity' },
+  { key: 'traceability',              label: 'Traceability to Stage 1–3 basis' },
+  { key: 'executionSpecificity',      label: 'Execution specificity' },
+  { key: 'dependencyRiskUsefulness',  label: 'Dependency / risk usefulness' },
+  { key: 'smeReviewability',          label: 'SME reviewability' },
+  { key: 'redundancyIssues',          label: 'Redundancy / copied-language issues' },
+  { key: 'overallUsability',          label: 'Overall usability' },
+]
+
 // ── Key helper ─────────────────────────────────────────────────────────────────
 
 function safeId(s) {
@@ -143,4 +161,45 @@ export function isArtifactOutputStale(output, plan, handoff) {
     output.generatedFromArtifactPlanPersistedAt !== plan.persistedAt ||
     output.generatedFromHandoffPersistedAt      !== handoff.persistedAt
   )
+}
+
+// ── Quality review ─────────────────────────────────────────────────────────────
+
+/**
+ * Persists a quality review onto an existing artifact output record.
+ *
+ * INVARIANT: generated content (contentSections, evidenceBasis, assumptions,
+ * openQuestions, persistedAt, generatedAt, sourceAtomIds) is NEVER modified.
+ * Only review fields are written.
+ *
+ * @param {object} currentOutput  verified artifact output loaded from IDB
+ * @param {object} reviewData     { reviewStatus, reviewDimensions, improvementNotes }
+ * @returns {Promise<{ ok, record }>}
+ */
+export async function saveArtifactReview(currentOutput, reviewData, workspaceId, stage1Id, stage2Id, stage3Id) {
+  if (!currentOutput?.artifactId) return { ok: false, record: currentOutput }
+  const key = stage4ArtifactOutputKey(workspaceId, stage1Id, stage2Id, stage3Id, currentOutput.artifactId)
+  const now = new Date().toISOString()
+
+  // Merge review fields only — generated content fields are spread from currentOutput unchanged
+  const updated = {
+    ...currentOutput,
+    reviewStatus:     reviewData.reviewStatus     ?? currentOutput.reviewStatus     ?? REVIEW_STATUS.NOT_REVIEWED,
+    reviewDimensions: reviewData.reviewDimensions ?? currentOutput.reviewDimensions ?? {},
+    improvementNotes: reviewData.improvementNotes ?? currentOutput.improvementNotes ?? '',
+    reviewedAt:       currentOutput.reviewedAt || now,
+    reviewUpdatedAt:  now,
+    updatedAt:        now,
+    // ── these fields are explicitly preserved and never overwritten by a review ──
+    contentSections:  currentOutput.contentSections,
+    evidenceBasis:    currentOutput.evidenceBasis,
+    assumptions:      currentOutput.assumptions,
+    openQuestions:    currentOutput.openQuestions,
+    persistedAt:      currentOutput.persistedAt,
+    generatedAt:      currentOutput.generatedAt,
+    sourceAtomIds:    currentOutput.sourceAtomIds,
+  }
+
+  const ok = await writeArtifact(key, updated)
+  return { ok, record: ok ? updated : currentOutput }
 }

@@ -40,6 +40,13 @@ import RefinementPanel    from './RefinementPanel'
 import LearningSignals    from './LearningSignals'
 import { deriveLearningSignals, buildLearningSignalMessages, parseLearningSignalResponse, normalizeLearningSignals } from '../utils/learningSignals'
 import { ATOM_STATUSES } from '../utils/generationAtoms'
+import {
+  UNIT_LIFECYCLE_STATES,
+  canAcceptUnit,
+  createUnitRefinementRecord,
+  transitionUnitToAccepted,
+  unitAuditHasBlockingIssues,
+} from '../utils/unitLifecycle'
 
 // ── Involvement level styles ──────────────────────────────────────────────────
 const LEVEL_COLORS = {
@@ -92,6 +99,74 @@ const ITEM_STATE_DEFAULT = {
   status: ATOM_STATUSES.NOT_STARTED, rawResponse: null, parsedValue: null, parserError: null,
   isDecomposed: false, assembledFromChildren: false, childAtoms: null,
   missingChildren: [], failedChildren: [], isStale: false,
+  lifecycle: UNIT_LIFECYCLE_STATES.NOT_STARTED, lifecycleAudit: null,
+  acceptedDraft: null, acceptedAt: null, refinementHistory: [],
+}
+
+function buildStage2ItemAudit(state = {}) {
+  const missingChildren = state.missingChildren || []
+  const failedChildren = state.failedChildren || []
+  const hasParsedValue = !!state.parsedValue
+  const blocking = !hasParsedValue || missingChildren.length > 0 || failedChildren.length > 0 || !!state.parserError
+  const status = state.parserError
+    ? 'failed'
+    : !hasParsedValue
+      ? 'incomplete'
+      : blocking
+        ? 'needs_refinement'
+        : 'complete'
+  return {
+    status,
+    blocking,
+    missingChildren,
+    failedChildren,
+    parserError: state.parserError || null,
+    lastAuditedAt: new Date().toISOString(),
+  }
+}
+
+function deriveStage2ItemLifecycle(state = {}, audit = buildStage2ItemAudit(state)) {
+  if (state.lifecycle) return state.lifecycle
+  if (state.status === 'generating') return UNIT_LIFECYCLE_STATES.GENERATING
+  if (state.status === 'failed') return UNIT_LIFECYCLE_STATES.FAILED
+  if (state.status === 'complete' || state.status === 'partial') {
+    return unitAuditHasBlockingIssues(audit)
+      ? UNIT_LIFECYCLE_STATES.NEEDS_REFINEMENT
+      : UNIT_LIFECYCLE_STATES.DRAFT_READY
+  }
+  return UNIT_LIFECYCLE_STATES.NOT_STARTED
+}
+
+function normalizeStage2ItemState(state = {}) {
+  const merged = { ...ITEM_STATE_DEFAULT, ...state }
+  const lifecycleAudit = merged.lifecycleAudit || buildStage2ItemAudit(merged)
+  const lifecycle = state.lifecycle || deriveStage2ItemLifecycle({ ...merged, lifecycle: null }, lifecycleAudit)
+  return {
+    ...merged,
+    lifecycle,
+    lifecycleAudit,
+    refinementHistory: merged.refinementHistory || [],
+    acceptedDraft: merged.acceptedDraft || null,
+  }
+}
+
+function markStage2ItemStale(state = {}) {
+  const next = normalizeStage2ItemState({
+    ...state,
+    isStale: true,
+    lifecycle: UNIT_LIFECYCLE_STATES.NEEDS_REFINEMENT,
+    acceptedAt: null,
+  })
+  return {
+    ...next,
+    lifecycleAudit: {
+      ...(next.lifecycleAudit || buildStage2ItemAudit(next)),
+      status: 'needs_refinement',
+      blocking: true,
+      stale: true,
+      lastAuditedAt: new Date().toISOString(),
+    },
+  }
 }
 
 // Display label for a handoff structure item (string legacy or new object format)
@@ -137,7 +212,10 @@ function normalizeHandoffDraftPayload(payload = {}) {
   return {
     version: 2,
     parsed,
-    itemStates: payload.itemStates || payload.handoffItems || {},
+    itemStates: Object.fromEntries(
+      Object.entries(payload.itemStates || payload.handoffItems || {})
+        .map(([key, state]) => [key, normalizeStage2ItemState(state)])
+    ),
     smeLensState,
     structureIsStale: !!payload.structureIsStale,
     buHandoff: payload.buHandoff || payload.assembledBuHandoff || null,
@@ -172,6 +250,8 @@ function buildHandoffDraftPayload({ buName, parsed, itemStates, smeLensState, st
   const itemStatuses = Object.fromEntries(
     Object.entries(handoffItems).map(([key, state]) => [key, {
       status: state?.status || 'not_started',
+      lifecycle: state?.lifecycle || 'not_started',
+      accepted: state?.lifecycle === UNIT_LIFECYCLE_STATES.ACCEPTED,
       childStatuses: Object.fromEntries(
         Object.entries(state?.childAtoms || {}).map(([childKey, child]) => [childKey, child?.status || 'not_started']),
       ),
@@ -453,7 +533,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
         Object.keys(updated).forEach(idx => {
           const s = updated[idx]?.status
           if (s === 'complete' || s === 'partial') {
-            updated[idx] = { ...updated[idx], isStale: true }
+            updated[idx] = markStage2ItemStale(updated[idx])
           }
         })
         return updated
@@ -509,7 +589,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
         Object.keys(updated).forEach(idx => {
           const s = updated[idx]?.status
           if (s === 'complete' || s === 'partial') {
-            updated[idx] = { ...updated[idx], isStale: true }
+            updated[idx] = markStage2ItemStale(updated[idx])
           }
         })
         return updated
@@ -522,7 +602,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   function patchItem(i, patch) {
     setItemStates(prev => ({
       ...prev,
-      [i]: { ...ITEM_STATE_DEFAULT, ...(prev[i] || {}), ...patch },
+      [i]: normalizeStage2ItemState({ ...ITEM_STATE_DEFAULT, ...(prev[i] || {}), ...patch }),
     }))
   }
 
@@ -536,12 +616,16 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     setItemOpen(prev => ({ ...prev, [i]: true }))
     patchItem(i, {
       status: 'generating',
+      lifecycle: UNIT_LIFECYCLE_STATES.GENERATING,
+      lifecycleAudit: null,
       isDecomposed: true,
       assembledFromChildren: false,
       parsedValue: null,
       parserError: null,
       rawResponse: null,
       isStale: false,
+      acceptedDraft: null,
+      acceptedAt: null,
       childAtoms: Object.fromEntries(CHILD_ATOM_KEYS.map(k => [k, { ...CHILD_ATOM_STATE_DEFAULT }])),
       missingChildren: [],
       failedChildren: [],
@@ -604,7 +688,19 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     })
 
     if (!Object.keys(assembledValue).length) {
-      patchItem(i, { status: 'failed', parserError: 'All child atoms failed to generate.' })
+      patchItem(i, {
+        status: 'failed',
+        lifecycle: UNIT_LIFECYCLE_STATES.FAILED,
+        parserError: 'All child atoms failed to generate.',
+        lifecycleAudit: {
+          status: 'failed',
+          blocking: true,
+          missingChildren,
+          failedChildren,
+          parserError: 'All child atoms failed to generate.',
+          lastAuditedAt: new Date().toISOString(),
+        },
+      })
       return
     }
 
@@ -615,13 +711,18 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       setItemOpen(prev => ({ ...prev, [i]: false }))  // collapse on full success
     }
 
-    patchItem(i, {
+    const nextItemState = {
       status: isPartial ? 'partial' : 'complete',
+      lifecycle: isPartial ? UNIT_LIFECYCLE_STATES.NEEDS_REFINEMENT : UNIT_LIFECYCLE_STATES.DRAFT_READY,
       assembledFromChildren: true,
       isStale: false,
       parsedValue: { key: themeKey, value: assembledValue },
       missingChildren,
       failedChildren,
+    }
+    patchItem(i, {
+      ...nextItemState,
+      lifecycleAudit: buildStage2ItemAudit(nextItemState),
     })
   }
 
@@ -702,12 +803,17 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     const existingKey = iState.parsedValue?.key
     const derivedKey = existingKey || getThemeKey(theme)
 
-    patchItem(i, {
+    const nextItemState = {
       status: isPartial ? 'partial' : 'complete',
+      lifecycle: isPartial ? UNIT_LIFECYCLE_STATES.NEEDS_REFINEMENT : UNIT_LIFECYCLE_STATES.DRAFT_READY,
       assembledFromChildren: true,
       parsedValue: { key: derivedKey, value: assembledValue },
       missingChildren,
       failedChildren,
+    }
+    patchItem(i, {
+      ...nextItemState,
+      lifecycleAudit: buildStage2ItemAudit(nextItemState),
     })
     // Auto-collapse decomposition on full assembly
     if (!isPartial) {
@@ -722,8 +828,10 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       return {
         key: getThemeKey(theme),
         label: getThemeLabel(theme),
-        status: iState?.status || 'not_started',
-        value: iState?.parsedValue?.value || null,
+        status: iState?.lifecycle || iState?.status || 'not_started',
+        value: iState?.lifecycle === UNIT_LIFECYCLE_STATES.ACCEPTED
+          ? (iState?.acceptedDraft?.value || iState?.parsedValue?.value || null)
+          : null,
       }
     })
     const completedItems = items.filter(it => it.value !== null)
@@ -739,6 +847,19 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   }
 
   // ── Refine item helpers ─────────────────────────────────────────────────────
+
+  function handleAcceptItem(i) {
+    const iState = normalizeStage2ItemState(itemStates[i])
+    const lifecycleAudit = iState.lifecycleAudit || buildStage2ItemAudit(iState)
+    if (!canAcceptUnit(iState, { audit: lifecycleAudit })) return
+
+    const accepted = transitionUnitToAccepted(iState, { audit: lifecycleAudit })
+    patchItem(i, {
+      ...accepted,
+      lifecycleAudit,
+      acceptedDraft: iState.parsedValue,
+    })
+  }
 
   function patchItemRefineUi(i, patch) {
     setItemRefineUi(prev => ({
@@ -776,17 +897,67 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     const { result, error } = await callAI(messages, { temperature: 0.3, maxTokens: 1500 })
 
     if (error) {
+      const failedRecord = createUnitRefinementRecord({
+        unitId: String(i),
+        prompt,
+        previousSnapshot: iState.parsedValue,
+        auditBefore: iState.lifecycleAudit || buildStage2ItemAudit(iState),
+        status: 'failed',
+        failureReason: error,
+      })
+      patchItem(i, {
+        refinementHistory: [...(iState.refinementHistory || []), failedRecord],
+      })
       patchItemRefineUi(i, { busy: false, error })
       return
     }
 
     const p = parseHandoffItemResponse(result)
     if (p.error) {
+      const failedRecord = createUnitRefinementRecord({
+        unitId: String(i),
+        prompt,
+        previousSnapshot: iState.parsedValue,
+        proposedSnapshot: result || null,
+        auditBefore: iState.lifecycleAudit || buildStage2ItemAudit(iState),
+        status: 'failed',
+        failureReason: p.error,
+      })
+      patchItem(i, {
+        refinementHistory: [...(iState.refinementHistory || []), failedRecord],
+      })
       patchItemRefineUi(i, { busy: false, error: p.error })
       return
     }
 
-    patchItem(i, { rawResponse: result, parsedValue: { key: p.key, value: p.value }, parserError: null })
+    const proposedState = {
+      ...iState,
+      status: 'complete',
+      lifecycle: UNIT_LIFECYCLE_STATES.DRAFT_READY,
+      rawResponse: result,
+      parsedValue: { key: p.key, value: p.value },
+      parserError: null,
+      missingChildren: [],
+      failedChildren: [],
+    }
+    const auditAfter = buildStage2ItemAudit(proposedState)
+    const record = createUnitRefinementRecord({
+      unitId: String(i),
+      prompt,
+      previousSnapshot: iState.parsedValue,
+      proposedSnapshot: proposedState.parsedValue,
+      auditBefore: iState.lifecycleAudit || buildStage2ItemAudit(iState),
+      auditAfter,
+      status: 'proposed',
+    })
+    patchItem(i, {
+      ...proposedState,
+      lifecycle: unitAuditHasBlockingIssues(auditAfter)
+        ? UNIT_LIFECYCLE_STATES.NEEDS_REFINEMENT
+        : UNIT_LIFECYCLE_STATES.DRAFT_READY,
+      lifecycleAudit: auditAfter,
+      refinementHistory: [...(iState.refinementHistory || []), record],
+    })
     patchItemRefineUi(i, { busy: false, error: null, open: false, prompt: '' })
   }
 
@@ -833,12 +1004,14 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
 
   const itemCount = parsed?.handoffStructure?.length ?? 0
   const doneCount = Object.values(itemStates).filter(s => s?.status === 'complete' || s?.status === 'partial').length
+  const acceptedCount = Object.values(itemStates).filter(s => s?.lifecycle === UNIT_LIFECYCLE_STATES.ACCEPTED).length
 
   function handoffStatusLabel() {
     if (!parsed) return 'Not started'
     if (itemCount === 0 || doneCount === 0) return 'Structure ready'
-    if (doneCount === itemCount) return 'All items complete'
-    return `${doneCount} / ${itemCount} items complete`
+    if (acceptedCount === itemCount) return 'All items accepted'
+    if (acceptedCount > 0) return `${acceptedCount} / ${itemCount} items accepted`
+    return `${doneCount} / ${itemCount} item drafts ready`
   }
 
   // ── Shared styles ───────────────────────────────────────────────────────────
@@ -1070,6 +1243,9 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                     const iState = itemStates[i] || ITEM_STATE_DEFAULT
                     const isGenItem = iState.status === 'generating'
                     const canGenItem = canGenItemBase && !isGenItem
+                    const lifecycleAudit = iState.lifecycleAudit || buildStage2ItemAudit(iState)
+                    const canAcceptItem = canAcceptUnit(iState, { audit: lifecycleAudit })
+                    const isAcceptedItem = iState.lifecycle === UNIT_LIFECYCLE_STATES.ACCEPTED
 
                     const assembled = iState.assembledFromChildren &&
                       (iState.status === 'complete' || iState.status === 'partial')
@@ -1140,6 +1316,11 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                                 assembled
                               </span>
                             )}
+                            {isAcceptedItem && (
+                              <span style={{ marginLeft: 5, fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4', opacity: .85 }}>
+                                accepted
+                              </span>
+                            )}
                           </div>
                           {(iState.status === 'complete' || iState.status === 'partial') && (
                             <button
@@ -1186,6 +1367,29 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                               </div>
                             )}
                             {renderItemValue(iState.parsedValue.value)}
+
+                            <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                              <button
+                                onClick={() => handleAcceptItem(i)}
+                                disabled={!canAcceptItem}
+                                style={{
+                                  fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                  padding: '2px 7px', borderRadius: 3,
+                                  cursor: canAcceptItem ? 'pointer' : 'not-allowed',
+                                  background: canAcceptItem ? 'rgba(0,229,180,.1)' : 'transparent',
+                                  border: `1px solid ${canAcceptItem ? 'rgba(0,229,180,.3)' : 'var(--border)'}`,
+                                  color: canAcceptItem ? '#00e5b4' : 'var(--muted)',
+                                  opacity: canAcceptItem ? 1 : 0.55,
+                                }}
+                              >
+                                Accept item
+                              </button>
+                              {lifecycleAudit.blocking && (
+                                <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.4 }}>
+                                  Needs refinement before acceptance
+                                </span>
+                              )}
+                            </div>
 
                             {/* UX Fix B — Refine handoff item */}
                             {apiMode === 'ai' && (() => {
@@ -1571,7 +1775,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
 
             {/* 3. Assemble BU handoff */}
             {(() => {
-              const canAssembleBu = !!parsed?.handoffStructure && doneCount > 0
+              const canAssembleBu = !!parsed?.handoffStructure && acceptedCount > 0
               return (
                 <button
                   onClick={handleAssembleBuHandoff}

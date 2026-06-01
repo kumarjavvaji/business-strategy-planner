@@ -28,15 +28,14 @@
  */
 
 import { readArtifactFromIdb, readArtifactAsync, writeArtifact } from './storageRouter'
+import { stage3BuPlanKey, stage3BuPlanLegacyKey } from './stage3BuPlanKeys'
 
 // ── Key helpers ────────────────────────────────────────────────────────────────
 
-function storageSafeName(name) {
-  return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '_')
-}
-
+// Re-export the canonical key under the legacy name so any external callers
+// that imported stage3BuPlanDraftKey from this module keep working.
 export function stage3BuPlanDraftKey(workspaceId, stage1Id, stage2Id, buName) {
-  return `bsp_v1_stage3_bu_plan_${workspaceId}_${stage1Id}_${stage2Id}_${storageSafeName(buName)}`
+  return stage3BuPlanKey(workspaceId, stage1Id, stage2Id, buName)
 }
 
 export function stage4HandoffKey(workspaceId, stage1Id, stage2Id, stage3Id) {
@@ -78,44 +77,63 @@ const REQUIRED_LIFECYCLE_STATUSES = new Set([
  * Returns a structured result; never throws.
  */
 async function loadBuDurableRecord(workspaceId, stage1Id, stage2Id, buName) {
-  const key = stage3BuPlanDraftKey(workspaceId, stage1Id, stage2Id, buName)
-  let record = null
+  const canonicalKey = stage3BuPlanKey(workspaceId, stage1Id, stage2Id, buName)
+  let record    = null
+  let usedKey   = canonicalKey
   let loadError = null
 
   try {
     // readArtifactFromIdb bypasses the in-memory cache so a failed IDB write
     // in the same session cannot produce a false-positive durable read.
-    record = await readArtifactFromIdb(key)
+    record = await readArtifactFromIdb(canonicalKey)
   } catch (e) {
     loadError = e?.message || String(e)
   }
 
+  // Backward-compatible fallback: try the legacy uppercase-preserving key that
+  // Stage 3 used before the shared key helper was introduced.  Only attempted
+  // when the canonical read returned nothing and did not throw.
+  if (!record && !loadError) {
+    const legacyKey = stage3BuPlanLegacyKey(workspaceId, stage1Id, stage2Id, buName)
+    if (legacyKey) {
+      try {
+        const legacyRecord = await readArtifactFromIdb(legacyKey)
+        if (legacyRecord) {
+          record  = legacyRecord
+          usedKey = legacyKey
+        }
+      } catch {
+        // ignore — canonical read already failed to find a record; legacy is best-effort
+      }
+    }
+  }
+
   if (loadError) {
-    return { buName, key, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: `IDB read failed: ${loadError}`, record: null }
+    return { buName, key: canonicalKey, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: `IDB read failed: ${loadError}`, record: null }
   }
   if (!record) {
-    return { buName, key, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: 'No durable Stage 3 record found in storage.', record: null }
+    return { buName, key: canonicalKey, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: 'No durable Stage 3 record found in storage.', record: null }
   }
   if (record.version !== 1) {
-    return { buName, key, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: `Unrecognised record version: ${record.version}`, record: null }
+    return { buName, key: usedKey, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: `Unrecognised record version: ${record.version}`, record: null }
   }
 
   // Require a write timestamp — content without one was never confirmed durable
   const persistTimestamp = record.persistedAt || record.lastSavedAt || null
   if (!persistTimestamp) {
-    return { buName, key, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: 'Record is missing persistedAt/lastSavedAt — durability unconfirmed.', record: null }
+    return { buName, key: usedKey, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: 'Record is missing persistedAt/lastSavedAt — durability unconfirmed.', record: null }
   }
 
   // Require a lifecycle status that indicates at least partial generation
   const lifecycleStatus = record.lifecycle?.status || record.status || null
   if (!REQUIRED_LIFECYCLE_STATUSES.has(lifecycleStatus)) {
-    return { buName, key, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: `Lifecycle status "${lifecycleStatus}" is not ready for handoff.`, record: null }
+    return { buName, key: usedKey, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: `Lifecycle status "${lifecycleStatus}" is not ready for handoff.`, record: null }
   }
 
   // Require at least one completed atom
   const completedAtoms = (record.executionAtoms || []).filter(a => a?.status === 'complete')
   if (!completedAtoms.length) {
-    return { buName, key, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: 'No completed execution atoms in durable record.', record: null }
+    return { buName, key: usedKey, status: BU_HANDOFF_STATUS.BLOCKED, blockedReason: 'No completed execution atoms in durable record.', record: null }
   }
 
   // Partial: plan assembled but some atoms failed or lifecycle is partial_draft
@@ -126,7 +144,8 @@ async function loadBuDurableRecord(workspaceId, stage1Id, stage2Id, buName) {
 
   return {
     buName,
-    key,
+    key: usedKey,
+    legacyKeyFallback: usedKey !== canonicalKey,
     status: isPartial ? BU_HANDOFF_STATUS.PARTIAL : BU_HANDOFF_STATUS.READY,
     blockedReason: null,
     record,
@@ -175,7 +194,40 @@ function loadBuFromSnapshot(buName, contentSnapshot, stage3Id) {
   }
 }
 
+// ── Compile-time helpers ────────────────────────────────────────────────────────
+
+function firstNSentences(text, n) {
+  if (!text || typeof text !== 'string') return null
+  const parts = text.match(/[^.!?]+[.!?]+/g) || [text]
+  return parts.slice(0, n).join(' ').trim() || text.slice(0, 400) || null
+}
+
+function normalizeForDedup(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function dedupStrings(arr) {
+  if (!arr?.length) return []
+  const seen = []
+  const out  = []
+  for (const item of arr) {
+    if (!item || typeof item !== 'string') continue
+    const norm = normalizeForDedup(item)
+    if (!norm) continue
+    const isDup = seen.some(s => {
+      if (s === norm) return true
+      const [sh, lo] = norm.length <= s.length ? [norm, s] : [s, norm]
+      if (sh.length >= 15 && lo.includes(sh)) return true
+      if (norm.length > 40 && s.length > 40 && norm.slice(0, 40) === s.slice(0, 40)) return true
+      return false
+    })
+    if (!isDup) { seen.push(norm); out.push(item) }
+  }
+  return out
+}
+
 // ── Per-BU handoff entry builder ───────────────────────────────────────────────
+
 
 function mapExecutionSections(sections) {
   return (sections || []).map(s => ({
@@ -188,6 +240,14 @@ function mapExecutionSections(sections) {
     risks:              s.risks || [],
     validationSignals:  s.validationReadinessChecks || s.validationSignals || [],
   }))
+}
+
+// Source examples for collapsed display in the renderer.
+function compileSourceExamples(completedAtoms, max) {
+  return (completedAtoms || [])
+    .filter(a => a?.parsedValue && typeof a.parsedValue === 'string' && a.parsedValue.trim().length > 10)
+    .slice(0, max || 3)
+    .map(a => ({ atomId: String(a.id || ''), text: String(a.parsedValue).slice(0, 200) }))
 }
 
 function buildBuHandoffEntry(loaded) {
@@ -212,37 +272,39 @@ function buildBuHandoffEntry(loaded) {
 
   // ── Snapshot-derived entry (full Stage 3 rebuild path) ──────────────────────
   if (loaded.sourceType === BU_SOURCE_TYPE.REVISION_SNAPSHOT) {
-    const plan     = loaded.snapshotPlan
-    const sections = mapExecutionSections(plan.executionSections)
-    const sectionIds = sections.map(s => s.sectionName).filter(Boolean)
+    const plan       = loaded.snapshotPlan
+    const rawSections = mapExecutionSections(plan.executionSections)
+    const sectionIds  = rawSections.map(s => s.sectionName).filter(Boolean)
 
-    const stage4DeliveryImplications = [
+    const stage4DeliveryImplications = dedupStrings([
       ...(plan.stage4DeliveryImplications || []),
-      ...sections.flatMap(s => s.stage4DeliveryImplications || []),
-    ].filter(Boolean)
+      ...rawSections.flatMap(s => s.stage4DeliveryImplications || []),
+    ])
 
     return {
       buName:           loaded.buName,
       status:           loaded.status,
       blockedReason:    null,
       sourcePersistKey: null,
-      sourcePersistAt:  null,         // durability comes from workspace plan blob
+      sourcePersistAt:  null,
       sourceType:       BU_SOURCE_TYPE.REVISION_SNAPSHOT,
       sourceTraceabilityLevel: 'section',
-      sourceAtomIds:    [],           // atoms not available from snapshot path
+      sourceAtomIds:    [],
       sourceSectionIds: sectionIds,
       completedAtomCount: 0,
       totalAtomCount:   0,
-      lifecycleStatus:  'accepted',   // snapshot is only used for accepted revisions
+      lifecycleStatus:  'accepted',
       plan: {
         buName:             plan.buName || loaded.buName,
-        mission:            plan.mission            || null,
-        strategicRole:      plan.strategicRole      || null,
-        priorityOutcomes:   plan.priorityOutcomes   || [],
+        mission:            firstNSentences(plan.mission, 3),
+        strategicRole:      firstNSentences(plan.strategicRole, 3),
+        priorityOutcomes:   dedupStrings(plan.priorityOutcomes || []),
         criticalWorkstreams: plan.criticalWorkstreams || [],
       },
-      executionSections: sections,
+      synthesisSchema:    'source_basis_v1',
+      executionSections:          rawSections,
       stage4DeliveryImplications,
+      sourceAtomExamples: [],
       diagnostics:  null,
       atomSummary:  null,
       source:       'ai',
@@ -257,10 +319,12 @@ function buildBuHandoffEntry(loaded) {
   const completedAtoms = (record.executionAtoms || []).filter(a => a?.status === 'complete')
   const sourceAtomIds  = completedAtoms.map(a => a.id).filter(Boolean)
 
-  const stage4DeliveryImplications = [
+  const rawSections = mapExecutionSections(plan?.executionSections)
+
+  const stage4DeliveryImplications = dedupStrings([
     ...(plan?.stage4DeliveryImplications || []),
     ...(plan?.executionSections || []).flatMap(s => s.stage4DeliveryImplications || []),
-  ].filter(Boolean)
+  ])
 
   return {
     buName:           loaded.buName,
@@ -268,6 +332,7 @@ function buildBuHandoffEntry(loaded) {
     blockedReason:    null,
     sourcePersistKey: loaded.key,
     sourcePersistAt:  loaded.persistTimestamp,
+    legacyKeyFallback: loaded.legacyKeyFallback || false,
     sourceType:       BU_SOURCE_TYPE.IDB_RECORD,
     sourceTraceabilityLevel: 'atom',
     sourceAtomIds,
@@ -275,15 +340,17 @@ function buildBuHandoffEntry(loaded) {
     completedAtomCount: loaded.completedAtomCount,
     totalAtomCount:     loaded.totalAtomCount,
     lifecycleStatus:  record.lifecycle?.status || record.status || null,
+    synthesisSchema:  'source_basis_v1',
     plan: plan ? {
-      buName:             plan.buName,
-      mission:            plan.mission            || null,
-      strategicRole:      plan.strategicRole      || null,
-      priorityOutcomes:   plan.priorityOutcomes   || [],
+      buName:              plan.buName,
+      mission:             firstNSentences(plan.mission, 3),
+      strategicRole:       firstNSentences(plan.strategicRole, 3),
+      priorityOutcomes:    dedupStrings(plan.priorityOutcomes || []),
       criticalWorkstreams: plan.criticalWorkstreams || [],
     } : null,
-    executionSections: mapExecutionSections(plan?.executionSections),
+    executionSections:          rawSections,
     stage4DeliveryImplications,
+    sourceAtomExamples:         compileSourceExamples(completedAtoms, 3),
     diagnostics: record.diagnostics
       ? { inputTokens: record.diagnostics.inputTokens || 0, outputTokens: record.diagnostics.outputTokens || 0 }
       : null,

@@ -20,6 +20,9 @@ import {
   loadArtifactOutput,
   loadAllArtifactOutputs,
   isArtifactOutputStale,
+  saveArtifactReview,
+  REVIEW_STATUS,
+  REVIEW_DIMENSIONS,
 } from '../utils/stage4ArtifactOutput'
 import {
   buildArtifactPrompt,
@@ -141,9 +144,17 @@ function StatusBadge({ status }) {
 
 // ── Per-BU handoff row ─────────────────────────────────────────────────────────
 
+// Current schema version — handoffs compiled with 'source_basis_v1' show the
+// compact source-basis view.  All other values (including 'decision_basis_v1'
+// and undefined) trigger the legacy rebuild notice.
+const SOURCE_BASIS_SCHEMA = 'source_basis_v1'
+
 function BuHandoffRow({ entry }) {
   const [open, setOpen] = useState(false)
-  const isUsable = entry.status !== BU_HANDOFF_STATUS.BLOCKED
+  const isUsable        = entry.status !== BU_HANDOFF_STATUS.BLOCKED
+  // Handoffs compiled before source_basis_v1 carry old synthesized fields
+  // that are no longer part of the universal handoff schema.
+  const isLegacyHandoff = entry.synthesisSchema !== SOURCE_BASIS_SCHEMA
 
   return (
     <div style={{
@@ -189,7 +200,7 @@ function BuHandoffRow({ entry }) {
         <span style={{ fontSize: 9, color: 'var(--muted)', flexShrink: 0 }}>{open ? '▲' : '▼'}</span>
       </div>
 
-      {/* Expanded content — only shown for non-blocked entries */}
+      {/* Expanded content */}
       {open && (
         <div style={{ padding: '12px 14px' }}>
           {entry.status === BU_HANDOFF_STATUS.BLOCKED ? (
@@ -206,79 +217,111 @@ function BuHandoffRow({ entry }) {
                 </div>
               )}
 
-              {/* Plan summary */}
+              {/* Legacy gate — old synthesized fields are not rendered */}
+              {isLegacyHandoff && (
+                <div style={warnBannerStyle}>
+                  <strong>Stale handoff.</strong> Compiled with an earlier schema.
+                  Rebuild the handoff to generate the source-basis view.
+                </div>
+              )}
+
+              {/* Compact source-basis view — only for current schema */}
+              {!isLegacyHandoff && (<>
+
+              {/* BU Thesis */}
               {entry.plan && (
                 <div style={{ marginBottom: 10 }}>
-                  <div style={labelStyle}>BU summary</div>
+                  <div style={labelStyle}>BU Thesis</div>
                   {entry.plan.mission && (
-                    <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', marginBottom: 4, lineHeight: 1.55 }}>
+                    <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', marginBottom: 4, lineHeight: 1.6 }}>
                       <strong>Mission:</strong> {entry.plan.mission}
                     </div>
                   )}
                   {entry.plan.strategicRole && (
-                    <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', marginBottom: 4, lineHeight: 1.55 }}>
+                    <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.6 }}>
                       <strong>Strategic role:</strong> {entry.plan.strategicRole}
                     </div>
                   )}
-                  {entry.plan.priorityOutcomes?.length > 0 && (
-                    <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55 }}>
-                      <strong>Priority outcomes:</strong>
-                      <ul style={{ margin: '3px 0 0 16px', padding: 0 }}>
-                        {entry.plan.priorityOutcomes.map((o, i) => <li key={i}>{o}</li>)}
-                      </ul>
-                    </div>
-                  )}
                 </div>
               )}
 
-              {/* Execution sections */}
-              {entry.executionSections?.length > 0 && (
+              {/* Priority outcomes */}
+              {entry.plan?.priorityOutcomes?.length > 0 && (
                 <div style={{ marginBottom: 10 }}>
-                  <div style={labelStyle}>Execution sections ({entry.executionSections.length})</div>
-                  {entry.executionSections.map((s, i) => (
-                    <div key={i} style={{
-                      marginBottom: 6,
-                      padding: '8px 10px',
-                      background: 'var(--s2)',
-                      borderRadius: 4,
-                      border: '1px solid var(--border)',
-                    }}>
-                      <div style={{ fontSize: 10, fontWeight: 600, marginBottom: 3 }}>{s.sectionName}</div>
-                      {s.objective && (
-                        <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55 }}>
-                          {s.objective}
-                        </div>
-                      )}
-                      {s.decisionsRequired?.length > 0 && (
-                        <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)', marginTop: 3, lineHeight: 1.45 }}>
-                          Decisions required: {s.decisionsRequired.join(' · ')}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Stage 4 delivery implications */}
-              {entry.stage4DeliveryImplications?.length > 0 && (
-                <div style={{ marginBottom: 6 }}>
-                  <div style={labelStyle}>Stage 4 delivery implications</div>
+                  <div style={labelStyle}>Priority outcomes</div>
                   <ul style={{ margin: 0, paddingLeft: 16 }}>
-                    {entry.stage4DeliveryImplications.map((impl, i) => (
-                      <li key={i} style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55 }}>
-                        {impl}
-                      </li>
+                    {entry.plan.priorityOutcomes.map((o, i) => (
+                      <li key={i} style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 3 }}>{o}</li>
                     ))}
                   </ul>
                 </div>
               )}
 
-              {/* Source atom IDs — for audit */}
-              {entry.sourceAtomIds?.length > 0 && (
-                <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginTop: 6 }}>
-                  Source atom IDs: {entry.sourceAtomIds.length} · key: {entry.sourcePersistKey}
+              {/* Execution sections — name + objective only */}
+              {entry.executionSections?.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={labelStyle}>Execution sections ({entry.executionSections.length})</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {entry.executionSections.map((s, i) => (
+                      <div key={i} style={{ padding: '6px 10px', background: 'var(--s2)', borderRadius: 4, border: '1px solid var(--border)' }}>
+                        <div style={{ fontSize: 10, fontWeight: 600 }}>{s.sectionName}</div>
+                        {s.objective && (
+                          <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.5, marginTop: 2 }}>
+                            {s.objective}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
+
+              {/* Stage 4 delivery implications */}
+              {entry.stage4DeliveryImplications?.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={labelStyle}>Stage 4 delivery implications</div>
+                  <ul style={{ margin: 0, paddingLeft: 16 }}>
+                    {entry.stage4DeliveryImplications.map((impl, i) => (
+                      <li key={i} style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55, marginBottom: 2 }}>{impl}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* ── End of source-basis sections ── */}
+              </>)}
+
+              {/* Source atom examples — collapsed, always available */}
+              {Array.isArray(entry.sourceAtomExamples) && entry.sourceAtomExamples.length > 0 && (
+                <div style={{ marginBottom: 6 }}>
+                  <details>
+                    <summary style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', cursor: 'pointer', userSelect: 'none' }}>
+                      Source atom examples ({entry.sourceAtomExamples.length})
+                    </summary>
+                    <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                      {entry.sourceAtomExamples.map((ex, i) => (
+                        <div key={i} style={{ padding: '5px 8px', background: 'var(--s2)', borderRadius: 3, border: '1px solid var(--border)' }}>
+                          <div style={{ fontSize: 7, fontFamily: fm, color: 'var(--muted)', marginBottom: 2 }}>{ex.atomId}</div>
+                          <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.5 }}>{ex.text}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                </div>
+              )}
+
+              {/* Traceability footer */}
+              <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginTop: 6, lineHeight: 1.5 }}>
+                {entry.sourceAtomIds?.length > 0 && (
+                  <span>{entry.sourceAtomIds.length} source atom{entry.sourceAtomIds.length !== 1 ? 's' : ''}</span>
+                )}
+                {entry.sourceSectionIds?.length > 0 && (
+                  <span>{entry.sourceSectionIds.length} source section{entry.sourceSectionIds.length !== 1 ? 's' : ''}</span>
+                )}
+                {entry.sourcePersistKey && (
+                  <span> · key: {entry.sourcePersistKey}{entry.legacyKeyFallback ? ' (legacy key)' : ''}</span>
+                )}
+              </div>
             </>
           )}
         </div>
@@ -309,10 +352,32 @@ function ReadinessBadge({ status }) {
   )
 }
 
+const REVIEW_STATUS_CFG = {
+  [REVIEW_STATUS.NOT_REVIEWED]:   { color: 'var(--muted)',  label: 'Not reviewed' },
+  [REVIEW_STATUS.NEEDS_REVISION]: { color: '#fbbf24',       label: 'Needs revision' },
+  [REVIEW_STATUS.USABLE]:         { color: '#00e5b4',       label: 'Usable' },
+  [REVIEW_STATUS.STRONG]:         { color: '#60a5fa',       label: 'Strong' },
+}
+
+function ReviewBadge({ status }) {
+  const cfg = REVIEW_STATUS_CFG[status] || REVIEW_STATUS_CFG[REVIEW_STATUS.NOT_REVIEWED]
+  return (
+    <span style={{
+      fontSize: 8, fontFamily: fm, fontWeight: 600, letterSpacing: '.04em',
+      color: cfg.color, background: `${cfg.color}18`,
+      border: `1px solid ${cfg.color}44`,
+      borderRadius: 4, padding: '2px 7px',
+    }}>
+      {cfg.label.toUpperCase()}
+    </span>
+  )
+}
+
 function ArtifactCard({
   artifact, selected, onToggle, editing,
   genPhase = null, genError = null, genFailureType = null,
   hasOutput = false, isOutputStale = false,
+  reviewStatus = null,
   onGenerate = null, apiMode = 'mock',
 }) {
   const isBlocked      = artifact.readinessStatus === ARTIFACT_READINESS.BLOCKED
@@ -354,6 +419,10 @@ function ArtifactCard({
             <span style={{ fontSize: 8, fontFamily: fm, fontWeight: 600, color: isOutputStale ? '#fbbf24' : '#00e5b4' }}>
               {isOutputStale ? '⚠ Stale' : '✓ Generated'}
             </span>
+          )}
+          {/* Review status badge */}
+          {!editing && hasOutput && reviewStatus && reviewStatus !== REVIEW_STATUS.NOT_REVIEWED && (
+            <ReviewBadge status={reviewStatus} />
           )}
         </div>
 
@@ -543,9 +612,163 @@ function ArtifactOutputViewer({ output, isStale }) {
         </div>
       )}
       <CollapsibleList label="Source atom IDs" items={output.sourceAtomIds} />
-      {/* Review notes placeholder */}
-      <div style={{ marginTop: 6, fontSize: 8, fontFamily: fm, color: 'var(--muted)', lineHeight: 1.4 }}>
-        Review notes: <em>{output.reviewNotes || '(none yet)'}</em>
+    </div>
+  )
+}
+
+function ArtifactQualityReview({ output, onSave, saving }) {
+  const [status, setStatus]   = useState(output.reviewStatus || REVIEW_STATUS.NOT_REVIEWED)
+  const [dims, setDims]       = useState(output.reviewDimensions || {})
+  const [notes, setNotes]     = useState(output.improvementNotes || '')
+  const [saveErr, setSaveErr] = useState(null)
+  const [saved, setSaved]     = useState(false)
+
+  // Sync local state when the persisted record updates after a save
+  useEffect(() => {
+    setStatus(output.reviewStatus || REVIEW_STATUS.NOT_REVIEWED)
+    setDims(output.reviewDimensions || {})
+    setNotes(output.improvementNotes || '')
+    setSaved(false)
+  }, [output.reviewUpdatedAt])
+
+  async function handleSave(overrideStatus) {
+    setSaveErr(null)
+    setSaved(false)
+    const effectiveStatus = overrideStatus ?? status
+    // Keep local status in sync when using quick-action buttons
+    if (overrideStatus) setStatus(overrideStatus)
+    const result = await onSave(output, {
+      reviewStatus:     effectiveStatus,
+      reviewDimensions: dims,
+      improvementNotes: notes,
+    })
+    if (result?.ok) {
+      setSaved(true)
+    } else {
+      setSaveErr('Save failed. Retry.')
+    }
+  }
+
+  return (
+    <div style={{
+      borderLeft: '2px solid rgba(59,130,246,.15)',
+      marginLeft: 4, marginTop: 0, marginBottom: 4,
+      paddingLeft: 12, paddingTop: 8, paddingBottom: 2,
+    }}>
+      <div style={{ ...labelStyle, marginBottom: 8 }}>Quality Review</div>
+
+      {/* Status selector */}
+      <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 10, alignItems: 'center' }}>
+        <span style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)', marginRight: 2 }}>Status:</span>
+        {Object.entries(REVIEW_STATUS_CFG).map(([val, cfg]) => (
+          <button
+            key={val}
+            onClick={() => setStatus(val)}
+            style={{
+              fontSize: 8, fontFamily: fm, fontWeight: 600, padding: '3px 10px',
+              borderRadius: 4, cursor: 'pointer',
+              background: status === val ? `${cfg.color}22` : 'var(--s2)',
+              border: `1px solid ${status === val ? cfg.color : 'var(--border)'}`,
+              color: status === val ? cfg.color : 'var(--muted)',
+            }}
+          >
+            {cfg.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Dimension ratings */}
+      <div style={{ marginBottom: 10 }}>
+        {REVIEW_DIMENSIONS.map(dim => (
+          <div key={dim.key} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <span style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', width: 200, flexShrink: 0, lineHeight: 1.3 }}>
+              {dim.label}
+            </span>
+            <div style={{ display: 'flex', gap: 3 }}>
+              {[1, 2, 3, 4, 5].map(n => (
+                <button
+                  key={n}
+                  onClick={() => setDims(prev => ({ ...prev, [dim.key]: n }))}
+                  style={{
+                    width: 22, height: 22, borderRadius: 3, cursor: 'pointer',
+                    fontSize: 8, fontFamily: fm, fontWeight: 600,
+                    background: (dims[dim.key] || 0) >= n ? 'rgba(59,130,246,.2)' : 'var(--s2)',
+                    border: `1px solid ${(dims[dim.key] || 0) >= n ? 'rgba(59,130,246,.5)' : 'var(--border)'}`,
+                    color: (dims[dim.key] || 0) >= n ? '#60a5fa' : 'var(--muted)',
+                  }}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
+            {dims[dim.key] != null && (
+              <button
+                onClick={() => setDims(prev => { const next = { ...prev }; delete next[dim.key]; return next })}
+                style={{ fontSize: 7, fontFamily: fm, color: 'var(--muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Improvement notes */}
+      <textarea
+        value={notes}
+        onChange={e => setNotes(e.target.value)}
+        placeholder="Improvement notes…"
+        rows={3}
+        style={{
+          width: '100%', boxSizing: 'border-box',
+          fontSize: 9, fontFamily: fm, color: 'var(--muted2)',
+          background: 'var(--s2)', border: '1px solid var(--border)',
+          borderRadius: 4, padding: '6px 8px', resize: 'vertical',
+          lineHeight: 1.55, marginBottom: 8,
+        }}
+      />
+
+      {/* Feedback */}
+      {saveErr && (
+        <div style={{ fontSize: 8, fontFamily: fm, color: '#f87171', marginBottom: 6 }}>{saveErr}</div>
+      )}
+      {saved && !saveErr && (
+        <div style={{ fontSize: 8, fontFamily: fm, color: '#00e5b4', marginBottom: 6 }}>✓ Review saved</div>
+      )}
+
+      {/* Action row */}
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
+        <button
+          onClick={() => handleSave()}
+          disabled={saving}
+          style={{ ...btnSecondary, fontSize: 9, opacity: saving ? 0.6 : 1 }}
+        >
+          Save review
+        </button>
+        <button
+          onClick={() => handleSave(REVIEW_STATUS.USABLE)}
+          disabled={saving}
+          style={{
+            fontSize: 9, fontFamily: fm, fontWeight: 600, padding: '5px 12px',
+            borderRadius: 4, cursor: 'pointer',
+            background: 'rgba(0,229,180,.08)', border: '1px solid rgba(0,229,180,.3)', color: '#00e5b4',
+            opacity: saving ? 0.6 : 1,
+          }}
+        >
+          Mark usable
+        </button>
+        <button
+          onClick={() => handleSave(REVIEW_STATUS.NEEDS_REVISION)}
+          disabled={saving}
+          style={{
+            fontSize: 9, fontFamily: fm, fontWeight: 600, padding: '5px 12px',
+            borderRadius: 4, cursor: 'pointer',
+            background: 'rgba(251,191,36,.07)', border: '1px solid rgba(251,191,36,.28)', color: '#fbbf24',
+            opacity: saving ? 0.6 : 1,
+          }}
+        >
+          Needs revision
+        </button>
       </div>
     </div>
   )
@@ -583,9 +806,10 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
   const savingRef                     = useRef(false)
 
   // Artifact generation state
-  const [outputs, setOutputs]   = useState({})   // { artifactId: verifiedOutputRecord }
-  const [genState, setGenState] = useState({})   // { artifactId: { phase, error, failureType } }
-  const generatingRef           = useRef(new Set())
+  const [outputs, setOutputs]       = useState({})   // { artifactId: verifiedOutputRecord }
+  const [genState, setGenState]     = useState({})   // { artifactId: { phase, error, failureType } }
+  const [reviewSaving, setReviewSaving] = useState(new Set()) // artifactIds whose review is being saved
+  const generatingRef               = useRef(new Set())
 
   // Load existing outputs whenever the plan becomes ready
   useEffect(() => {
@@ -667,6 +891,23 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       setGenState(prev => ({ ...prev, [id]: { phase: 'failed', error: err.message || String(err), failureType } }))
     } finally {
       generatingRef.current.delete(id)
+    }
+  }
+
+  async function handleReviewSave(currentOutput, reviewData) {
+    const id = currentOutput.artifactId
+    setReviewSaving(prev => new Set([...prev, id]))
+    try {
+      const result = await saveArtifactReview(
+        currentOutput, reviewData,
+        workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId,
+      )
+      if (result.ok) {
+        setOutputs(prev => ({ ...prev, [id]: result.record }))
+      }
+      return result
+    } finally {
+      setReviewSaving(prev => { const next = new Set(prev); next.delete(id); return next })
     }
   }
 
@@ -966,11 +1207,19 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
                     genFailureType={gs.failureType}
                     hasOutput={!!output}
                     isOutputStale={isStale}
+                    reviewStatus={output?.reviewStatus ?? REVIEW_STATUS.NOT_REVIEWED}
                     onGenerate={!editing ? handleGenerate : null}
                     apiMode={apiMode}
                   />
                   {!editing && output && (
-                    <ArtifactOutputViewer output={output} isStale={isStale} />
+                    <>
+                      <ArtifactOutputViewer output={output} isStale={isStale} />
+                      <ArtifactQualityReview
+                        output={output}
+                        onSave={handleReviewSave}
+                        saving={reviewSaving.has(a.artifactId)}
+                      />
+                    </>
                   )}
                 </div>
               )

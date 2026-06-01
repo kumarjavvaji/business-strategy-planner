@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { stage3BuPlanKey, stage3BuPlanLegacyKey } from './stage3BuPlanKeys'
 
 // ── localStorage shim ──────────────────────────────────────────────────────────
 function makeLocalStorageShim() {
@@ -59,9 +60,14 @@ vi.mock('./idbStorage', () => ({
 }))
 
 // ── Key helpers ────────────────────────────────────────────────────────────────
+// stage3Key delegates to the shared canonical helper — the single source of truth.
 function stage3Key(workspaceId, stage1Id, stage2Id, buName) {
-  const safe = buName.toLowerCase().replace(/[^a-z0-9]/g, '_')
-  return `bsp_v1_stage3_bu_plan_${workspaceId}_${stage1Id}_${stage2Id}_${safe}`
+  return stage3BuPlanKey(workspaceId, stage1Id, stage2Id, buName)
+}
+
+// stage3LegacyKey produces the old uppercase-preserving key for backward-compat tests.
+function stage3LegacyKey(workspaceId, stage1Id, stage2Id, buName) {
+  return stage3BuPlanLegacyKey(workspaceId, stage1Id, stage2Id, buName)
 }
 
 function stage4Key(workspaceId, stage1Id, stage2Id, stage3Id) {
@@ -621,6 +627,47 @@ describe('stage4Handoff — compiler reads only from IDB', () => {
     expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
   })
 
+  // ── Legacy key fallback tests ────────────────────────────────────────────────
+  // These cover the backward-compat path: records written by the old Stage 3
+  // storageSafeName (uppercase-preserving) must still be found by Stage 4.
+
+  it('legacy key fallback: BU with uppercase name found when only legacy key is in IDB', async () => {
+    // Seed a record under the old uppercase-preserving key (e.g. "Sales" → "Sales")
+    const legacyKey = stage3LegacyKey(WID, S1, S2, 'Sales')
+    expect(legacyKey).not.toBeNull()  // 'Sales' differs from 'sales' — fallback key exists
+    _idbStore.set(legacyKey, makeStage3Draft('Sales'))
+    ls.setItem(legacyKey, JSON.stringify({ _idbRef: true, store: 'stage3_bu_plans', idbKey: legacyKey }))
+    await storageRouter.initStorageCache()
+
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+    const result = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Sales'] })
+
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
+    expect(result.buHandoffs[0].sourcePersistKey).toBe(legacyKey)
+  })
+
+  it('legacy key fallback: canonical key wins when both canonical and legacy exist', async () => {
+    // Seed canonical (newer write) — should always win over legacy
+    await seedStage3('Sales')
+    const legacyKey = stage3LegacyKey(WID, S1, S2, 'Sales')
+    if (legacyKey) {
+      _idbStore.set(legacyKey, makeStage3Draft('Sales', { persistedAt: '2020-01-01T00:00:00.000Z' }))
+    }
+
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+    const result = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Sales'] })
+
+    expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.READY)
+    // Key used should be the canonical (lowercase) one, not the legacy one
+    expect(result.buHandoffs[0].sourcePersistKey).toBe(stage3Key(WID, S1, S2, 'Sales'))
+  })
+
+  it('legacy key fallback not needed for lowercase-only BU names', async () => {
+    // 'ops' is already all-lowercase — legacy key would be identical, no fallback
+    const legacyKey = stage3LegacyKey(WID, S1, S2, 'ops')
+    expect(legacyKey).toBeNull()
+  })
+
   // ── Snapshot fallback tests (full Stage 3 rebuild path) ──────────────────────
 
   function makeStage3Revision(stage3Id, stage1Id, stage2Id, buNames) {
@@ -736,6 +783,52 @@ describe('stage4Handoff — compiler reads only from IDB', () => {
       stage3ActiveRevision: wrongRevision,
     })
     expect(result.buHandoffs[0].status).toBe(BU_HANDOFF_STATUS.BLOCKED)
+  })
+
+  // ── Decision-basis synthesis schema assertion ─────────────────────────────
+  // A READY BU compiled with the current synthesis must carry synthesisSchema
+  // and expose canonical (non-raw) fields for default-view rendering.
+  // Raw atom text must only appear under sourceItems / sourceAtomExamples.
+
+  it('READY IDB-sourced BU carries source_basis_v1 schema and universal artifact fields', async () => {
+    await seedStage3('Engineering')
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+
+    const result = await compileStage4Handoff({ workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'] })
+    const entry = result.buHandoffs[0]
+
+    expect(entry.status).toBe(BU_HANDOFF_STATUS.READY)
+    // synthesisSchema marks the source-basis schema version
+    expect(entry.synthesisSchema).toBe('source_basis_v1')
+    // Fields that artifact generators use must all be present
+    expect(typeof entry.plan.mission).toBe('string')
+    expect(typeof entry.plan.strategicRole).toBe('string')
+    expect(Array.isArray(entry.plan.priorityOutcomes)).toBe(true)
+    expect(Array.isArray(entry.plan.criticalWorkstreams)).toBe(true)
+    expect(Array.isArray(entry.executionSections)).toBe(true)
+    expect(entry.executionSections.length).toBeGreaterThan(0)
+    expect(typeof entry.executionSections[0].sectionName).toBe('string')
+    // Removed synthesized fields must NOT be present on universal handoff
+    expect(entry.focusAreas).toBeUndefined()
+    expect(entry.keyDecisions).toBeUndefined()
+    expect(entry.executionControls).toBeUndefined()
+    expect(entry.openRisks).toBeUndefined()
+  })
+
+  it('READY snapshot-sourced BU carries source_basis_v1 schema and executionSections', async () => {
+    await storageRouter.initStorageCache()
+    const { compileStage4Handoff, BU_HANDOFF_STATUS } = await getHandoffModule()
+    const revision = makeStage3Revision(S3, S1, S2, ['Engineering'])
+    const result = await compileStage4Handoff({
+      workspaceId: WID, stage1Id: S1, stage2Id: S2, stage3Id: S3, buNames: ['Engineering'],
+      stage3ActiveRevision: revision,
+    })
+    const entry = result.buHandoffs[0]
+    expect(entry.status).toBe(BU_HANDOFF_STATUS.READY)
+    expect(entry.synthesisSchema).toBe('source_basis_v1')
+    expect(Array.isArray(entry.executionSections)).toBe(true)
+    expect(entry.focusAreas).toBeUndefined()
+    expect(entry.keyDecisions).toBeUndefined()
   })
 })
 
