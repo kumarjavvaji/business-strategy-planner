@@ -23,6 +23,7 @@ import {
   transitionToFailed,
 } from './stage3PanelLifecycle'
 import { unitAuditHasBlockingIssues } from './unitLifecycle'
+import { auditPanelStrength, strengthAuditBlocks } from './stage3PanelStrengthAudit'
 
 // ── Panel registry ────────────────────────────────────────────────────────────
 
@@ -73,6 +74,544 @@ export const REFINEMENT_STATUSES = {
   ACCEPTED: 'accepted',
   REJECTED: 'rejected',
   FAILED:   'failed',
+}
+
+// ── Execution Sequence → Stage 4 deliverable mapping ─────────────────────────
+
+/**
+ * Canonical list of Stage 4 deliverable types used in Execution Sequence phase mapping.
+ * Mirrors artifact types in stage4ArtifactPlan.js — kept here to avoid a Stage 3 → Stage 4
+ * import dependency.  Update both lists if artifact types change.
+ */
+export const STAGE4_DELIVERABLES = [
+  { id: 'executive_decision_brief',            label: 'Executive Decision Brief',            intent: 'Frames the strategic decision, recommendation, tradeoffs, evidence, and unresolved risks for leadership review.' },
+  { id: 'bu_execution_plan',                   label: 'BU Execution Plan',                   intent: 'Turns the selected execution path into phase-level work, owners, gates, dependencies, and operating actions.' },
+  { id: 'global_sme_review_packet',            label: 'SME Review Packet',                   intent: 'Packages the assumptions, evidence, risks, and validation questions that require SME review or challenge.' },
+  { id: 'cross_bu_dependency_map',             label: 'Cross-BU Dependency Map',             intent: 'Shows which other business units, owners, inputs, and sequencing dependencies affect execution.' },
+  { id: 'risk_control_plan',                   label: 'Risk and Control Plan',               intent: 'Converts failure modes into controls, mitigations, early warnings, and evidence that risk is reduced.' },
+  { id: 'operating_cadence_plan',              label: 'Operating Cadence Plan',              intent: 'Defines recurring checkpoints, decision forums, escalation paths, and review rhythm.' },
+  { id: 'pdlc_epic_outline',                   label: 'PDLC Epic Outline',                   intent: 'Translates execution strategy into product-delivery epics, scope boundaries, dependencies, and sequencing.' },
+  { id: 'acceptance_criteria_draft',           label: 'Acceptance Criteria Draft',           intent: 'Turns validation needs into testable acceptance criteria for product, engineering, compliance, and delivery review.' },
+  { id: 'implementation_governance_checklist', label: 'Implementation Governance Checklist', intent: 'Defines the controls, approvals, gates, and documentation required before implementation can proceed.' },
+  { id: 'dependency_risk_brief',               label: 'Dependency and Risk Brief',           intent: 'Summarizes the most important dependencies, risks, consequences, and mitigation actions for planning discussion.' },
+  { id: 'bu_execution_plan_partial',           label: 'BU Execution Plan Partial',           intent: 'Creates a partial execution plan when only some phases or tactics are mapped.' },
+]
+
+export const MAPPING_STATUS = {
+  UNMAPPED:       'unmapped',
+  SUGGESTED:      'suggested',
+  USER_CONFIRMED: 'user_confirmed',
+  PARTIAL:        'partial',
+}
+
+/**
+ * Fuzzy-match rules: phase name pattern → suggested deliverable IDs.
+ * Ordered — first match wins.
+ */
+const PHASE_DELIVERABLE_DEFAULTS = [
+  { match: /problem.*outcome|outcome.*valid/i,         ids: ['executive_decision_brief', 'global_sme_review_packet'] },
+  { match: /solution.*path|solution.*eval/i,           ids: ['executive_decision_brief', 'bu_execution_plan', 'dependency_risk_brief'] },
+  { match: /architect|delivery.*readiness|readiness/i, ids: ['bu_execution_plan', 'pdlc_epic_outline', 'implementation_governance_checklist', 'acceptance_criteria_draft'] },
+  { match: /pilot|controlled.*exec/i,                  ids: ['bu_execution_plan', 'risk_control_plan', 'acceptance_criteria_draft', 'global_sme_review_packet'] },
+  { match: /scale|rollout|scale.*decision/i,           ids: ['executive_decision_brief', 'operating_cadence_plan', 'dependency_risk_brief'] },
+]
+
+/** Stable phase identifier from a phase name (lowercase slug). */
+export function phaseSlug(phaseName) {
+  return String(phaseName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'phase'
+}
+
+/** Return suggested deliverable IDs for a given phase name. */
+export function suggestPhaseDeliverables(phaseName) {
+  const name = String(phaseName || '')
+  for (const { match, ids } of PHASE_DELIVERABLE_DEFAULTS) {
+    if (match.test(name)) return ids
+  }
+  return []
+}
+
+/** Stable option identifier from a how-option name (lowercase slug). */
+export function optionSlug(optionName) {
+  return String(optionName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'option'
+}
+
+/**
+ * Per-how-option suggested deliverable defaults.
+ * Outer key: phaseId (phaseSlug of the phase name).
+ * Inner key: optionId (optionSlug of the option name).
+ * These are defaults only — users can override them.
+ */
+const HOW_OPTION_DELIVERABLE_DEFAULTS = {
+  problem_outcome_validation: {
+    regulatory_gap_mapping_workshop:             ['executive_decision_brief', 'global_sme_review_packet'],
+    examination_finding_audit_trail_review:      ['global_sme_review_packet', 'risk_control_plan'],
+    peer_institution_benchmarking:               ['executive_decision_brief', 'global_sme_review_packet'],
+    contract_engineer_scope_incident_log_review: ['bu_execution_plan', 'implementation_governance_checklist'],
+  },
+  solution_path_evaluation: {
+    rfi_rfp_competitive_solicitation:                     ['executive_decision_brief', 'dependency_risk_brief'],
+    architectural_spike_with_proof_of_concept_prototype:  ['bu_execution_plan', 'pdlc_epic_outline', 'acceptance_criteria_draft'],
+    regulatory_precedent_benchmarking:                    ['executive_decision_brief', 'global_sme_review_packet'],
+    contract_engineer_scope_simulation:                   ['bu_execution_plan', 'implementation_governance_checklist', 'risk_control_plan'],
+  },
+  architecture_delivery_readiness: {
+    threat_modeled_architecture_review:    ['risk_control_plan', 'implementation_governance_checklist'],
+    contract_engineer_scope_simulation:    ['bu_execution_plan', 'operating_cadence_plan'],
+    regulatory_pre_review_walkthrough:     ['global_sme_review_packet', 'acceptance_criteria_draft'],
+    integration_dependency_freeze_audit:   ['cross_bu_dependency_map', 'dependency_risk_brief'],
+  },
+  pilot_controlled_execution: {
+    shadow_mode_parallel_run:                            ['acceptance_criteria_draft', 'global_sme_review_packet', 'bu_execution_plan'],
+    regulatory_sandbox_pilot_with_examiner_observer:     ['global_sme_review_packet', 'risk_control_plan', 'executive_decision_brief'],
+    tiered_alert_complexity_stress_test:                 ['acceptance_criteria_draft', 'risk_control_plan'],
+    contract_engineer_scope_gate_checkpoints:            ['implementation_governance_checklist', 'operating_cadence_plan', 'bu_execution_plan'],
+  },
+}
+
+/** Return suggested deliverable IDs for a given how-option within a phase. */
+export function suggestHowOptionDeliverables(phaseId, optionName) {
+  return HOW_OPTION_DELIVERABLE_DEFAULTS[String(phaseId || '')]?.[optionSlug(optionName)] || []
+}
+
+/**
+ * Derive the phase-level mapped deliverables as the union of all how-option selections.
+ * Used to compute phaseMappedDeliverables and the backward-compat mappedDeliverables alias.
+ */
+export function derivePhaseMappedDeliverables(howOptionMappings) {
+  if (!howOptionMappings || typeof howOptionMappings !== 'object') return []
+  const all = new Set()
+  Object.values(howOptionMappings).forEach(m => {
+    ;(m?.mappedDeliverables || []).forEach(d => all.add(d))
+  })
+  return Array.from(all)
+}
+
+export function getMappedDeliverableIds(panel) {
+  const ids = new Set()
+  Object.values(panel?.executionDeliverableMappings || {}).forEach(mapping => {
+    const howOptionMappings = mapping?.howOptionMappings || {}
+    Object.values(howOptionMappings).forEach(optMapping => {
+      ;(optMapping?.mappedDeliverables || []).forEach(did => ids.add(did))
+    })
+    if (Object.keys(howOptionMappings).length === 0) {
+      ;(mapping?.phaseMappedDeliverables || mapping?.mappedDeliverables || []).forEach(did => ids.add(did))
+    }
+  })
+  return Array.from(ids)
+}
+
+export function getDeliverableMappingSummary(panel, deliverableId) {
+  const content = Array.isArray(panel?.content) ? panel.content : []
+  const mappings = panel?.executionDeliverableMappings || {}
+  const selectedPhases = []
+  let selectedHowOptionCount = 0
+  let unmappedPhaseCount = 0
+
+  content.forEach(phase => {
+    const phaseId = phaseSlug(phase?.phaseName)
+    const mapping = mappings?.[phaseId] || {}
+    const howOptions = Array.isArray(phase?.howOptions) ? phase.howOptions : []
+    let selectedInPhase = 0
+
+    if (howOptions.length > 0) {
+      howOptions.forEach(opt => {
+        const optId = optionSlug(opt?.optionName)
+        const selected = mapping?.howOptionMappings?.[optId]?.mappedDeliverables || []
+        if (selected.includes(deliverableId)) selectedInPhase += 1
+      })
+    } else {
+      const selected = mapping?.phaseMappedDeliverables || mapping?.mappedDeliverables || []
+      if (selected.includes(deliverableId)) selectedInPhase = 1
+    }
+
+    selectedHowOptionCount += selectedInPhase
+    if (selectedInPhase > 0) {
+      selectedPhases.push(phase?.phaseName || 'Phase')
+    } else {
+      unmappedPhaseCount += 1
+    }
+  })
+
+  return {
+    deliverableId,
+    selectedHowOptionCount,
+    selectedPhaseCount: selectedPhases.length,
+    totalPhaseCount: content.length,
+    unmappedPhaseCount,
+    selectedPhases,
+  }
+}
+
+export function computeDeliverableMappingReadiness(panel, intendedDeliverableIds = null) {
+  const intendedIds = Array.isArray(intendedDeliverableIds)
+    ? intendedDeliverableIds
+    : getMappedDeliverableIds(panel)
+  const unmappedDeliverables = intendedIds.filter(did =>
+    getDeliverableMappingSummary(panel, did).selectedHowOptionCount === 0
+  )
+
+  return {
+    mappingReady: unmappedDeliverables.length === 0,
+    intendedDeliverableIds: intendedIds,
+    unmappedDeliverables,
+  }
+}
+
+export function getSelectedStage4Deliverables(panel) {
+  const hasExplicitSelection = Array.isArray(panel?.selectedStage4Deliverables)
+  const existing = hasExplicitSelection ? panel.selectedStage4Deliverables : []
+  const ids = hasExplicitSelection
+    ? existing.map(record => record?.deliverableType).filter(Boolean)
+    : getMappedDeliverableIds(panel)
+  const now = new Date().toISOString()
+
+  return ids.map(deliverableType => {
+    const prior = existing.find(record => record?.deliverableType === deliverableType) || {}
+    const count = getDeliverableMappingSummary(panel, deliverableType).selectedHowOptionCount
+    return {
+      deliverableType,
+      status: count > 0 ? 'mapped' : 'incomplete',
+      selectedAt: prior.selectedAt || now,
+      updatedAt: prior.updatedAt || now,
+    }
+  })
+}
+
+function withSelectedStage4DeliverableStatuses(execPanel, selectedRecords = execPanel?.selectedStage4Deliverables) {
+  const base = {
+    ...execPanel,
+    selectedStage4Deliverables: Array.isArray(selectedRecords) ? selectedRecords : [],
+  }
+  return {
+    ...base,
+    selectedStage4Deliverables: getSelectedStage4Deliverables(base),
+  }
+}
+
+/** Derive phase-level mapping status from how-option statuses. */
+function derivePhaseStatus(howOptionMappings) {
+  const entries = Object.values(howOptionMappings || {})
+  if (entries.length === 0) return MAPPING_STATUS.UNMAPPED
+  const confirmed = entries.filter(m => m?.mappingStatus === MAPPING_STATUS.USER_CONFIRMED).length
+  const suggested = entries.filter(m => m?.mappingStatus === MAPPING_STATUS.SUGGESTED).length
+  if (confirmed === entries.length)  return MAPPING_STATUS.USER_CONFIRMED
+  if (confirmed > 0)                 return MAPPING_STATUS.PARTIAL
+  if (suggested > 0)                 return MAPPING_STATUS.SUGGESTED
+  return MAPPING_STATUS.UNMAPPED
+}
+
+/**
+ * Build initial executionDeliverableMappings from an executionSequence content array.
+ * For phases with howOptions, creates per-how-option mappings with suggested defaults.
+ * For phases without howOptions (legacy/empty), falls back to phase-level suggestion.
+ */
+export function buildInitialPhaseMappings(phaseArray) {
+  if (!Array.isArray(phaseArray) || phaseArray.length === 0) return {}
+  const now = new Date().toISOString()
+  const mappings = {}
+  phaseArray.forEach(phase => {
+    const phaseName  = phase?.phaseName || ''
+    const id         = phaseSlug(phaseName)
+    const howOptions = Array.isArray(phase?.howOptions) ? phase.howOptions : []
+
+    if (howOptions.length > 0) {
+      const howOptionMappings = {}
+      howOptions.forEach(opt => {
+        const optName   = opt?.optionName || ''
+        const optId     = optionSlug(optName)
+        const suggested = suggestHowOptionDeliverables(id, optName)
+        howOptionMappings[optId] = {
+          optionName:            optName,
+          mappedDeliverables:    suggested,
+          suggestedDeliverables: suggested,
+          mappingStatus:         suggested.length > 0 ? MAPPING_STATUS.SUGGESTED : MAPPING_STATUS.UNMAPPED,
+          updatedAt:             now,
+        }
+      })
+      const phaseMapped = derivePhaseMappedDeliverables(howOptionMappings)
+      const phaseStatus = derivePhaseStatus(howOptionMappings)
+      mappings[id] = {
+        phaseName,
+        phaseMappedDeliverables: phaseMapped,
+        mappedDeliverables:      phaseMapped,
+        suggestedDeliverables:   phaseMapped,
+        mappingStatus:           phaseStatus,
+        howOptionMappings,
+        updatedAt:               now,
+      }
+    } else {
+      // No how-options: use phase-level suggestion (legacy / empty howOptions)
+      const suggested = suggestPhaseDeliverables(phaseName)
+      mappings[id] = {
+        phaseName,
+        phaseMappedDeliverables: suggested,
+        mappedDeliverables:      suggested,
+        suggestedDeliverables:   suggested,
+        mappingStatus:           suggested.length > 0 ? MAPPING_STATUS.SUGGESTED : MAPPING_STATUS.UNMAPPED,
+        howOptionMappings:       {},
+        updatedAt:               now,
+      }
+    }
+  })
+  return mappings
+}
+
+/**
+ * Merge existing mappings with a newly generated phase array.
+ * For phases with howOptions, preserves user_confirmed how-option mappings and rebuilds the rest.
+ * Migrates legacy phase-level-only records to the new how-option shape (marks them "suggested").
+ * For phases without howOptions, falls back to legacy phase-level behavior.
+ */
+export function mergePhasesMappings(existingMappings, newPhaseArray) {
+  if (!Array.isArray(newPhaseArray) || newPhaseArray.length === 0) return {}
+  const now = new Date().toISOString()
+  const merged = {}
+  newPhaseArray.forEach(phase => {
+    const phaseName  = phase?.phaseName || ''
+    const id         = phaseSlug(phaseName)
+    const existing   = existingMappings?.[id]
+    const howOptions = Array.isArray(phase?.howOptions) ? phase.howOptions : []
+
+    if (howOptions.length > 0) {
+      const existingHowMappings = existing?.howOptionMappings
+
+      if (existing && !existingHowMappings) {
+        // Legacy record (no howOptionMappings) — migrate to how-option shape.
+        // Old phase-level user_confirmed status does NOT transfer to the how-option level;
+        // initialize all how-options from suggested defaults and mark "suggested" (not user_confirmed).
+        const howOptionMappings = {}
+        howOptions.forEach(opt => {
+          const optName   = opt?.optionName || ''
+          const optId     = optionSlug(optName)
+          const suggested = suggestHowOptionDeliverables(id, optName)
+          howOptionMappings[optId] = {
+            optionName:            optName,
+            mappedDeliverables:    suggested,
+            suggestedDeliverables: suggested,
+            mappingStatus:         suggested.length > 0 ? MAPPING_STATUS.SUGGESTED : MAPPING_STATUS.UNMAPPED,
+            updatedAt:             now,
+          }
+        })
+        const phaseMapped = derivePhaseMappedDeliverables(howOptionMappings)
+        merged[id] = {
+          phaseName,
+          phaseMappedDeliverables: phaseMapped,
+          mappedDeliverables:      phaseMapped,
+          suggestedDeliverables:   phaseMapped,
+          mappingStatus:           MAPPING_STATUS.SUGGESTED,
+          howOptionMappings,
+          updatedAt:               now,
+        }
+      } else {
+        // New format — preserve user_confirmed how-option entries; rebuild the rest.
+        const howOptionMappings = {}
+        howOptions.forEach(opt => {
+          const optName    = opt?.optionName || ''
+          const optId      = optionSlug(optName)
+          const existingOpt = existingHowMappings?.[optId]
+          if (existingOpt?.mappingStatus === MAPPING_STATUS.USER_CONFIRMED) {
+            howOptionMappings[optId] = { ...existingOpt, optionName: optName }
+          } else {
+            const suggested = suggestHowOptionDeliverables(id, optName)
+            howOptionMappings[optId] = {
+              optionName:            optName,
+              mappedDeliverables:    suggested,
+              suggestedDeliverables: suggested,
+              mappingStatus:         suggested.length > 0 ? MAPPING_STATUS.SUGGESTED : MAPPING_STATUS.UNMAPPED,
+              updatedAt:             now,
+            }
+          }
+        })
+        const phaseMapped = derivePhaseMappedDeliverables(howOptionMappings)
+        const phaseStatus = derivePhaseStatus(howOptionMappings)
+        merged[id] = {
+          phaseName,
+          phaseMappedDeliverables: phaseMapped,
+          mappedDeliverables:      phaseMapped,
+          suggestedDeliverables:   existing?.suggestedDeliverables || phaseMapped,
+          mappingStatus:           phaseStatus,
+          howOptionMappings,
+          updatedAt:               existing?.updatedAt || now,
+        }
+      }
+    } else {
+      // No how-options: legacy phase-level behavior
+      if (existing?.mappingStatus === MAPPING_STATUS.USER_CONFIRMED) {
+        merged[id] = { ...existing, phaseName }
+      } else {
+        const suggested = suggestPhaseDeliverables(phaseName)
+        merged[id] = {
+          phaseName,
+          phaseMappedDeliverables: suggested,
+          mappedDeliverables:      suggested,
+          suggestedDeliverables:   suggested,
+          mappingStatus:           suggested.length > 0 ? MAPPING_STATUS.SUGGESTED : MAPPING_STATUS.UNMAPPED,
+          howOptionMappings:       {},
+          updatedAt:               now,
+        }
+      }
+    }
+  })
+  return merged
+}
+
+/**
+ * Update a single phase's mapped deliverables, marking it user_confirmed.
+ * Does NOT mutate phase content or trigger regeneration.
+ *
+ * @param {object} panelModel
+ * @param {string} phaseId         - phaseSlug(phaseName)
+ * @param {string[]} mappedDeliverables - array of deliverable IDs
+ */
+export function updatePhaseMapping(panelModel, phaseId, mappedDeliverables) {
+  const execPanel = panelModel?.panels?.executionSequence
+  if (!execPanel) return panelModel
+  const existing = execPanel.executionDeliverableMappings || buildInitialPhaseMappings(execPanel.content || [])
+  const entry    = existing[phaseId] || {}
+  const now      = new Date().toISOString()
+  const updatedMappings = {
+    ...existing,
+    [phaseId]: {
+      ...entry,
+      mappedDeliverables:   Array.isArray(mappedDeliverables) ? mappedDeliverables : [],
+      mappingStatus:        MAPPING_STATUS.USER_CONFIRMED,
+      updatedAt:            now,
+    },
+  }
+  const updatedPanels = {
+    ...panelModel.panels,
+    executionSequence: {
+      ...execPanel,
+      executionDeliverableMappings: updatedMappings,
+    },
+  }
+  updatedPanels.executionSequence = withSelectedStage4DeliverableStatuses(updatedPanels.executionSequence)
+  // Re-run readiness to update mapping warnings
+  const crossPanelAudit = panelModel.crossPanelAudit
+  const readinessStatus = computeLifecycleReadiness(updatedPanels, crossPanelAudit)
+  return { ...panelModel, panels: updatedPanels, readinessStatus }
+}
+
+/**
+ * Update a single how-option's mapped deliverables, marking it user_confirmed.
+ * Recomputes phaseMappedDeliverables (union) and phase mappingStatus.
+ * Does NOT mutate phase content or trigger regeneration.
+ *
+ * @param {object} panelModel
+ * @param {string} phaseId   - phaseSlug(phaseName)
+ * @param {string} optionId  - optionSlug(optionName)
+ * @param {string[]} mappedDeliverables
+ */
+export function updateHowOptionMapping(panelModel, phaseId, optionId, mappedDeliverables) {
+  const execPanel = panelModel?.panels?.executionSequence
+  if (!execPanel) return panelModel
+  const existing      = execPanel.executionDeliverableMappings || buildInitialPhaseMappings(execPanel.content || [])
+  const phaseRecord   = existing[phaseId] || {}
+  const howOptMaps    = phaseRecord.howOptionMappings || {}
+  const existingOpt   = howOptMaps[optionId] || {}
+  const now           = new Date().toISOString()
+
+  const updatedHowOptMaps = {
+    ...howOptMaps,
+    [optionId]: {
+      ...existingOpt,
+      mappedDeliverables: Array.isArray(mappedDeliverables) ? mappedDeliverables : [],
+      mappingStatus:      MAPPING_STATUS.USER_CONFIRMED,
+      updatedAt:          now,
+    },
+  }
+
+  const phaseMapped = derivePhaseMappedDeliverables(updatedHowOptMaps)
+  const phaseStatus = derivePhaseStatus(updatedHowOptMaps)
+
+  const updatedMappings = {
+    ...existing,
+    [phaseId]: {
+      ...phaseRecord,
+      phaseMappedDeliverables: phaseMapped,
+      mappedDeliverables:      phaseMapped,
+      mappingStatus:           phaseStatus,
+      howOptionMappings:       updatedHowOptMaps,
+      updatedAt:               now,
+    },
+  }
+
+  const updatedPanels = {
+    ...panelModel.panels,
+    executionSequence: {
+      ...execPanel,
+      executionDeliverableMappings: updatedMappings,
+    },
+  }
+  updatedPanels.executionSequence = withSelectedStage4DeliverableStatuses(updatedPanels.executionSequence)
+  const crossPanelAudit = panelModel.crossPanelAudit
+  const readinessStatus = computeLifecycleReadiness(updatedPanels, crossPanelAudit)
+  return { ...panelModel, panels: updatedPanels, readinessStatus }
+}
+
+export function updateSelectedStage4Deliverables(panelModel, deliverableTypes) {
+  const execPanel = panelModel?.panels?.executionSequence
+  if (!execPanel) return panelModel
+  const now = new Date().toISOString()
+  const prior = Array.isArray(execPanel.selectedStage4Deliverables) ? execPanel.selectedStage4Deliverables : []
+  const selectedStage4Deliverables = Array.from(new Set(deliverableTypes || [])).map(deliverableType => {
+    const existing = prior.find(record => record?.deliverableType === deliverableType)
+    return {
+      deliverableType,
+      status: 'selected',
+      selectedAt: existing?.selectedAt || now,
+      updatedAt: now,
+    }
+  })
+  const updatedPanels = {
+    ...panelModel.panels,
+    executionSequence: withSelectedStage4DeliverableStatuses({
+      ...execPanel,
+      selectedStage4Deliverables,
+    }, selectedStage4Deliverables),
+  }
+  const crossPanelAudit = panelModel.crossPanelAudit
+  const readinessStatus = computeLifecycleReadiness(updatedPanels, crossPanelAudit)
+  return { ...panelModel, panels: updatedPanels, readinessStatus }
+}
+
+/**
+ * Compute the mapping completeness summary for an executionSequence panel.
+ * For phases with howOptions, counts phases that have at least one how-option with deliverables.
+ * For phases without howOptions, falls back to phase-level check.
+ * Returns { total, mapped, unmapped, allMapped, hasMappings }.
+ */
+export function computeMappingStatus(panel) {
+  const content  = panel?.content
+  const mappings = panel?.executionDeliverableMappings
+
+  if (!Array.isArray(content) || content.length === 0) {
+    return { total: 0, mapped: 0, unmapped: 0, allMapped: true, hasMappings: false }
+  }
+  let mapped = 0
+  let unmapped = 0
+  content.forEach(phase => {
+    const id       = phaseSlug(phase?.phaseName)
+    const mapping  = mappings?.[id]
+    const howOpts  = Array.isArray(phase?.howOptions) ? phase.howOptions : []
+
+    if (howOpts.length > 0) {
+      // New model: mapped if any how-option has at least one deliverable
+      const howOptMaps = mapping?.howOptionMappings
+      const hasMapped  = howOpts.some(opt => {
+        const optId = optionSlug(opt?.optionName)
+        return (howOptMaps?.[optId]?.mappedDeliverables?.length ?? 0) > 0
+      })
+      if (hasMapped) mapped++
+      else unmapped++
+    } else {
+      // Legacy / no how-options: check phase-level deliverables
+      const deliverables = mapping?.phaseMappedDeliverables || mapping?.mappedDeliverables
+      if (deliverables?.length > 0) mapped++
+      else unmapped++
+    }
+  })
+  return { total: content.length, mapped, unmapped, allMapped: unmapped === 0, hasMappings: !!mappings }
 }
 
 // Required top-level fields per panel.
@@ -606,9 +1145,23 @@ export function computeReadinessStatus(panels, crossPanelAudit) {
     if (audit.status === PANEL_AUDIT_STATUSES.TRUNCATED) {
       blockingPanels.push(panelId)
       blockingReasons.push(`${PANEL_LABELS[panelId]}: TRUNCATED — ${audit.truncatedFields.slice(0, 2).join(', ')}`)
-    } else if (audit.status === PANEL_AUDIT_STATUSES.INCOMPLETE) {
+      return
+    }
+    if (audit.status === PANEL_AUDIT_STATUSES.INCOMPLETE) {
       blockingPanels.push(panelId)
       blockingReasons.push(`${PANEL_LABELS[panelId]}: INCOMPLETE — missing ${audit.missingFields.slice(0, 2).join(', ')}`)
+      return
+    }
+    // Document-strength audit: only gate ACCEPTED panels on strength.
+    // Unaccepted panels are already blocked by lifecycle; strength is a quality gate
+    // that activates once the user has accepted the draft.
+    const panel = panels[panelId]
+    if (panel?.lifecycle !== PANEL_LIFECYCLE.ACCEPTED) return
+    const strengthAudit = panel?.panelStrengthAudit
+    if (strengthAuditBlocks(strengthAudit)) {
+      blockingPanels.push(panelId)
+      const firstFinding = strengthAudit.findings?.[0] || strengthAudit.recommendedAction || 'needs strengthening'
+      blockingReasons.push(`${PANEL_LABELS[panelId]}: NEEDS STRENGTHENING — ${firstFinding.slice(0, 100)}`)
     }
     // needs_refinement is not blocking (it has content, just suboptimal)
   })
@@ -691,15 +1244,26 @@ export function normalizeToPanelModel(compiledPlan) {
   const panels = {}
   PANEL_IDS.forEach(panelId => {
     const content = contentMap[panelId]
-    const completenessAudit = auditPanelCompleteness(panelId, content)
+    const completenessAudit  = auditPanelCompleteness(panelId, content)
+    const panelStrengthAudit = auditPanelStrength(panelId, content)
     const lifecycle = derivePanelLifecycle(content, completenessAudit)
     panels[panelId] = {
       ...emptyPanel(panelId),
       content,
       completenessAudit,
+      panelStrengthAudit,
       lifecycle,
       sourceAtomIds: collectSourceAtomIds(content),
       lastGeneratedAt: new Date().toISOString(),
+      // Execution Sequence: populate suggested deliverable mappings on first normalization
+      ...(panelId === 'executionSequence' ? (() => {
+        const executionDeliverableMappings = buildInitialPhaseMappings(content)
+        const panelForSelection = { content, executionDeliverableMappings }
+        return {
+          executionDeliverableMappings,
+          selectedStage4Deliverables: getSelectedStage4Deliverables(panelForSelection),
+        }
+      })() : {}),
     }
   })
 
@@ -914,26 +1478,53 @@ export function rejectPanel(panelModel, panelId, reason = 'Panel draft rejected 
  * Apply an accepted refinement — update panel content + audit.
  * Marks the refinement record as accepted and re-runs panel + cross-panel audits.
  */
-export function applyAcceptedRefinement(panelModel, panelId, revisedContent) {
+/**
+ * Apply new content to a panel (after generation or refinement).
+ * Optionally merge in child unit records from atomic generation.
+ * Returns a new panel model with updated cross-panel audit and readiness.
+ *
+ * @param {object} panelModel
+ * @param {string} panelId
+ * @param {*} revisedContent
+ * @param {object} [options]
+ * @param {object[]} [options.childUnits]  - child unit records from atomic generation
+ * @param {object}  [options.panelAudit]   - pre-computed audit (skip re-audit if provided)
+ */
+export function applyAcceptedRefinement(panelModel, panelId, revisedContent, options = {}) {
   if (!panelModel?.panels?.[panelId]) return panelModel
   const now = new Date().toISOString()
-  const newAudit = auditPanelCompleteness(panelId, revisedContent)
+  const newAudit = options.panelAudit || auditPanelCompleteness(panelId, revisedContent)
+  const newStrengthAudit = auditPanelStrength(panelId, revisedContent)
   const newLifecycle = derivePanelLifecycle(revisedContent, newAudit)
   const updatedPanels = {
     ...panelModel.panels,
     [panelId]: {
       ...panelModel.panels[panelId],
-      content:          revisedContent,
+      content:           revisedContent,
       completenessAudit: newAudit,
-      lifecycle:        newLifecycle,
-      sourceAtomIds:    collectSourceAtomIds(revisedContent).length
+      panelStrengthAudit: newStrengthAudit,
+      lifecycle:         newLifecycle,
+      sourceAtomIds:     collectSourceAtomIds(revisedContent).length
         ? collectSourceAtomIds(revisedContent)
         : (panelModel.panels[panelId].sourceAtomIds || []),
-      lastGeneratedAt:  panelModel.panels[panelId].lastGeneratedAt,
-      lastRefinedAt:    now,
-      // A refinement creates a new draft; user must explicitly accept again.
-      acceptedAt:       null,
+      lastGeneratedAt:   panelModel.panels[panelId].lastGeneratedAt,
+      lastRefinedAt:     now,
+      // A generation/refinement creates a new draft; user must explicitly accept again.
+      acceptedAt:        null,
+      // Preserve child unit records from atomic generation
+      ...(options.childUnits ? { childUnits: options.childUnits } : {}),
+      // Execution Sequence: merge existing mappings — user_confirmed entries are preserved
+      ...(panelId === 'executionSequence' ? {
+        executionDeliverableMappings: mergePhasesMappings(
+          panelModel.panels[panelId].executionDeliverableMappings,
+          revisedContent,
+        ),
+        selectedStage4Deliverables: panelModel.panels[panelId].selectedStage4Deliverables || [],
+      } : {}),
     },
+  }
+  if (panelId === 'executionSequence') {
+    updatedPanels[panelId] = withSelectedStage4DeliverableStatuses(updatedPanels[panelId])
   }
   const crossPanelAudit = auditCrossPanels(updatedPanels)
   const readinessStatus = computeLifecycleReadiness(updatedPanels, crossPanelAudit)

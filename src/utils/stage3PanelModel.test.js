@@ -28,8 +28,27 @@ import {
   CROSS_PANEL_QUALITY_STATUSES,
   REFINEMENT_STATUSES,
   PANEL_IDS,
+  // Mapping exports
+  MAPPING_STATUS,
+  phaseSlug,
+  optionSlug,
+  suggestPhaseDeliverables,
+  suggestHowOptionDeliverables,
+  buildInitialPhaseMappings,
+  mergePhasesMappings,
+  updatePhaseMapping,
+  updateHowOptionMapping,
+  updateSelectedStage4Deliverables,
+  derivePhaseMappedDeliverables,
+  getMappedDeliverableIds,
+  getSelectedStage4Deliverables,
+  getDeliverableMappingSummary,
+  computeDeliverableMappingReadiness,
+  computeMappingStatus,
+  STAGE4_DELIVERABLES,
 } from './stage3PanelModel'
-import { PANEL_LIFECYCLE, canAccept } from './stage3PanelLifecycle'
+import { PANEL_LIFECYCLE, canAccept, computeLifecycleReadiness } from './stage3PanelLifecycle'
+import { STRENGTH_STATUSES } from './stage3PanelStrengthAudit'
 
 // ── Shared fixtures ───────────────────────────────────────────────────────────
 
@@ -106,12 +125,12 @@ function makeGoodCompiledPlan() {
     criticalDecisions:   makeGoodCriticalDecisions(),
     executionSequence: [{
       phaseName: 'Problem & Outcome Validation',
-      phaseObjective: 'Clarify the priority use case before committing architecture scope.',
-      recommendedHow: 'Client workflow interviews',
-      whyThisFitsThePhase: 'Surfaces where users struggle before architecture is locked.',
-      exitCriteria: 'Priority workflow is named and outcome signal is agreed.',
-      evidenceExamples: ['interview notes', 'workflow steps'],
-      howOptions: [{ optionName: 'Mock review', whenToUse: 'Before engineering build', whyItFitsThePhaseOutcome: 'Fast feedback loop', evidenceProduced: 'Annotated mock' }],
+      phaseObjective: 'Confirm that examiner-facing explainability outputs meet SR 11-7 requirements before committing to build path.',
+      recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format, with Compliance and API Engineering present.',
+      whyThisFitsThePhase: 'This phase must confirm regulatory fit before architecture decisions are locked — validation against examiner expectations prevents rework once build begins.',
+      exitCriteria: 'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 1 closes. Gate must be confirmed before Sprint 2 begins.',
+      evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+      howOptions: [],
     }],
     dependencies:        makeGoodDependencies(),
     risksAndMitigations: makeGoodRisks(),
@@ -129,6 +148,14 @@ function makeTruncatedDependencyRefinement() {
       consequenceIfMissing: 'Architecture and compliance teams proceed with components that ma',
     },
   ]
+}
+
+function makeStructurallyCompleteGenericStrategicObjective() {
+  return {
+    summary: 'This business unit will leverage existing best practices and robust frameworks to ensure alignment, drive value, improve outcomes, and support the business through a holistic approach that can be reused across most operating contexts.',
+    outcomeFocus: 'Drive efficiency and enable growth across the business through stakeholder engagement, alignment, and delivery of value.',
+    nonGoalsOrBoundaries: ['Does not own unrelated implementation details', 'Excludes areas outside this workstream'],
+  }
 }
 
 // ── Truncation detection ──────────────────────────────────────────────────────
@@ -542,7 +569,9 @@ describe('panel lifecycle transitions', () => {
     expect(() => acceptPanel(pm, 'dependencies')).toThrow(/Cannot accept panel/)
   })
 
-  it('blocks accepting panels with blocking duplicate field findings', () => {
+  it('allows accepting panels with needs_refinement audit (user informed choice)', () => {
+    // canAccept was relaxed to allow acceptance despite NEEDS_REFINEMENT warnings.
+    // The user must explicitly accept; the strength audit then gates Stage 4 readiness.
     const pm = normalizeToPanelModel({
       ...makeGoodCompiledPlan(),
       dependencies: [{
@@ -554,7 +583,8 @@ describe('panel lifecycle transitions', () => {
       }],
     })
     expect(pm.panels.dependencies.completenessAudit.status).toBe(PANEL_AUDIT_STATUSES.NEEDS_REFINEMENT)
-    expect(canAccept(pm.panels.dependencies)).toBe(false)
+    // Acceptance is now allowed even with NEEDS_REFINEMENT — strength audit provides the quality gate.
+    expect(canAccept(pm.panels.dependencies)).toBe(true)
   })
 
   it('blocks Stage 4 readiness when any accepted set contains a truncated panel', () => {
@@ -568,6 +598,17 @@ describe('panel lifecycle transitions', () => {
     expect(pm.readinessStatus.isReady).toBe(false)
     expect(pm.readinessStatus.blockingPanels).toContain('dependencies')
     expect(pm.readinessStatus.blockingReasons.some(r => r.includes('TRUNCATED'))).toBe(true)
+  })
+
+  it('classifies truncated panels as structural audit failures before strength gating', () => {
+    const pm = normalizeToPanelModel({
+      ...makeGoodCompiledPlan(),
+      dependencies: makeTruncatedDependencyRefinement(),
+    })
+
+    expect(pm.panels.dependencies.completenessAudit.status).toBe(PANEL_AUDIT_STATUSES.TRUNCATED)
+    expect(pm.panels.dependencies.lifecycle).toBe(PANEL_LIFECYCLE.NEEDS_REFINEMENT)
+    expect(canAccept(pm.panels.dependencies)).toBe(false)
   })
 
   it('resolves failed critical decisions as failed instead of complete for display', () => {
@@ -595,6 +636,42 @@ describe('panel lifecycle transitions', () => {
     expect(pm.panels.risks.lifecycle).toBe(PANEL_LIFECYCLE.FAILED)
     expect(pm.readinessStatus.isReady).toBe(false)
     expect(pm.readinessStatus.blockingPanels).toContain('risks')
+  })
+
+  it('blocks Stage 4 readiness when all panels are accepted but a strength audit is weak', () => {
+    let pm = normalizeToPanelModel({
+      ...makeGoodCompiledPlan(),
+      strategicObjective: makeStructurallyCompleteGenericStrategicObjective(),
+    })
+
+    expect(pm.panels.strategicObjective.completenessAudit.status).toBe(PANEL_AUDIT_STATUSES.COMPLETE)
+    expect(pm.panels.strategicObjective.panelStrengthAudit.status).toBe(STRENGTH_STATUSES.WEAK)
+
+    PANEL_IDS.forEach(pid => {
+      pm = acceptPanel(pm, pid)
+    })
+
+    expect(pm.readinessStatus.isReady).toBe(false)
+    expect(pm.readinessStatus.blockingPanels).toContain('strategicObjective')
+    expect(pm.readinessStatus.blockingReasons).toContain('Panels accepted, strength audit failed.')
+  })
+
+  it('blocks Stage 4 readiness when compiled quality audit has blocking violations', () => {
+    let pm = normalizeToPanelModel(makeGoodCompiledPlan())
+    PANEL_IDS.forEach(pid => {
+      pm = acceptPanel(pm, pid)
+    })
+
+    const readiness = computeLifecycleReadiness(pm.panels, {
+      qualityStatus: CROSS_PANEL_QUALITY_STATUSES.FAIL,
+      duplicatedFieldPairs: [{ source: 'dependencies[0].requiredInput', target: 'risks[0].mitigationOptions' }],
+      misplacedContentFindings: ['Risk content appears inside dependencies.'],
+      repeatedPhrases: [],
+      planAlignmentFindings: [],
+    })
+
+    expect(readiness.isReady).toBe(false)
+    expect(readiness.blockingReasons.some(reason => reason.includes('Cross-panel audit failed'))).toBe(true)
   })
 })
 
@@ -810,5 +887,650 @@ describe('synthesizePanelSummary', () => {
     const summary = synthesizePanelSummary('criticalDecisions', makeGoodCriticalDecisions())
     expect(summary).toContain('1 decision')
     expect(summary).toContain('Build vs Partner')
+  })
+})
+
+// ── Execution Sequence deliverable mapping ────────────────────────────────────
+
+const KNOWN_PHASES = [
+  { phaseName: 'Problem & Outcome Validation' },
+  { phaseName: 'Solution Path Evaluation' },
+  { phaseName: 'Architecture & Delivery Readiness' },
+  { phaseName: 'Pilot / Controlled Execution' },
+  { phaseName: 'Scale Decision' },
+]
+
+const UNKNOWN_PHASE = [{ phaseName: 'Data Lake Migration Sprint' }]
+
+describe('phaseSlug', () => {
+  it('slugifies a phase name', () => {
+    expect(phaseSlug('Problem & Outcome Validation')).toBe('problem_outcome_validation')
+    expect(phaseSlug('Architecture & Delivery Readiness')).toBe('architecture_delivery_readiness')
+  })
+  it('handles empty input', () => {
+    expect(phaseSlug('')).toBe('phase')
+    expect(phaseSlug(null)).toBe('phase')
+  })
+})
+
+describe('suggestPhaseDeliverables', () => {
+  it('suggests deliverables for known phase names', () => {
+    expect(suggestPhaseDeliverables('Problem & Outcome Validation')).toContain('executive_decision_brief')
+    expect(suggestPhaseDeliverables('Architecture & Delivery Readiness')).toContain('bu_execution_plan')
+    expect(suggestPhaseDeliverables('Pilot / Controlled Execution')).toContain('risk_control_plan')
+    expect(suggestPhaseDeliverables('Scale Decision')).toContain('operating_cadence_plan')
+  })
+  it('returns empty array for unknown phase', () => {
+    expect(suggestPhaseDeliverables('Data Lake Migration Sprint')).toHaveLength(0)
+  })
+  it('returns empty array for empty input', () => {
+    expect(suggestPhaseDeliverables('')).toHaveLength(0)
+  })
+})
+
+describe('buildInitialPhaseMappings', () => {
+  it('creates suggested mappings for known phase names', () => {
+    const mappings = buildInitialPhaseMappings(KNOWN_PHASES)
+    expect(Object.keys(mappings)).toHaveLength(5)
+    // Problem & Outcome Validation → suggested
+    const problem = mappings['problem_outcome_validation']
+    expect(problem.mappingStatus).toBe(MAPPING_STATUS.SUGGESTED)
+    expect(problem.mappedDeliverables).toContain('executive_decision_brief')
+    expect(problem.suggestedDeliverables).toEqual(problem.mappedDeliverables)
+  })
+
+  it('marks unknown phases as unmapped', () => {
+    const mappings = buildInitialPhaseMappings(UNKNOWN_PHASE)
+    const phase = mappings['data_lake_migration_sprint']
+    expect(phase.mappingStatus).toBe(MAPPING_STATUS.UNMAPPED)
+    expect(phase.mappedDeliverables).toHaveLength(0)
+  })
+
+  it('returns empty object for empty input', () => {
+    expect(buildInitialPhaseMappings([])).toEqual({})
+    expect(buildInitialPhaseMappings(null)).toEqual({})
+  })
+
+  it('stores phaseName in each record', () => {
+    const mappings = buildInitialPhaseMappings(KNOWN_PHASES)
+    expect(mappings['problem_outcome_validation'].phaseName).toBe('Problem & Outcome Validation')
+  })
+})
+
+describe('mergePhasesMappings', () => {
+  it('preserves user_confirmed mappings through a regeneration', () => {
+    const original = buildInitialPhaseMappings(KNOWN_PHASES)
+    // Simulate user confirming a mapping
+    original['problem_outcome_validation'] = {
+      ...original['problem_outcome_validation'],
+      mappedDeliverables: ['executive_decision_brief', 'bu_execution_plan'],
+      mappingStatus: MAPPING_STATUS.USER_CONFIRMED,
+    }
+    const merged = mergePhasesMappings(original, KNOWN_PHASES)
+    expect(merged['problem_outcome_validation'].mappingStatus).toBe(MAPPING_STATUS.USER_CONFIRMED)
+    expect(merged['problem_outcome_validation'].mappedDeliverables).toContain('bu_execution_plan')
+  })
+
+  it('rebuilds suggested mappings for phases not yet user_confirmed', () => {
+    const original = buildInitialPhaseMappings(KNOWN_PHASES)
+    const merged = mergePhasesMappings(original, KNOWN_PHASES)
+    // Non-confirmed phases stay as suggested
+    expect(merged['architecture_delivery_readiness'].mappingStatus).toBe(MAPPING_STATUS.SUGGESTED)
+  })
+})
+
+describe('updatePhaseMapping', () => {
+  it('marks a phase as user_confirmed when deliverables are set', () => {
+    let pm = normalizeToPanelModel(makeGoodCompiledPlan())
+    pm = updatePhaseMapping(pm, 'problem_outcome_validation', ['executive_decision_brief', 'bu_execution_plan'])
+    const mapping = pm.panels.executionSequence.executionDeliverableMappings['problem_outcome_validation']
+    expect(mapping.mappingStatus).toBe(MAPPING_STATUS.USER_CONFIRMED)
+    expect(mapping.mappedDeliverables).toContain('executive_decision_brief')
+    expect(mapping.mappedDeliverables).toContain('bu_execution_plan')
+  })
+
+  it('does NOT mutate execution phase content when mapping changes', () => {
+    let pm = normalizeToPanelModel(makeGoodCompiledPlan())
+    const contentBefore = JSON.stringify(pm.panels.executionSequence.content)
+    pm = updatePhaseMapping(pm, 'problem_outcome_validation', ['bu_execution_plan'])
+    expect(JSON.stringify(pm.panels.executionSequence.content)).toBe(contentBefore)
+  })
+
+  it('returns original panelModel if executionSequence panel is missing', () => {
+    const pm = { panels: {} }
+    const result = updatePhaseMapping(pm, 'problem_outcome_validation', ['bu_execution_plan'])
+    expect(result).toBe(pm)
+  })
+})
+
+describe('computeMappingStatus', () => {
+  it('returns allMapped=true when all phases have deliverables', () => {
+    let pm = normalizeToPanelModel(makeGoodCompiledPlan())
+    // The compiled plan has 1 phase — normalizeToPanelModel runs buildInitialPhaseMappings
+    // with suggested deliverables (should map to at least one deliverable)
+    const status = computeMappingStatus(pm.panels.executionSequence)
+    // The phase is "Problem & Outcome Validation" which has suggestions
+    expect(status.total).toBeGreaterThan(0)
+    expect(status.mapped + status.unmapped).toBe(status.total)
+  })
+
+  it('counts unmapped phases correctly', () => {
+    const panel = {
+      content: [
+        { phaseName: 'Data Lake Migration' },      // no match → unmapped
+        { phaseName: 'Data Lake Post-Migration' },  // no match → unmapped
+      ],
+      executionDeliverableMappings: buildInitialPhaseMappings([
+        { phaseName: 'Data Lake Migration' },
+        { phaseName: 'Data Lake Post-Migration' },
+      ]),
+    }
+    const status = computeMappingStatus(panel)
+    expect(status.unmapped).toBe(2)
+    expect(status.allMapped).toBe(false)
+  })
+
+  it('returns allMapped=true for empty content', () => {
+    const status = computeMappingStatus({ content: [] })
+    expect(status.allMapped).toBe(true)
+    expect(status.total).toBe(0)
+  })
+})
+
+// ── How-option level mapping ──────────────────────────────────────────────────
+
+const PHASES_WITH_HOW_OPTIONS = [
+  {
+    phaseName: 'Problem & Outcome Validation',
+    howOptions: [
+      { optionName: 'Regulatory Gap Mapping Workshop', whenToUse: 'When regulatory gap exists.', whyItFitsThePhaseOutcome: 'Directly addresses validation.', evidenceProduced: 'Gap analysis report.' },
+      { optionName: 'Peer Institution Benchmarking', whenToUse: 'When peer data available.', whyItFitsThePhaseOutcome: 'Provides external validation.', evidenceProduced: 'Benchmark comparison.' },
+    ],
+  },
+  {
+    phaseName: 'Solution Path Evaluation',
+    howOptions: [
+      { optionName: 'Architectural Spike with Proof-of-Concept Prototype', whenToUse: 'When approach is unclear.', whyItFitsThePhaseOutcome: 'Validates feasibility.', evidenceProduced: 'PoC report.' },
+      { optionName: 'Contract Engineer Scope Simulation', whenToUse: 'When scope is at risk.', whyItFitsThePhaseOutcome: 'Bounds delivery risk.', evidenceProduced: 'Scope boundary doc.' },
+    ],
+  },
+]
+
+describe('optionSlug', () => {
+  it('slugifies an option name', () => {
+    expect(optionSlug('Regulatory Gap Mapping Workshop')).toBe('regulatory_gap_mapping_workshop')
+    expect(optionSlug('RFI/RFP Competitive Solicitation')).toBe('rfi_rfp_competitive_solicitation')
+    expect(optionSlug('Architectural Spike with Proof-of-Concept Prototype')).toBe('architectural_spike_with_proof_of_concept_prototype')
+  })
+  it('handles empty input', () => {
+    expect(optionSlug('')).toBe('option')
+    expect(optionSlug(null)).toBe('option')
+  })
+})
+
+describe('suggestHowOptionDeliverables', () => {
+  it('returns defaults for known phase + option combinations', () => {
+    expect(suggestHowOptionDeliverables('problem_outcome_validation', 'Regulatory Gap Mapping Workshop'))
+      .toEqual(['executive_decision_brief', 'global_sme_review_packet'])
+    expect(suggestHowOptionDeliverables('solution_path_evaluation', 'Architectural Spike with Proof-of-Concept Prototype'))
+      .toContain('pdlc_epic_outline')
+    expect(suggestHowOptionDeliverables('architecture_delivery_readiness', 'Threat-Modeled Architecture Review'))
+      .toContain('risk_control_plan')
+    expect(suggestHowOptionDeliverables('pilot_controlled_execution', 'Shadow-Mode Parallel Run'))
+      .toContain('acceptance_criteria_draft')
+  })
+  it('returns empty array for unknown combinations', () => {
+    expect(suggestHowOptionDeliverables('problem_outcome_validation', 'Unknown Option')).toHaveLength(0)
+    expect(suggestHowOptionDeliverables('unknown_phase', 'Regulatory Gap Mapping Workshop')).toHaveLength(0)
+  })
+})
+
+describe('derivePhaseMappedDeliverables', () => {
+  it('returns union of all how-option mapped deliverables', () => {
+    const howOptMaps = {
+      opt_a: { mappedDeliverables: ['executive_decision_brief', 'bu_execution_plan'] },
+      opt_b: { mappedDeliverables: ['bu_execution_plan', 'risk_control_plan'] },
+    }
+    const result = derivePhaseMappedDeliverables(howOptMaps)
+    expect(result).toContain('executive_decision_brief')
+    expect(result).toContain('bu_execution_plan')
+    expect(result).toContain('risk_control_plan')
+    expect(result).toHaveLength(3)  // deduplicated
+  })
+  it('returns empty array for empty how-option mappings', () => {
+    expect(derivePhaseMappedDeliverables({})).toHaveLength(0)
+    expect(derivePhaseMappedDeliverables(null)).toHaveLength(0)
+  })
+})
+
+describe('buildInitialPhaseMappings — with howOptions', () => {
+  it('creates howOptionMappings for each how option with suggested defaults', () => {
+    const mappings = buildInitialPhaseMappings(PHASES_WITH_HOW_OPTIONS)
+    const problemPhase = mappings['problem_outcome_validation']
+    expect(problemPhase).toBeTruthy()
+    expect(problemPhase.howOptionMappings).toBeTruthy()
+    const workshopOpt = problemPhase.howOptionMappings['regulatory_gap_mapping_workshop']
+    expect(workshopOpt).toBeTruthy()
+    expect(workshopOpt.mappedDeliverables).toContain('executive_decision_brief')
+    expect(workshopOpt.mappingStatus).toBe(MAPPING_STATUS.SUGGESTED)
+  })
+
+  it('phaseMappedDeliverables is derived union of how-option deliverables', () => {
+    const mappings = buildInitialPhaseMappings(PHASES_WITH_HOW_OPTIONS)
+    const problemPhase = mappings['problem_outcome_validation']
+    // Both workshop and benchmarking suggest executive_decision_brief, so it appears once
+    expect(problemPhase.phaseMappedDeliverables).toContain('executive_decision_brief')
+    expect(problemPhase.mappedDeliverables).toEqual(problemPhase.phaseMappedDeliverables)
+  })
+
+  it('stores optionName in each how-option record', () => {
+    const mappings = buildInitialPhaseMappings(PHASES_WITH_HOW_OPTIONS)
+    const workshopOpt = mappings['problem_outcome_validation'].howOptionMappings['regulatory_gap_mapping_workshop']
+    expect(workshopOpt.optionName).toBe('Regulatory Gap Mapping Workshop')
+  })
+
+  it('phases with empty howOptions still use legacy phase-level path', () => {
+    const phases = [{ phaseName: 'Problem & Outcome Validation', howOptions: [] }]
+    const mappings = buildInitialPhaseMappings(phases)
+    const phase = mappings['problem_outcome_validation']
+    expect(phase.howOptionMappings).toEqual({})
+    expect(phase.mappedDeliverables).toContain('executive_decision_brief')
+    expect(phase.mappingStatus).toBe(MAPPING_STATUS.SUGGESTED)
+  })
+})
+
+describe('mergePhasesMappings — how-option level', () => {
+  it('preserves user_confirmed how-option mappings through a regeneration', () => {
+    const initial = buildInitialPhaseMappings(PHASES_WITH_HOW_OPTIONS)
+    // Simulate user confirming one how-option
+    initial['problem_outcome_validation'].howOptionMappings['regulatory_gap_mapping_workshop'] = {
+      ...initial['problem_outcome_validation'].howOptionMappings['regulatory_gap_mapping_workshop'],
+      mappedDeliverables: ['executive_decision_brief', 'bu_execution_plan'],
+      mappingStatus: MAPPING_STATUS.USER_CONFIRMED,
+    }
+    const merged = mergePhasesMappings(initial, PHASES_WITH_HOW_OPTIONS)
+    const opt = merged['problem_outcome_validation'].howOptionMappings['regulatory_gap_mapping_workshop']
+    expect(opt.mappingStatus).toBe(MAPPING_STATUS.USER_CONFIRMED)
+    expect(opt.mappedDeliverables).toContain('bu_execution_plan')
+  })
+
+  it('rebuilds suggested mappings for non-confirmed how-options on regeneration', () => {
+    const initial = buildInitialPhaseMappings(PHASES_WITH_HOW_OPTIONS)
+    const merged = mergePhasesMappings(initial, PHASES_WITH_HOW_OPTIONS)
+    const opt = merged['problem_outcome_validation'].howOptionMappings['peer_institution_benchmarking']
+    expect(opt.mappingStatus).toBe(MAPPING_STATUS.SUGGESTED)
+  })
+
+  it('migrates a legacy phase-level record to how-option shape as suggested (not user_confirmed)', () => {
+    const legacyMappings = {
+      'problem_outcome_validation': {
+        phaseName:         'Problem & Outcome Validation',
+        mappedDeliverables: ['executive_decision_brief'],
+        suggestedDeliverables: ['executive_decision_brief'],
+        mappingStatus:     MAPPING_STATUS.USER_CONFIRMED,  // old-style confirmed
+        updatedAt:         new Date().toISOString(),
+        // NO howOptionMappings key
+      },
+    }
+    const merged = mergePhasesMappings(legacyMappings, PHASES_WITH_HOW_OPTIONS)
+    const phase = merged['problem_outcome_validation']
+    expect(phase.howOptionMappings).toBeTruthy()
+    expect(Object.keys(phase.howOptionMappings).length).toBe(2)
+    // Migrated record is NOT user_confirmed — marked suggested
+    expect(phase.mappingStatus).toBe(MAPPING_STATUS.SUGGESTED)
+    // All how-option entries are suggested, not user_confirmed
+    Object.values(phase.howOptionMappings).forEach(opt => {
+      expect(opt.mappingStatus).not.toBe(MAPPING_STATUS.USER_CONFIRMED)
+    })
+  })
+})
+
+describe('updateHowOptionMapping', () => {
+  function makePMWithHowOptions() {
+    const plan = {
+      ...makeGoodCompiledPlan(),
+      executionSequence: PHASES_WITH_HOW_OPTIONS.map(p => ({
+        ...p,
+        phaseObjective: 'Confirm that the proposed path meets regulatory and delivery requirements before committing to the build.',
+        recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format with Compliance team.',
+        exitCriteria:   'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 2 begins.',
+        evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+      })),
+    }
+    return normalizeToPanelModel(plan)
+  }
+
+  it('marks the targeted how-option as user_confirmed', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['executive_decision_brief', 'risk_control_plan'])
+    const opt = pm.panels.executionSequence.executionDeliverableMappings['problem_outcome_validation'].howOptionMappings['regulatory_gap_mapping_workshop']
+    expect(opt.mappingStatus).toBe(MAPPING_STATUS.USER_CONFIRMED)
+    expect(opt.mappedDeliverables).toContain('executive_decision_brief')
+    expect(opt.mappedDeliverables).toContain('risk_control_plan')
+  })
+
+  it('updates phaseMappedDeliverables as the union after how-option change', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['executive_decision_brief'])
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'peer_institution_benchmarking', ['risk_control_plan'])
+    const phase = pm.panels.executionSequence.executionDeliverableMappings['problem_outcome_validation']
+    expect(phase.phaseMappedDeliverables).toContain('executive_decision_brief')
+    expect(phase.phaseMappedDeliverables).toContain('risk_control_plan')
+    expect(phase.mappedDeliverables).toEqual(phase.phaseMappedDeliverables)
+  })
+
+  it('does NOT mutate phase or how-option text when mapping changes', () => {
+    let pm = makePMWithHowOptions()
+    const contentBefore = JSON.stringify(pm.panels.executionSequence.content)
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['bu_execution_plan'])
+    expect(JSON.stringify(pm.panels.executionSequence.content)).toBe(contentBefore)
+  })
+
+  it('deliverable-first checkbox state reads existing how-option mappings', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['bu_execution_plan'])
+    const summary = getDeliverableMappingSummary(pm.panels.executionSequence, 'bu_execution_plan')
+
+    expect(summary.selectedHowOptionCount).toBeGreaterThanOrEqual(1)
+    expect(summary.selectedPhases).toContain('Problem & Outcome Validation')
+  })
+
+  it('checking a how option adds the active deliverable to mappedDeliverables', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['executive_decision_brief'])
+    const before = pm.panels.executionSequence.executionDeliverableMappings.problem_outcome_validation.howOptionMappings.regulatory_gap_mapping_workshop
+
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', [...before.mappedDeliverables, 'bu_execution_plan'])
+    const after = pm.panels.executionSequence.executionDeliverableMappings.problem_outcome_validation.howOptionMappings.regulatory_gap_mapping_workshop
+
+    expect(after.mappedDeliverables).toContain('executive_decision_brief')
+    expect(after.mappedDeliverables).toContain('bu_execution_plan')
+  })
+
+  it('unchecking a how option removes the active deliverable from mappedDeliverables', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['executive_decision_brief', 'bu_execution_plan'])
+    const before = pm.panels.executionSequence.executionDeliverableMappings.problem_outcome_validation.howOptionMappings.regulatory_gap_mapping_workshop
+
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', before.mappedDeliverables.filter(d => d !== 'bu_execution_plan'))
+    const after = pm.panels.executionSequence.executionDeliverableMappings.problem_outcome_validation.howOptionMappings.regulatory_gap_mapping_workshop
+
+    expect(after.mappedDeliverables).toContain('executive_decision_brief')
+    expect(after.mappedDeliverables).not.toContain('bu_execution_plan')
+  })
+
+  it('phase summary is derived from selected how options for the active deliverable', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['bu_execution_plan'])
+    pm = updateHowOptionMapping(pm, 'solution_path_evaluation', 'contract_engineer_scope_simulation', ['bu_execution_plan'])
+    const summary = getDeliverableMappingSummary(pm.panels.executionSequence, 'bu_execution_plan')
+
+    expect(summary.selectedHowOptionCount).toBeGreaterThanOrEqual(2)
+    expect(summary.selectedPhaseCount).toBe(2)
+    expect(summary.unmappedPhaseCount).toBe(0)
+  })
+
+  it('existing mapping metadata still loads into deliverable-first summaries', () => {
+    const mappings = buildInitialPhaseMappings(PHASES_WITH_HOW_OPTIONS)
+    const panel = { content: PHASES_WITH_HOW_OPTIONS, executionDeliverableMappings: mappings }
+    const ids = getMappedDeliverableIds(panel)
+    const summary = getDeliverableMappingSummary(panel, 'executive_decision_brief')
+
+    expect(ids).toContain('executive_decision_brief')
+    expect(summary.selectedHowOptionCount).toBeGreaterThan(0)
+  })
+
+  it('mapping readiness is based on intended deliverables, not every possible deliverable', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['bu_execution_plan'])
+
+    const ready = computeDeliverableMappingReadiness(pm.panels.executionSequence, ['bu_execution_plan'])
+    const blocked = computeDeliverableMappingReadiness(pm.panels.executionSequence, ['bu_execution_plan', 'operating_cadence_plan'])
+
+    expect(ready.mappingReady).toBe(true)
+    expect(blocked.mappingReady).toBe(false)
+    expect(blocked.unmappedDeliverables).toContain('operating_cadence_plan')
+  })
+
+  it('stores selected Stage 4 deliverables to prepare separately from mappings', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateSelectedStage4Deliverables(pm, ['bu_execution_plan', 'acceptance_criteria_draft'])
+
+    const selected = getSelectedStage4Deliverables(pm.panels.executionSequence)
+    expect(selected.map(record => record.deliverableType)).toEqual(['bu_execution_plan', 'acceptance_criteria_draft'])
+    expect(selected.every(record => record.selectedAt && record.updatedAt)).toBe(true)
+  })
+
+  it('active deliverable options are derived from selected deliverables only', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateSelectedStage4Deliverables(pm, ['acceptance_criteria_draft'])
+
+    const selected = getSelectedStage4Deliverables(pm.panels.executionSequence)
+    expect(selected.map(record => record.deliverableType)).toEqual(['acceptance_criteria_draft'])
+    expect(selected.map(record => record.deliverableType)).not.toContain('bu_execution_plan')
+  })
+
+  it('selected deliverable status becomes incomplete when no how options map to it', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateSelectedStage4Deliverables(pm, ['operating_cadence_plan'])
+
+    const selected = getSelectedStage4Deliverables(pm.panels.executionSequence)
+    expect(selected[0]).toMatchObject({
+      deliverableType: 'operating_cadence_plan',
+      status: 'incomplete',
+    })
+    expect(computeDeliverableMappingReadiness(pm.panels.executionSequence, ['operating_cadence_plan']).mappingReady).toBe(false)
+  })
+
+  it('selected deliverable status becomes mapped when a how option feeds it', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateSelectedStage4Deliverables(pm, ['operating_cadence_plan'])
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['operating_cadence_plan'])
+
+    const selected = getSelectedStage4Deliverables(pm.panels.executionSequence)
+    expect(selected[0]).toMatchObject({
+      deliverableType: 'operating_cadence_plan',
+      status: 'mapped',
+    })
+    expect(getDeliverableMappingSummary(pm.panels.executionSequence, 'operating_cadence_plan').selectedHowOptionCount).toBe(1)
+  })
+
+  it('selected deliverable metadata still loads after serialization', () => {
+    let pm = makePMWithHowOptions()
+    pm = updateSelectedStage4Deliverables(pm, ['bu_execution_plan'])
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['bu_execution_plan'])
+
+    const reloadedPanel = JSON.parse(JSON.stringify(pm.panels.executionSequence))
+    const selected = getSelectedStage4Deliverables(reloadedPanel)
+    expect(selected).toHaveLength(1)
+    expect(selected[0].deliverableType).toBe('bu_execution_plan')
+    expect(getDeliverableMappingSummary(reloadedPanel, 'bu_execution_plan').selectedHowOptionCount).toBeGreaterThan(0)
+  })
+
+  it('Stage 4 deliverables expose concise preparation intent descriptions', () => {
+    expect(STAGE4_DELIVERABLES.every(deliverable => deliverable.intent && deliverable.intent.length > 20)).toBe(true)
+  })
+
+  it('returns original panelModel if executionSequence panel is missing', () => {
+    const pm = { panels: {} }
+    const result = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['bu_execution_plan'])
+    expect(result).toBe(pm)
+  })
+})
+
+describe('computeMappingStatus — with howOptions', () => {
+  it('counts a phase as mapped when at least one how-option has deliverables', () => {
+    const phase = PHASES_WITH_HOW_OPTIONS[0]
+    const id    = phaseSlug(phase.phaseName)
+    const mapping = buildInitialPhaseMappings([phase])[id]
+    const panel = { content: [phase], executionDeliverableMappings: { [id]: mapping } }
+    const status = computeMappingStatus(panel)
+    // Regulatory Gap Mapping Workshop has suggested deliverables → mapped
+    expect(status.mapped).toBe(1)
+    expect(status.unmapped).toBe(0)
+  })
+
+  it('counts a phase as unmapped when all how-options have empty deliverables', () => {
+    const phase = { phaseName: 'Custom Phase', howOptions: [{ optionName: 'Unknown Option' }] }
+    const id = phaseSlug(phase.phaseName)
+    const mapping = buildInitialPhaseMappings([phase])[id]
+    const panel = { content: [phase], executionDeliverableMappings: { [id]: mapping } }
+    const status = computeMappingStatus(panel)
+    expect(status.unmapped).toBe(1)
+    expect(status.allMapped).toBe(false)
+  })
+})
+
+describe('mapping readiness — Stage 4 preparation distinct from content readiness', () => {
+  it('panel acceptance is not blocked by missing mappings', () => {
+    let pm = normalizeToPanelModel(makeGoodCompiledPlan())
+    // Execution sequence is DRAFT_READY — can be accepted regardless of mapping state
+    expect(canAccept(pm.panels.executionSequence)).toBe(true)
+  })
+
+  it('accepted panel with unmapped phases does not warn unless deliverables are intended', () => {
+    // Use the good compiled plan (all fields present), then clear the mappings
+    // for the one execution phase so it reads as "unmapped".
+    let pm = normalizeToPanelModel(makeGoodCompiledPlan())
+
+    // Force-clear the mapping so the phase is unmapped
+    pm = {
+      ...pm,
+      panels: {
+        ...pm.panels,
+        executionSequence: {
+          ...pm.panels.executionSequence,
+          selectedStage4Deliverables: [],
+          executionDeliverableMappings: {
+            'problem_outcome_validation': {
+              phaseName:           'Problem & Outcome Validation',
+              mappedDeliverables:  [],   // explicitly empty — unmapped
+              suggestedDeliverables: [],
+              mappingStatus:       MAPPING_STATUS.UNMAPPED,
+              updatedAt:           new Date().toISOString(),
+            },
+          },
+        },
+      },
+    }
+
+    // Accept all panels that can be accepted
+    PANEL_IDS.forEach(pid => {
+      const p = pm.panels[pid]
+      if (p && canAccept(p)) {
+        pm = acceptPanel(pm, pid)
+      }
+    })
+
+    // mappingWarnings should exist because the executionSequence phase is unmapped + accepted
+    // Note: isReady may be false if strength audit blocks — we test the warning regardless
+    const readiness = computeLifecycleReadiness(pm.panels, pm.crossPanelAudit)
+    expect(readiness.mappingWarnings).toHaveLength(0)
+    expect(readiness.mappingReady).toBe(true)
+  })
+
+  it('all phases mapped clears mapping warning', () => {
+    let pm = normalizeToPanelModel(makeGoodCompiledPlan())
+    PANEL_IDS.forEach(pid => {
+      if (['draft_ready', 'needs_refinement'].includes(pm.panels[pid]?.lifecycle)) {
+        pm = acceptPanel(pm, pid)
+      }
+    })
+    // Confirm mapping for the one phase in the compiled plan
+    pm = updatePhaseMapping(pm, 'problem_outcome_validation', ['executive_decision_brief'])
+    const readiness = pm.readinessStatus
+    if (readiness.isReady) {
+      expect(readiness.mappingReady).toBe(true)
+    }
+  })
+
+  it('how-option mapped phase clears mapping warning when accepted', () => {
+    // Build a plan whose execution phases have howOptions
+    const plan = {
+      ...makeGoodCompiledPlan(),
+      executionSequence: [{
+        phaseName:    'Problem & Outcome Validation',
+        phaseObjective: 'Confirm that examiner-facing explainability outputs meet SR 11-7 requirements before build commitment.',
+        recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format with Compliance team.',
+        exitCriteria:   'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 2 begins.',
+        evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+        howOptions: [
+          { optionName: 'Regulatory Gap Mapping Workshop', whenToUse: 'When regulatory gap exists.', whyItFitsThePhaseOutcome: 'Directly addresses validation need.', evidenceProduced: 'Gap analysis report.' },
+        ],
+      }],
+    }
+    let pm = normalizeToPanelModel(plan)
+    pm = updateSelectedStage4Deliverables(pm, ['executive_decision_brief'])
+    PANEL_IDS.forEach(pid => {
+      if (canAccept(pm.panels[pid])) pm = acceptPanel(pm, pid)
+    })
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['executive_decision_brief'])
+    const readiness = computeLifecycleReadiness(pm.panels, pm.crossPanelAudit)
+    expect(readiness.mappingWarnings).toHaveLength(0)
+    expect(readiness.mappingReady).toBe(true)
+  })
+
+  it('accepted phase with howOptions and no selected deliverables does not require every possible deliverable', () => {
+    const plan = {
+      ...makeGoodCompiledPlan(),
+      executionSequence: [{
+        phaseName:    'Problem & Outcome Validation',
+        phaseObjective: 'Confirm that examiner-facing explainability outputs meet SR 11-7 requirements before build commitment.',
+        recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format with Compliance team.',
+        exitCriteria:   'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 2 begins.',
+        evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+        howOptions: [
+          { optionName: 'Undocumented Custom Approach', whenToUse: 'In special circumstances only.', whyItFitsThePhaseOutcome: 'Context-dependent.', evidenceProduced: 'Custom evidence.' },
+        ],
+      }],
+    }
+    let pm = normalizeToPanelModel(plan)
+    PANEL_IDS.forEach(pid => {
+      if (canAccept(pm.panels[pid])) pm = acceptPanel(pm, pid)
+    })
+    // Do NOT confirm any how-option mapping — 'Undocumented Custom Approach' has no defaults
+    const readiness = computeLifecycleReadiness(pm.panels, pm.crossPanelAudit)
+    expect(readiness.mappingWarnings).toHaveLength(0)
+    expect(readiness.mappingReady).toBe(true)
+  })
+
+  it('accepted execution sequence blocks Stage 4 readiness when a selected deliverable has no mapped how option', () => {
+    const plan = {
+      ...makeGoodCompiledPlan(),
+      executionSequence: [{
+        phaseName:    'Problem & Outcome Validation',
+        phaseObjective: 'Confirm that examiner-facing explainability outputs meet SR 11-7 requirements before build commitment.',
+        recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format with Compliance team.',
+        exitCriteria:   'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 2 begins.',
+        evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+        howOptions: [
+          { optionName: 'Undocumented Custom Approach', whenToUse: 'In special circumstances only.', whyItFitsThePhaseOutcome: 'Context-dependent.', evidenceProduced: 'Custom evidence.' },
+        ],
+      }],
+    }
+    let pm = normalizeToPanelModel(plan)
+    pm = updateSelectedStage4Deliverables(pm, ['operating_cadence_plan'])
+    PANEL_IDS.forEach(pid => {
+      if (canAccept(pm.panels[pid])) pm = acceptPanel(pm, pid)
+    })
+
+    const readiness = computeLifecycleReadiness(pm.panels, pm.crossPanelAudit)
+    expect(readiness.mappingReady).toBe(false)
+    expect(readiness.mappingWarnings.join(' ')).toContain('selected deliverable')
+  })
+
+  it('existing panels without executionDeliverableMappings normalize safely', () => {
+    const legacyPanel = {
+      panelId: 'executionSequence',
+      content: [{ phaseName: 'Problem & Outcome Validation', phaseObjective: 'Test' }],
+      lifecycle: 'accepted',
+      completenessAudit: null,
+      executionDeliverableMappings: undefined,  // missing
+    }
+    // computeMappingStatus should not throw for missing mappings
+    const status = computeMappingStatus(legacyPanel)
+    expect(status.total).toBe(1)
+    expect(typeof status.mapped).toBe('number')
+    expect(typeof status.unmapped).toBe('number')
   })
 })

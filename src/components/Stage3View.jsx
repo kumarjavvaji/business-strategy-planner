@@ -72,6 +72,9 @@ import {
   createFailedRefinementRecord,
   auditPanelCompleteness,
   validateProposedPanelContent,
+  updatePhaseMapping,
+  updateHowOptionMapping,
+  updateSelectedStage4Deliverables,
 } from '../utils/stage3PanelModel'
 import {
   buildPanelGenerationMessages,
@@ -79,6 +82,13 @@ import {
   parsePanelGenerationResponse,
   parsePanelRefinementResponse,
 } from '../utils/stage3PanelPrompts'
+import {
+  ATOMIC_GENERATION_PANELS,
+  DEFAULT_ITEM_COUNTS,
+  generatePanelAtomically,
+  retryChildUnit,
+  initChildUnits,
+} from '../utils/stage3ChildUnitGeneration'
 import { Stage3PanelView } from './Stage3PanelView'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
@@ -4827,7 +4837,7 @@ function Stage3CompiledQualityAuditView({ audit }) {
   )
 }
 
-function CompiledStrategyView({ compiled, audit, qualityAudit, provenance, panelModel, runningRefinementId, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, hasApiKey: apiKeyAvailable }) {
+function CompiledStrategyView({ compiled, audit, qualityAudit, provenance, panelModel, runningRefinementId, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdatePhaseMapping, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey: apiKeyAvailable }) {
   if (!compiled) return null
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -4840,6 +4850,9 @@ function CompiledStrategyView({ compiled, audit, qualityAudit, provenance, panel
         onGeneratePanel={onGeneratePanel}
         onAcceptPanel={onAcceptPanel}
         onRejectPanel={onRejectPanel}
+        onUpdatePhaseMapping={onUpdatePhaseMapping}
+        onUpdateHowOptionMapping={onUpdateHowOptionMapping}
+        onUpdateSelectedStage4Deliverables={onUpdateSelectedStage4Deliverables}
         hasApiKey={apiKeyAvailable}
       />
       <HandoffCoverageAuditView audit={audit} />
@@ -5089,43 +5102,124 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], 
     }
   }, [compiledStrategy, panelModel, runningRefinementId, commitPanelModel])
 
-  const handleGeneratePanel = useCallback(async ({ panelId }) => {
+  const handleGeneratePanel = useCallback(async ({ panelId, retryIndex = null }) => {
     if (!hasApiKey() || runningRefinementId) return
-    const compiled = panelModelAsCompiledPlan()
-    const currentModel = panelModel || normalizeToPanelModel(compiledStrategy?.compiledBUExecutionPlan || compiled)
+    const currentModel = panelModel || normalizeToPanelModel(compiledStrategy?.compiledBUExecutionPlan || panelModelAsCompiledPlan())
 
     setRunningRefinementId(panelId)
     setPanelRefinementError(null)
 
-    try {
-      const buSummary = {
-        name: unitName || draft?.plan?.buName || legacyPlan?.buName || handoffBrief?.businessUnitName,
-        purpose: handoffBrief?.planningPurpose || draft?.plan?.mission || legacyPlan?.mission,
-        strategicInvolvement: handoffBrief?.decisionBasisSummary || draft?.plan?.strategicRole || legacyPlan?.strategicRole,
-        keyResponsibilities: draft?.plan?.criticalWorkstreams || handoffBrief?.sourceStage2SectionIds || [],
-        dependencies: draft?.plan?.crossFunctionalDependencies || [],
-        risksAndUnknowns: draft?.plan?.risks || [],
-      }
-      const s1Summary = [
-        handoffBrief?.decisionBasisSummary,
-        handoffBrief?.planningPurpose,
-        handoffBrief?.businessUnitName,
-      ].filter(Boolean).join('\n')
+    const buSummary = {
+      name:                 unitName || draft?.plan?.buName || legacyPlan?.buName || handoffBrief?.businessUnitName,
+      purpose:              handoffBrief?.planningPurpose || draft?.plan?.mission || legacyPlan?.mission,
+      strategicInvolvement: handoffBrief?.decisionBasisSummary || draft?.plan?.strategicRole || legacyPlan?.strategicRole,
+      keyResponsibilities:  draft?.plan?.criticalWorkstreams || handoffBrief?.sourceStage2SectionIds || [],
+      dependencies:         draft?.plan?.crossFunctionalDependencies || [],
+      risksAndUnknowns:     draft?.plan?.risks || [],
+    }
+    const s1Summary = [
+      handoffBrief?.decisionBasisSummary,
+      handoffBrief?.planningPurpose,
+      handoffBrief?.businessUnitName,
+    ].filter(Boolean).join('\n')
 
-      const { messages } = buildPanelGenerationMessages({
+    try {
+      // ── Strategic Objective — single call, small enough to complete reliably ──
+      if (!ATOMIC_GENERATION_PANELS.has(panelId)) {
+        const { messages } = buildPanelGenerationMessages({
+          panelId,
+          buSummary,
+          s1Summary,
+          panels: currentModel.panels,
+        })
+        const response = await callAI(messages)
+        if (response?.error || response?.rateLimited) throw new Error(response.error || 'API rate limited.')
+        const truncReason = apiResponseTruncationReason(response)
+        if (truncReason) throw new Error(truncReason)
+        const { content, error } = parsePanelGenerationResponse(panelId, aiResponseText(response))
+        if (error || !content) throw new Error(error || 'Could not parse panel response.')
+        commitPanelModel(prev => applyAcceptedRefinement(prev || currentModel, panelId, content))
+        return
+      }
+
+      // ── Multi-item panels — atomic generation (one item per call) ──────────
+      if (retryIndex != null) {
+        // Retry a single failed child unit — leave all others untouched
+        const existingUnits = currentModel?.panels?.[panelId]?.childUnits || []
+        const siblings = existingUnits
+          .filter(u => u.index !== retryIndex && u.status === 'draft_ready')
+          .map(u => u.content)
+          .filter(Boolean)
+        const updated = await retryChildUnit({ panelId, index: retryIndex, buSummary, s1Summary, siblingsContent: siblings, callAI })
+        commitPanelModel(prev => {
+          const panel    = prev?.panels?.[panelId]
+          const units    = (panel?.childUnits || initChildUnits(panelId, DEFAULT_ITEM_COUNTS[panelId] ?? 3))
+            .map(u => u.index === retryIndex ? updated : u)
+          const assembled = units.filter(u => u.status === 'draft_ready').sort((a, b) => a.index - b.index).map(u => u.content)
+          const panelAudit = assembled.length ? auditPanelCompleteness(panelId, assembled) : null
+          return applyAcceptedRefinement(prev || currentModel, panelId, assembled, { childUnits: units, panelAudit })
+        })
+        if (updated.status === 'failed') setPanelRefinementError(`Item ${retryIndex + 1} retry failed: ${updated.error}`)
+        return
+      }
+
+      // Full atomic generation
+      const existingUnits = currentModel?.panels?.[panelId]?.childUnits || []
+
+      // Initialise child units to 'generating' state in UI immediately
+      commitPanelModel(prev => {
+        const panel = prev?.panels?.[panelId]
+        const count = DEFAULT_ITEM_COUNTS[panelId] ?? 3
+        const blank = initChildUnits(panelId, count).map(u => {
+          const prior = existingUnits.find(e => e.index === u.index && e.status === 'accepted')
+          return prior ? prior : { ...u, status: 'generating' }
+        })
+        if (!prev?.panels?.[panelId]) return prev
+        return { ...prev, panels: { ...prev.panels, [panelId]: { ...panel, childUnits: blank, lifecycle: 'generating_units' } } }
+      })
+
+      const { assembledContent, allChildUnits, failedUnits } = await generatePanelAtomically({
         panelId,
         buSummary,
         s1Summary,
-        panels: currentModel.panels,
+        existingPanels:    currentModel.panels,
+        existingChildUnits: existingUnits,
+        callAI,
+        onChildUnitComplete: (index, content, audit) => {
+          commitPanelModel(prev => {
+            const panel = prev?.panels?.[panelId]
+            if (!panel) return prev
+            const units = (panel.childUnits || []).map(u =>
+              u.index === index ? { ...u, status: 'draft_ready', content, audit, generatedAt: new Date().toISOString() } : u
+            )
+            return { ...prev, panels: { ...prev.panels, [panelId]: { ...panel, childUnits: units } } }
+          })
+        },
+        onChildUnitFailed: (index, error) => {
+          commitPanelModel(prev => {
+            const panel = prev?.panels?.[panelId]
+            if (!panel) return prev
+            const units = (panel.childUnits || []).map(u =>
+              u.index === index ? { ...u, status: 'failed', error, generatedAt: new Date().toISOString() } : u
+            )
+            return { ...prev, panels: { ...prev.panels, [panelId]: { ...panel, childUnits: units } } }
+          })
+        },
       })
-      const response = await callAI(messages)
-      if (response?.error || response?.rateLimited) {
-        throw new Error(response.error || 'API rate limited. Try again.')
-      }
-      const { content: generatedContent, error } = parsePanelGenerationResponse(panelId, aiResponseText(response))
-      if (error || !generatedContent) throw new Error(error || 'Could not parse panel generation response.')
 
-      commitPanelModel(prev => applyAcceptedRefinement(prev || currentModel, panelId, generatedContent))
+      // Apply assembled content (only completed items) — preserve prior accepted content if all failed
+      if (assembledContent.length > 0) {
+        commitPanelModel(prev =>
+          applyAcceptedRefinement(prev || currentModel, panelId, assembledContent, { childUnits: allChildUnits })
+        )
+      } else {
+        // Nothing succeeded — mark panel failed but preserve prior accepted content
+        commitPanelModel(prev => rejectPanel(prev || currentModel, panelId, 'All child units failed — no content generated.'))
+      }
+
+      if (failedUnits.length > 0) {
+        setPanelRefinementError(`${failedUnits.length} item(s) failed and can be retried individually.`)
+      }
     } catch (err) {
       const error = `Panel generation failed: ${err?.message || String(err)}`
       setPanelRefinementError(error)
@@ -5146,6 +5240,18 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], 
 
   const handleRejectPanel = useCallback(({ panelId }) => {
     commitPanelModel(prev => rejectPanel(prev, panelId))
+  }, [commitPanelModel])
+
+  const handleUpdatePhaseMapping = useCallback(({ phaseId, mappedDeliverables }) => {
+    commitPanelModel(prev => updatePhaseMapping(prev, phaseId, mappedDeliverables))
+  }, [commitPanelModel])
+
+  const handleUpdateHowOptionMapping = useCallback(({ phaseId, optionId, mappedDeliverables }) => {
+    commitPanelModel(prev => updateHowOptionMapping(prev, phaseId, optionId, mappedDeliverables))
+  }, [commitPanelModel])
+
+  const handleUpdateSelectedStage4Deliverables = useCallback(({ deliverableTypes }) => {
+    commitPanelModel(prev => updateSelectedStage4Deliverables(prev, deliverableTypes))
   }, [commitPanelModel])
 
   if (!tree || !tree.sections.length) {
@@ -5258,6 +5364,9 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], 
             onGeneratePanel={handleGeneratePanel}
             onAcceptPanel={handleAcceptPanel}
             onRejectPanel={handleRejectPanel}
+            onUpdatePhaseMapping={handleUpdatePhaseMapping}
+            onUpdateHowOptionMapping={handleUpdateHowOptionMapping}
+            onUpdateSelectedStage4Deliverables={handleUpdateSelectedStage4Deliverables}
             hasApiKey={hasApiKey()}
           />
         </>

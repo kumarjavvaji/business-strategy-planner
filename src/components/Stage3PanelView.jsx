@@ -17,11 +17,25 @@ import {
 import {
   PANEL_LIFECYCLE,
   LIFECYCLE_DISPLAY,
+  STRENGTH_DISPLAY,
   canAccept,
   canGenerate,
   canRefine,
   countPanelIssues,
 } from '../utils/stage3PanelLifecycle'
+import { ATOMIC_GENERATION_PANELS } from '../utils/stage3ChildUnitGeneration'
+import { STRENGTH_STATUSES, strengthAuditBlocks } from '../utils/stage3PanelStrengthAudit'
+import {
+  STAGE4_DELIVERABLES,
+  MAPPING_STATUS,
+  phaseSlug,
+  optionSlug,
+  suggestPhaseDeliverables,
+  computeMappingStatus,
+  getMappedDeliverableIds,
+  getDeliverableMappingSummary,
+  getSelectedStage4Deliverables,
+} from '../utils/stage3PanelModel'
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
 
@@ -43,6 +57,70 @@ function Badge({ children, color = '#00e5b4', small = false }) {
     }}>
       {children}
     </span>
+  )
+}
+
+/** Compact badge showing the document-strength status of a panel. */
+function PanelStrengthBadge({ strengthAudit }) {
+  if (!strengthAudit) return null
+  const display = STRENGTH_DISPLAY?.[strengthAudit.status]
+  if (!display) return null
+  // Don't show a badge for STRONG — it's the default/expected state
+  if (strengthAudit.status === STRENGTH_STATUSES.STRONG) return null
+  return (
+    <Badge color={display.color} small>
+      {display.label}
+    </Badge>
+  )
+}
+
+/** Expandable detail panel for strength audit findings. */
+function PanelStrengthDetail({ strengthAudit }) {
+  if (!strengthAudit || strengthAudit.status === STRENGTH_STATUSES.STRONG) return null
+  const display = STRENGTH_DISPLAY?.[strengthAudit.status]
+  if (!display) return null
+
+  const categories = [
+    { key: 'parentAlignmentFindings',   label: 'Parent-Section Alignment' },
+    { key: 'specificityFindings',       label: 'Specificity & Concreteness' },
+    { key: 'downstreamUsefulnessFindings', label: 'Downstream Usefulness for Stage 4' },
+    { key: 'mechanicalTextFindings',    label: 'Mechanical / Generic Language' },
+  ]
+
+  return (
+    <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 4, background: `${display.color}0d`, border: `1px solid ${display.color}33` }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700, color: display.color, textTransform: 'uppercase', letterSpacing: '.04em' }}>
+          Document Strength — {display.label}
+        </span>
+        <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted2)' }}>
+          score {strengthAudit.score ?? '—'}/100
+        </span>
+      </div>
+
+      {categories.map(({ key, label }) => {
+        const items = strengthAudit[key] || []
+        if (!items.length) return null
+        return (
+          <div key={key} style={{ marginBottom: 5 }}>
+            <div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 2 }}>
+              {label}
+            </div>
+            {items.map((finding, i) => (
+              <div key={i} style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 2, paddingLeft: 8, borderLeft: `2px solid ${display.color}44` }}>
+                {finding}
+              </div>
+            ))}
+          </div>
+        )
+      })}
+
+      {strengthAudit.recommendedAction && (
+        <div style={{ marginTop: 4, fontSize: 8, fontFamily: 'var(--fm)', color: display.color, fontStyle: 'italic' }}>
+          → {strengthAudit.recommendedAction}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -378,11 +456,358 @@ function RefinementHistoryEntry({ entry }) {
   )
 }
 
+// ── Execution Sequence — deliverable mapping UI ───────────────────────────────
+
+/** Status chip for a mapping record. */
+function MappingStatusChip({ status }) {
+  const cfg = {
+    [MAPPING_STATUS.USER_CONFIRMED]: { label: 'confirmed', color: '#00e5b4' },
+    [MAPPING_STATUS.PARTIAL]:        { label: 'partial',   color: '#fb923c' },
+    [MAPPING_STATUS.SUGGESTED]:      { label: 'suggested', color: '#f59e0b' },
+    [MAPPING_STATUS.UNMAPPED]:       { label: 'unmapped',  color: '#f87171' },
+  }[status] || { label: status, color: '#6b7280' }
+  return (
+    <span style={{ fontSize: 6, fontFamily: 'var(--fm)', fontWeight: 700, color: cfg.color, border: `1px solid ${cfg.color}55`, padding: '0 4px', borderRadius: 2, textTransform: 'uppercase', letterSpacing: '.04em' }}>
+      {cfg.label}
+    </span>
+  )
+}
+
+/** Checkbox list of Stage 4 deliverables — shared by both per-how-option and legacy phase rows. */
+/**
+ * Row for a single how-option with its own deliverable checkbox list.
+ * The primary mapping control — one how-option can map to multiple deliverables.
+ */
+function HowOptionMappingRow({ phaseId, opt, optMapping, activeDeliverableId, onUpdateHowOption, disabled }) {
+  const optName  = opt?.optionName || 'Option'
+  const optId    = optionSlug(optName)
+  const selected = optMapping?.mappedDeliverables || []
+  const status   = optMapping?.mappingStatus || MAPPING_STATUS.UNMAPPED
+  const checked  = selected.includes(activeDeliverableId)
+  const desc     = ''
+  function toggle() {
+    if (!activeDeliverableId) return
+    const next = checked ? selected.filter(d => d !== activeDeliverableId) : [...selected, activeDeliverableId]
+    onUpdateHowOption(phaseId, optId, next)
+  }
+
+  return (
+    <div style={{ marginBottom: 7, paddingBottom: 7, paddingLeft: 10, borderLeft: '2px solid var(--border)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled || !activeDeliverableId}
+          onChange={toggle}
+          style={{ width: 12, height: 12, accentColor: '#00e5b4', cursor: disabled ? 'not-allowed' : 'pointer', flexShrink: 0 }}
+        />
+        <span style={{ fontSize: 7.5, fontFamily: 'var(--fm)', fontWeight: 600, color: 'var(--fg)', flex: 1 }}>
+          {optName}
+        </span>
+        <MappingStatusChip status={status} />
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginLeft: 17 }}>
+        {opt?.whenToUse && <LabeledText label="use when" value={opt.whenToUse} />}
+        {opt?.whyItFitsThePhaseOutcome && <LabeledText label="why it fits" value={opt.whyItFitsThePhaseOutcome} />}
+        {opt?.evidenceProduced && <LabeledText label="evidence" value={opt.evidenceProduced} />}
+      </div>
+      {desc && (
+        <div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 4, lineHeight: 1.4 }}>
+          {String(desc).slice(0, 120)}{String(desc).length > 120 ? '…' : ''}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Phase container for the deliverable mapping section.
+ * - Phases WITH howOptions: shows how-option rows as the primary mapping control.
+ *   Phase header shows derived mapping summary (union of selected how-option deliverables).
+ * - Phases WITHOUT howOptions: legacy fallback — shows phase-level checkboxes.
+ */
+function PhaseDeliverableRow({ phase, mapping, activeDeliverableId, activeDeliverableLabel, onUpdate, onUpdateHowOption, disabled }) {
+  const phaseName  = phase?.phaseName || 'Phase'
+  const phaseId    = phaseSlug(phaseName)
+  const howOptions = Array.isArray(phase?.howOptions) ? phase.howOptions : []
+  const status     = mapping?.mappingStatus || MAPPING_STATUS.UNMAPPED
+
+  if (howOptions.length > 0) {
+    // New model: how-option level mapping
+    const howOptMaps  = mapping?.howOptionMappings || {}
+    const mappedCount = howOptions.filter(opt => (howOptMaps[optionSlug(opt?.optionName)]?.mappedDeliverables || []).includes(activeDeliverableId)).length
+
+    return (
+      <div style={{ marginBottom: 10, paddingBottom: 10, borderBottom: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}>
+          <span style={{ fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700, color: 'var(--fg)', flex: 1 }}>
+            {phaseName}
+          </span>
+          <MappingStatusChip status={status} />
+          <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted2)', flexShrink: 0 }}>
+            {mappedCount}/{howOptions.length} selected for {activeDeliverableLabel}
+          </span>
+        </div>
+        {howOptions.map((opt, i) => (
+          <HowOptionMappingRow
+            key={optionSlug(opt?.optionName) || i}
+            phaseId={phaseId}
+            opt={opt}
+            optMapping={howOptMaps[optionSlug(opt?.optionName)]}
+            activeDeliverableId={activeDeliverableId}
+            onUpdateHowOption={onUpdateHowOption}
+            disabled={disabled}
+          />
+        ))}
+      </div>
+    )
+  }
+
+  // Legacy / no how-options: phase-level checkboxes
+  const selected = mapping?.phaseMappedDeliverables || mapping?.mappedDeliverables || []
+  const checked = selected.includes(activeDeliverableId)
+  function toggle() {
+    const next = checked ? selected.filter(d => d !== activeDeliverableId) : [...selected, activeDeliverableId]
+    onUpdate(phaseId, next)
+  }
+  return (
+    <div style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid var(--border)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 4 }}>
+        <input type="checkbox" checked={checked} disabled={disabled} onChange={toggle} style={{ width: 12, height: 12, accentColor: '#00e5b4', cursor: disabled ? 'not-allowed' : 'pointer', flexShrink: 0 }} />
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700, color: 'var(--fg)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {phaseName}
+        </span>
+        <MappingStatusChip status={status} />
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Full deliverable mapping section for the Execution Sequence panel.
+ * Shows phases as containers; each phase shows its how-options (or falls back to phase-level).
+ */
+function ExecutionMappingSection({ panel, onUpdateMapping, onUpdateHowOptionMapping, onUpdateSelectedDeliverables, disabled }) {
+  const content  = panel?.content
+  const mappings = panel?.executionDeliverableMappings
+  const selectedRecords = getSelectedStage4Deliverables(panel)
+  const selectedIds = selectedRecords.map(record => record.deliverableType)
+  const mappedIds = getMappedDeliverableIds(panel)
+  const defaultDeliverableId = selectedIds.includes('bu_execution_plan') ? 'bu_execution_plan' : (selectedIds[0] || mappedIds[0] || 'bu_execution_plan')
+  const [activeDeliverableId, setActiveDeliverableId] = useState(defaultDeliverableId)
+
+  if (!Array.isArray(content) || content.length === 0) return null
+
+  const activeId = selectedIds.includes(activeDeliverableId) ? activeDeliverableId : selectedIds[0]
+  const activeDeliverable = STAGE4_DELIVERABLES.find(d => d.id === activeId) || null
+  const summary = activeDeliverable
+    ? getDeliverableMappingSummary(panel, activeDeliverable.id)
+    : { selectedHowOptionCount: 0, selectedPhaseCount: 0 }
+  const selectedSummaries = selectedRecords.map(record => {
+    const deliverable = STAGE4_DELIVERABLES.find(d => d.id === record.deliverableType)
+    const deliverableSummary = getDeliverableMappingSummary(panel, record.deliverableType)
+    return {
+      ...record,
+      label: deliverable?.label || record.deliverableType,
+      count: deliverableSummary.selectedHowOptionCount,
+      phaseCount: deliverableSummary.selectedPhaseCount,
+    }
+  })
+
+  function toggleSelectedDeliverable(deliverableId) {
+    const next = selectedIds.includes(deliverableId)
+      ? selectedIds.filter(id => id !== deliverableId)
+      : [...selectedIds, deliverableId]
+    if (!next.includes(activeDeliverableId)) setActiveDeliverableId(next[0] || '')
+    onUpdateSelectedDeliverables?.({ deliverableTypes: next })
+  }
+
+  function handleUpdate(phaseId, deliverables) {
+    if (onUpdateMapping) onUpdateMapping({ phaseId, mappedDeliverables: deliverables })
+  }
+
+  function handleUpdateHowOption(phaseId, optionId, deliverables) {
+    if (onUpdateHowOptionMapping) onUpdateHowOptionMapping({ phaseId, optionId, mappedDeliverables: deliverables })
+  }
+
+  function getMapping(phase) {
+    const id = phaseSlug(phase?.phaseName)
+    if (mappings?.[id]) return mappings[id]
+    const suggested = suggestPhaseDeliverables(phase?.phaseName)
+    return {
+      phaseMappedDeliverables: suggested,
+      mappedDeliverables:      suggested,
+      suggestedDeliverables:   suggested,
+      mappingStatus:           suggested.length > 0 ? MAPPING_STATUS.SUGGESTED : MAPPING_STATUS.UNMAPPED,
+      howOptionMappings:       {},
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }}>
+        Stage 4 deliverables to prepare
+      </div>
+      <div style={{ display: 'none', fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }}>
+        Deliverable Mapping — map how options to Stage 4 artifacts
+      </div>
+      <div style={{ display: 'grid', gap: 5, marginBottom: 8 }}>
+        {STAGE4_DELIVERABLES.map(deliverable => {
+          const selected = selectedIds.includes(deliverable.id)
+          const deliverableSummary = getDeliverableMappingSummary(panel, deliverable.id)
+          return (
+            <label
+              key={deliverable.id}
+              style={{ display: 'grid', gridTemplateColumns: '14px minmax(0, 1fr) auto', gap: 6, alignItems: 'start', padding: '5px 6px', borderRadius: 4, border: `1px solid ${selected ? 'rgba(0,229,180,.35)' : 'var(--border)'}`, background: selected ? 'rgba(0,229,180,.05)' : 'transparent', cursor: disabled ? 'not-allowed' : 'pointer' }}
+            >
+              <input
+                type="checkbox"
+                checked={selected}
+                disabled={disabled}
+                onChange={() => toggleSelectedDeliverable(deliverable.id)}
+                style={{ width: 12, height: 12, marginTop: 1, accentColor: '#00e5b4', cursor: disabled ? 'not-allowed' : 'pointer' }}
+              />
+              <span style={{ minWidth: 0 }}>
+                <span style={{ display: 'block', fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700, color: selected ? '#00e5b4' : 'var(--fg)' }}>{deliverable.label}</span>
+                <span style={{ display: 'block', fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.35 }}>{deliverable.intent}</span>
+              </span>
+              {selected && (
+                <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: deliverableSummary.selectedHowOptionCount > 0 ? '#00e5b4' : '#f97316', whiteSpace: 'nowrap' }}>
+                  {deliverableSummary.selectedHowOptionCount > 0 ? `${deliverableSummary.selectedHowOptionCount} mapped` : 'incomplete'}
+                </span>
+              )}
+            </label>
+          )
+        })}
+      </div>
+      {selectedSummaries.length > 0 && (
+        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 8 }}>
+          {selectedSummaries.map(item => (
+            <span key={item.deliverableType} style={{ fontSize: 7, fontFamily: 'var(--fm)', color: item.count > 0 ? '#00e5b4' : '#f97316', border: '1px solid var(--border)', borderRadius: 3, padding: '2px 5px' }}>
+              {item.label}: {item.count > 0 ? `${item.count} how option${item.count === 1 ? '' : 's'}` : 'incomplete'}
+            </span>
+          ))}
+        </div>
+      )}
+      {!activeDeliverable && (
+        <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', padding: '6px 0' }}>
+          Content ready; no Stage 4 deliverables selected.
+        </div>
+      )}
+      {activeDeliverable && (
+        <>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+          <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em' }}>
+            Selected deliverable
+          </span>
+          <select
+            value={activeDeliverable.id}
+            disabled={disabled}
+            onChange={e => setActiveDeliverableId(e.target.value)}
+            style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--fg)', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 3, padding: '3px 6px' }}
+          >
+            {selectedRecords.map(record => {
+              const deliverable = STAGE4_DELIVERABLES.find(d => d.id === record.deliverableType)
+              return <option key={record.deliverableType} value={record.deliverableType}>{deliverable?.label || record.deliverableType}</option>
+            })}
+          </select>
+        </label>
+      </div>
+      <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4', marginBottom: 8 }}>
+        {activeDeliverable.label}: {summary.selectedHowOptionCount} how option{summary.selectedHowOptionCount === 1 ? '' : 's'} selected across {summary.selectedPhaseCount} phase{summary.selectedPhaseCount === 1 ? '' : 's'}.
+      </div>
+      {content.map((phase, i) => (
+        <PhaseDeliverableRow
+          key={phaseSlug(phase?.phaseName) || i}
+          phase={phase}
+          mapping={getMapping(phase)}
+          activeDeliverableId={activeDeliverable.id}
+          activeDeliverableLabel={activeDeliverable.label}
+          onUpdate={handleUpdate}
+          onUpdateHowOption={handleUpdateHowOption}
+          disabled={disabled}
+        />
+      ))}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ── Child unit progress tracker ───────────────────────────────────────────────
+
+/**
+ * Shows per-item generation status for atomic panels (risks, criticalDecisions, etc.).
+ * Rendered when: generation is running OR there are failed units needing retry.
+ */
+function ChildUnitProgressTracker({ panelId, childUnits = [], isRunning, onGenerate }) {
+  if (!childUnits.length) return null
+
+  const hasFailed = childUnits.some(u => u.status === 'failed')
+  if (!isRunning && !hasFailed) return null
+
+  const doneCount = childUnits.filter(u => ['draft_ready', 'needs_refinement', 'accepted'].includes(u.status)).length
+  const total     = childUnits.length
+
+  return (
+    <div style={{ marginTop: 8, padding: '7px 9px', borderRadius: 4, background: 'rgba(59,130,246,.06)', border: '1px solid rgba(59,130,246,.2)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: hasFailed ? 5 : 0 }}>
+        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#3b82f6', fontWeight: 600 }}>
+          {isRunning ? `generating items… ${doneCount}/${total} done` : `${hasFailed ? childUnits.filter(u => u.status === 'failed').length + ' item(s) failed' : ''}`}
+        </span>
+        <div style={{ display: 'flex', gap: 3 }}>
+          {childUnits.map(u => {
+            const color = u.status === 'draft_ready' || u.status === 'accepted' ? '#00e5b4'
+              : u.status === 'needs_refinement' ? '#f59e0b'
+              : u.status === 'failed'           ? '#f87171'
+              : u.status === 'generating'       ? '#3b82f6'
+              : '#6b7280'
+            const pulse = u.status === 'generating'
+            return (
+              <span
+                key={u.index}
+                title={`Item ${u.index + 1}: ${u.status}${u.error ? ` — ${u.error}` : ''}`}
+                style={{
+                  display: 'inline-block',
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  background: color,
+                  opacity: pulse ? undefined : 1,
+                  animation: pulse ? 'pulse 1.2s ease-in-out infinite' : 'none',
+                  flexShrink: 0,
+                }}
+              />
+            )
+          })}
+        </div>
+      </div>
+
+      {hasFailed && !isRunning && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+          {childUnits.filter(u => u.status === 'failed').map(u => (
+            <button
+              key={u.index}
+              onClick={() => onGenerate?.({ panelId, retryIndex: u.index })}
+              title={u.error || undefined}
+              style={{ fontSize: 7, fontFamily: 'var(--fm)', padding: '2px 7px', borderRadius: 3, border: '1px solid #f8717188', background: 'transparent', color: '#f87171', cursor: 'pointer' }}
+            >
+              retry item {u.index + 1}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Panel card ────────────────────────────────────────────────────────────────
 
-function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRefine, onGenerate, onAccept, onReject, hasApiKey }) {
+function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRefine, onGenerate, onAccept, onReject, hasApiKey, onUpdateMapping, onUpdateHowOptionMapping, onUpdateSelectedDeliverables }) {
   const [expanded,        setExpanded]        = useState(false)
   const [showAudit,       setShowAudit]       = useState(false)
+  const [showStrength,    setShowStrength]    = useState(false)
   const [showRefinement,  setShowRefinement]  = useState(false)
   const [showHistory,     setShowHistory]     = useState(false)
 
@@ -391,11 +816,21 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
   const audit   = panel?.completenessAudit
   const content = panel?.content
   const history = panel?.refinementHistory || []
-  const isRunning = runningRefinementId === panelId
+  const childUnits = panel?.childUnits || []
+  const strengthAudit = panel?.panelStrengthAudit || null
+  const isAtomic   = ATOMIC_GENERATION_PANELS.has(panelId)
+  const isRunning  = runningRefinementId === panelId
+  const isAtomicGenerating = isRunning && isAtomic && panel?.lifecycle === 'generating_units'
   const lifecycle = isRunning ? PANEL_LIFECYCLE.GENERATING : (panel?.lifecycle || PANEL_LIFECYCLE.NOT_STARTED)
   const displayedAuditStatus = resolvePanelDisplayStatus({ ...panel, lifecycle })
   const issueCount = countPanelIssues(panel, crossPanelAudit)
   const actionDisabled = lifecycle === PANEL_LIFECYCLE.GENERATING
+  const hasFailedChildUnits = isAtomic && childUnits.some(u => u.status === 'failed')
+  const strengthBlocks = strengthAuditBlocks(strengthAudit)
+
+  // Execution Sequence mapping summary
+  const isExecSeq     = panelId === 'executionSequence'
+  const mappingSummary = isExecSeq ? computeMappingStatus(panel) : null
 
   const summary     = synthesizePanelSummary(panelId, content)
   const lastTouched = panel?.lastRefinedAt || panel?.lastGeneratedAt
@@ -418,10 +853,22 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
             <span style={{ fontSize: 10, fontWeight: 700, color: accent }}>{label}</span>
             <LifecycleBadge lifecycle={lifecycle} />
             {displayedAuditStatus && <PanelStatusBadge status={displayedAuditStatus} />}
-            {isRunning && <Badge color="#3b82f6" small>refining…</Badge>}
+            {isRunning && <Badge color="#3b82f6" small>{isAtomicGenerating ? 'generating…' : 'refining…'}</Badge>}
+            {!isRunning && hasFailedChildUnits && <Badge color="#f87171" small>items failed</Badge>}
+            {!isRunning && <PanelStrengthBadge strengthAudit={strengthAudit} />}
             {issueCount > 0 && <Badge color="#f87171" small>{issueCount} issue{issueCount === 1 ? '' : 's'}</Badge>}
           </div>
           <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{summary}</div>
+          {/* Execution Sequence mapping summary */}
+          {isExecSeq && mappingSummary && mappingSummary.total > 0 && (
+            <div style={{ fontSize: 7, fontFamily: 'var(--fm)', marginTop: 2 }}>
+              <span style={{ color: 'var(--muted2)' }}>{mappingSummary.total} phase{mappingSummary.total === 1 ? '' : 's'}</span>
+              {' · '}
+              <span style={{ color: mappingSummary.mapped > 0 ? '#00e5b4' : 'var(--muted2)' }}>{mappingSummary.mapped} mapped</span>
+              {' · '}
+              <span style={{ color: mappingSummary.unmapped > 0 ? '#f97316' : 'var(--muted2)' }}>{mappingSummary.unmapped} unmapped</span>
+            </div>
+          )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
           {lastTouchedLabel && <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted2)' }}>updated {lastTouchedLabel}</span>}
@@ -461,6 +908,15 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
             >
               {showAudit ? '▲ hide audit' : `▼ audit · ${audit?.status || 'pending'}`}
             </button>
+
+            {strengthAudit && content && (
+              <button
+                onClick={() => setShowStrength(s => !s)}
+                style={{ fontSize: 7, fontFamily: 'var(--fm)', padding: '3px 8px', borderRadius: 3, border: `1px solid ${strengthBlocks ? '#f9731688' : '#a3e63588'}`, background: 'transparent', color: strengthBlocks ? '#f97316' : '#a3e635', cursor: 'pointer' }}
+              >
+                {showStrength ? '▲ hide strength' : `▼ strength · ${strengthAudit.status || 'pending'}`}
+              </button>
+            )}
 
             {hasApiKey && canRefine(panel) && (
               <button
@@ -502,6 +958,11 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
             )}
           </div>
 
+          {/* Document-strength audit detail — auto-shown when blocking, or toggled via button */}
+          {content && (strengthBlocks || showStrength) && (
+            <PanelStrengthDetail strengthAudit={strengthAudit} />
+          )}
+
           {/* Completeness audit detail */}
           {showAudit && (
             <PanelAuditDetail audit={audit} crossPanelAudit={crossPanelAudit} panelId={panelId} />
@@ -517,10 +978,30 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
             />
           )}
 
-          {isRunning && (
+          {isRunning && !isAtomicGenerating && (
             <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#3b82f6', padding: '8px 0', fontStyle: 'italic' }}>
               Refining {label}…
             </div>
+          )}
+
+          {(isAtomicGenerating || hasFailedChildUnits) && (
+            <ChildUnitProgressTracker
+              panelId={panelId}
+              childUnits={childUnits}
+              isRunning={isRunning}
+              onGenerate={onGenerate}
+            />
+          )}
+
+          {/* Execution Sequence: deliverable mapping section */}
+          {isExecSeq && content && (
+            <ExecutionMappingSection
+              panel={panel}
+              onUpdateMapping={onUpdateMapping}
+              onUpdateHowOptionMapping={onUpdateHowOptionMapping}
+              onUpdateSelectedDeliverables={onUpdateSelectedDeliverables}
+              disabled={actionDisabled}
+            />
           )}
 
           {/* Refinement history */}
@@ -605,8 +1086,9 @@ function CrossPanelAuditSummary({ crossPanelAudit }) {
 
 function ReadinessBanner({ readinessStatus }) {
   if (!readinessStatus) return null
-  const { isReady, blockingPanels, blockingReasons } = readinessStatus
-  if (isReady) {
+  const { isReady, blockingPanels, blockingReasons, mappingReady, mappingWarnings } = readinessStatus
+
+  if (isReady && mappingReady !== false) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 11px', borderRadius: 4, background: 'rgba(0,229,180,.08)', border: '1px solid rgba(0,229,180,.3)', marginBottom: 8 }}>
         <Badge color="#00e5b4" small>stage 4 ready</Badge>
@@ -614,18 +1096,43 @@ function ReadinessBanner({ readinessStatus }) {
       </div>
     )
   }
+
+  // Content ready but mapping incomplete
+  if (isReady && mappingReady === false) {
+    return (
+      <div style={{ padding: '7px 11px', borderRadius: 4, background: 'rgba(249,115,22,.06)', border: '1px solid rgba(249,115,22,.3)', marginBottom: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: mappingWarnings?.length ? 4 : 0 }}>
+          <Badge color="#f97316" small>mapping incomplete</Badge>
+          <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f97316' }}>
+            Content ready; deliverable mapping incomplete.
+          </span>
+        </div>
+        {mappingWarnings?.map((w, i) => (
+          <div key={i} style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 2 }}>— {w}</div>
+        ))}
+      </div>
+    )
+  }
+
   return (
     <div style={{ padding: '7px 11px', borderRadius: 4, background: 'rgba(248,113,113,.06)', border: '1px solid rgba(248,113,113,.28)', marginBottom: 8 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: blockingReasons?.length ? 5 : 0 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: blockingReasons?.length || mappingWarnings?.length ? 5 : 0 }}>
         <Badge color="#f87171" small>needs refinement</Badge>
         <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171' }}>
           Stage 4 blocked: {blockingPanels?.length} panel{blockingPanels?.length === 1 ? '' : 's'} need attention.
         </span>
       </div>
       {blockingReasons?.length > 0 && (
-        <div>
+        <div style={{ marginBottom: mappingWarnings?.length ? 4 : 0 }}>
           {blockingReasons.slice(0, 4).map((r, i) => (
             <div key={i} style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginBottom: 2 }}>— {r}</div>
+          ))}
+        </div>
+      )}
+      {mappingWarnings?.length > 0 && (
+        <div>
+          {mappingWarnings.map((w, i) => (
+            <div key={i} style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f97316', marginBottom: 2 }}>— {w}</div>
           ))}
         </div>
       )}
@@ -644,7 +1151,7 @@ function ReadinessBanner({ readinessStatus }) {
  *   onRefinePanel       — ({ panelId, prompt, impactSummary }) => void
  *   hasApiKey           — boolean — whether to show refinement controls
  */
-export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, hasApiKey = false }) {
+export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdatePhaseMapping, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey = false }) {
   if (!panelModel?.panels) {
     return (
       <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic', padding: '8px 0' }}>
@@ -670,6 +1177,9 @@ export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefi
           onGenerate={onGeneratePanel}
           onAccept={onAcceptPanel}
           onReject={onRejectPanel}
+          onUpdateMapping={onUpdatePhaseMapping}
+          onUpdateHowOptionMapping={onUpdateHowOptionMapping}
+          onUpdateSelectedDeliverables={onUpdateSelectedStage4Deliverables}
           hasApiKey={hasApiKey}
         />
       ))}
