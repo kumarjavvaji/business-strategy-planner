@@ -21,16 +21,32 @@ import {
   loadAllArtifactOutputs,
   isArtifactOutputStale,
   saveArtifactReview,
+  auditArtifactOutput,
+  buildArtifactProgressOutput,
+  buildInitialArtifactSectionUnits,
+  buildInitialArtifactChildUnits,
+  applySectionGenerationSuccess,
+  applySectionGenerationFailure,
+  applyChildGenerationSuccess,
+  applyChildGenerationFailure,
+  assembleSectionFromChildUnits,
+  assembleArtifactFromSectionUnits,
   REVIEW_STATUS,
   REVIEW_DIMENSIONS,
 } from '../utils/stage4ArtifactOutput'
 import {
-  buildArtifactPrompt,
-  parseArtifactResponse,
-  generateMockArtifactOutput,
+  buildArtifactSectionPrompt,
+  buildArtifactChildPrompt,
+  deriveSectionChildDefs,
+  getArtifactSectionOutline,
+  parseArtifactSectionResponse,
+  parseArtifactChildResponse,
+  generateMockArtifactSectionOutput,
+  generateMockArtifactChildOutput,
   SUPPORTED_GENERATION_TYPES,
 } from '../utils/stage4ArtifactPrompts'
-import { callAI, getApiMode, hasApiKey } from '../api/aiClient'
+import { compileArtifactBasis, basisPreviewText } from '../utils/stage4ArtifactBasis'
+import { callAI, hasApiKey } from '../api/aiClient'
 import { storageReady } from '../utils/storageRouter'
 
 // ── Shared style tokens ────────────────────────────────────────────────────────
@@ -373,16 +389,59 @@ function ReviewBadge({ status }) {
   )
 }
 
+function countGeneratedSections(sectionUnits = []) {
+  return (sectionUnits || []).filter(unit => ['draft_ready', 'accepted'].includes(unit?.lifecycle) && unit?.section).length
+}
+
+function countFailedSections(sectionUnits = []) {
+  return (sectionUnits || []).filter(unit => unit?.lifecycle === 'failed').length
+}
+
+function describeGenerationStatus({ genPhase, genFailureType, hasOutput, artifactGenerationStatus, sectionUnits }) {
+  if (genPhase === 'failed' && hasOutput) return 'partial'
+  if (genPhase === 'failed') return genFailureType?.startsWith('child') ? 'partial' : 'failed'
+  if (['generating', 'persisting', 'verifying'].includes(genPhase)) return 'generating'
+  if (artifactGenerationStatus === 'partial') return 'partial'
+  if (artifactGenerationStatus === 'generated' || genPhase === 'done') return 'generated'
+  if (hasOutput && countGeneratedSections(sectionUnits) > 0) return 'partial'
+  return 'not_generated'
+}
+
 function ArtifactCard({
   artifact, selected, onToggle, editing,
   genPhase = null, genError = null, genFailureType = null,
   hasOutput = false, isOutputStale = false,
   reviewStatus = null,
-  onGenerate = null, apiMode = 'mock',
+  onGenerate = null, artifactBasis = null,
+  artifactGenerationStatus = null,
+  sectionUnits = [],
 }) {
   const isBlocked      = artifact.readinessStatus === ARTIFACT_READINESS.BLOCKED
   const isSupported    = SUPPORTED_GENERATION_TYPES.has(artifact.artifactType)
   const isGenerating   = ['generating', 'persisting', 'verifying'].includes(genPhase)
+  const basisStatus = !isSupported ? 'generator_missing'
+    : artifactBasis?.counts?.mappedHowOptions === 0 ? 'basis_incomplete'
+    : 'basis_ready'
+  const generationStatus = describeGenerationStatus({ genPhase, genFailureType, hasOutput, artifactGenerationStatus, sectionUnits })
+  const generatedCount = countGeneratedSections(sectionUnits)
+  const failedCount = countFailedSections(sectionUnits)
+  const totalCount = sectionUnits?.length || 0
+  const basisLabel = {
+    basis_ready: 'Basis ready',
+    basis_incomplete: 'Basis incomplete',
+    generator_missing: 'Generator missing',
+  }[basisStatus]
+  const generationLabel = generationStatus === 'generating'
+    ? `Generating ${generatedCount}/${totalCount || '?'} sections`
+    : generationStatus === 'partial'
+      ? `Partial - ${generatedCount}/${totalCount || '?'} sections generated${failedCount ? `, ${failedCount} failed` : ''}`
+      : generationStatus === 'generated'
+        ? 'Generated'
+        : generationStatus === 'failed'
+          ? 'Failed'
+          : basisStatus === 'basis_incomplete'
+            ? 'Cannot generate'
+            : 'Not generated'
 
   const phaseLabel = { generating: 'Generating…', persisting: 'Saving to storage…', verifying: 'Verifying from storage…' }[genPhase]
 
@@ -408,14 +467,19 @@ function ArtifactCard({
         {/* Header row */}
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 3 }}>
           <span style={{ fontSize: 10, fontWeight: 600 }}>{artifact.title}</span>
-          <ReadinessBadge status={artifact.readinessStatus} />
+          {(editing || isBlocked || !selected) && <ReadinessBadge status={artifact.readinessStatus} />}
+          {!editing && selected && !isBlocked && (
+            <span style={{ fontSize: 8, fontFamily: fm, color: generationStatus === 'partial' ? '#f97316' : generationStatus === 'failed' ? '#f87171' : generationStatus === 'generated' ? '#00e5b4' : basisStatus === 'basis_incomplete' ? '#f97316' : 'var(--muted)', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 3, padding: '1px 6px' }}>
+              {basisLabel} - {generationLabel}
+            </span>
+          )}
           {artifact.businessUnitName && (
             <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 3, padding: '1px 6px' }}>
               {artifact.businessUnitName}
             </span>
           )}
           {/* Generation status badge */}
-          {!editing && !isBlocked && genPhase === 'done' && (
+          {!editing && !isBlocked && genPhase === 'done' && artifactGenerationStatus !== 'partial' && (
             <span style={{ fontSize: 8, fontFamily: fm, fontWeight: 600, color: isOutputStale ? '#fbbf24' : '#00e5b4' }}>
               {isOutputStale ? '⚠ Stale' : '✓ Generated'}
             </span>
@@ -437,6 +501,18 @@ function ArtifactCard({
         )}
 
         {/* Generation controls — view mode, selected, non-blocked */}
+        {!editing && selected && artifactBasis && !isBlocked && (
+          <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)' }}>
+            <div style={{ fontSize: 8, fontFamily: fm, color: artifactBasis.counts.mappedHowOptions > 0 ? '#00e5b4' : '#f97316', lineHeight: 1.45 }}>
+              {basisPreviewText(artifactBasis)}
+            </div>
+            {artifactBasis.basisWarnings?.length > 0 && (
+              <div style={{ fontSize: 8, fontFamily: fm, color: '#f97316', marginTop: 3 }}>
+                {artifactBasis.basisWarnings.slice(0, 2).join(' ')}
+              </div>
+            )}
+          </div>
+        )}
         {!editing && selected && !isBlocked && (
           <div style={{ marginTop: 7, borderTop: '1px solid var(--border)', paddingTop: 6, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             {/* In-flight phases */}
@@ -488,7 +564,7 @@ function ArtifactCard({
             )}
 
             {/* View confirmation */}
-            {genPhase === 'done' && hasOutput && !isOutputStale && (
+            {genPhase === 'done' && hasOutput && !isOutputStale && artifactGenerationStatus !== 'partial' && (
               <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)' }}>
                 ↓ View below
               </span>
@@ -534,7 +610,7 @@ function CollapsibleList({ label, items, defaultOpen = false }) {
   )
 }
 
-function ArtifactOutputViewer({ output, isStale }) {
+function ArtifactOutputViewer({ output, isStale, onRetryUnit = null }) {
   const [openSections, setOpenSections] = useState(() => {
     const init = {}
     if (output?.contentSections) {
@@ -546,6 +622,11 @@ function ArtifactOutputViewer({ output, isStale }) {
   if (!output) return null
 
   const toggleSection = id => setOpenSections(prev => ({ ...prev, [id]: !prev[id] }))
+  const sectionUnits = output.sectionUnits || []
+  const hasProgressUnits = sectionUnits.length > 0
+  const generatedSections = countGeneratedSections(sectionUnits)
+  const failedSections = countFailedSections(sectionUnits)
+  const generationStatus = output.artifactGenerationStatus || output.generationStatus || 'generated'
 
   return (
     <div style={{
@@ -565,6 +646,79 @@ function ArtifactOutputViewer({ output, isStale }) {
         Generated · persisted {output.persistedAt ? new Date(output.persistedAt).toLocaleString() : '—'}
         {output.verifiedAt && ` · verified ${new Date(output.verifiedAt).toLocaleString()}`}
       </div>
+
+      {hasProgressUnits && (
+        <div style={{ marginBottom: 10, padding: '8px 10px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 4 }}>
+          <div style={{ ...labelStyle, marginBottom: 6 }}>Section Progress</div>
+          <div style={{ fontSize: 8, fontFamily: fm, color: generationStatus === 'partial' ? '#f97316' : '#00e5b4', marginBottom: 6 }}>
+            {generationStatus === 'partial' ? 'Partial' : generationStatus} - {generatedSections}/{sectionUnits.length} sections generated{failedSections ? `, ${failedSections} failed` : ''}
+          </div>
+          {sectionUnits.map(unit => {
+            const isFailed = unit.lifecycle === 'failed'
+            const isGenerated = ['draft_ready', 'accepted'].includes(unit.lifecycle) && unit.section
+            const children = unit.childUnits || []
+            const childGenerated = children.filter(child => ['draft_ready', 'accepted'].includes(child.lifecycle) && child.content).length
+            const childFailed = children.filter(child => child.lifecycle === 'failed').length
+            return (
+              <div key={unit.sectionId} style={{ padding: '6px 0', borderTop: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 9, fontFamily: fm, fontWeight: 600, color: 'var(--muted2)' }}>{unit.heading}</span>
+                  <span style={{ fontSize: 8, fontFamily: fm, color: isFailed ? '#f87171' : isGenerated ? '#00e5b4' : childGenerated ? '#f97316' : 'var(--muted)' }}>
+                    {isFailed && children.length ? `partial, ${childGenerated}/${children.length} children generated${childFailed ? `, ${childFailed} failed` : ''}`
+                      : isFailed ? 'failed'
+                        : isGenerated ? 'generated'
+                          : childGenerated ? `partial, ${childGenerated}/${children.length} children generated`
+                            : unit.lifecycle || 'not_started'}
+                  </span>
+                  {isFailed && onRetryUnit && (
+                    <button onClick={onRetryUnit} style={{ fontSize: 8, fontFamily: fm, padding: '2px 8px', borderRadius: 4, cursor: 'pointer', background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted2)' }}>
+                      Retry
+                    </button>
+                  )}
+                </div>
+                {isFailed && (unit.lifecycleError || unit.lifecycleMeta?.failureReason) && (
+                  <div style={{ fontSize: 8, fontFamily: fm, color: '#f87171', marginTop: 3, lineHeight: 1.45 }}>
+                    {unit.lifecycleError || unit.lifecycleMeta?.failureReason}
+                  </div>
+                )}
+                {children.length > 0 && (
+                  <div style={{ marginTop: 5, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {children.map(child => {
+                      const childFailedUnit = child.lifecycle === 'failed'
+                      const childGeneratedUnit = ['draft_ready', 'accepted'].includes(child.lifecycle) && child.content
+                      return (
+                        <div key={child.childId} style={{ padding: '5px 7px', background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 4 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: 8, fontFamily: fm, fontWeight: 600, color: 'var(--muted2)' }}>{child.label || child.heading || child.childId}</span>
+                            <span style={{ fontSize: 8, fontFamily: fm, color: childFailedUnit ? '#f87171' : childGeneratedUnit ? '#00e5b4' : 'var(--muted)' }}>
+                              {childFailedUnit ? 'failed' : childGeneratedUnit ? 'generated' : child.lifecycle || 'not_started'}
+                            </span>
+                            {childFailedUnit && onRetryUnit && (
+                              <button onClick={onRetryUnit} style={{ fontSize: 8, fontFamily: fm, padding: '2px 8px', borderRadius: 4, cursor: 'pointer', background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--muted2)' }}>
+                                Retry
+                              </button>
+                            )}
+                          </div>
+                          {childGeneratedUnit && (
+                            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55, marginTop: 3, whiteSpace: 'pre-wrap' }}>
+                              <strong>{child.content.heading}:</strong> {child.content.body}
+                            </div>
+                          )}
+                          {childFailedUnit && (
+                            <div style={{ fontSize: 8, fontFamily: fm, color: '#f87171', marginTop: 3, lineHeight: 1.45 }}>
+                              {child.failureReason || child.lifecycleError || child.lifecycleMeta?.failureReason || 'Child unit failed.'}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       {/* Content sections */}
       {(output.contentSections || []).map((s, i) => {
@@ -850,25 +1004,135 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
         return
       }
 
-      // Build and call — mock when no API key
-      let contentSections, evidenceBasis, assumptions, openQuestions
-      if (!hasApiKey()) {
-        const mock = generateMockArtifactOutput(durableItem, durableHandoff)
-        ;({ contentSections, evidenceBasis, assumptions, openQuestions } = mock)
-      } else {
-        const { messages } = buildArtifactPrompt(durableItem, durableHandoff)
-        const response = await callAI(messages, { temperature: 0.3, maxTokens: 2000 })
-        if (response.error) throw Object.assign(new Error(response.error), { failureType: 'generation_failed' })
-        const parsed = parseArtifactResponse(response.result)
-        if (parsed.error) throw Object.assign(new Error(parsed.error), { failureType: 'generation_failed' })
-        ;({ contentSections, evidenceBasis, assumptions, openQuestions } = parsed)
+      const artifactBasis = compileArtifactBasis(durableItem, durableHandoff)
+      if (artifactBasis.counts.mappedHowOptions === 0) {
+        throw Object.assign(new Error('Content ready; deliverable mapping incomplete. Map at least one Execution Sequence how option before generating this artifact.'), { failureType: 'mapping_incomplete' })
       }
+
+      // Build and call — mock when no API key
+      const sectionOutline = getArtifactSectionOutline(durableItem.artifactType)
+      if (!sectionOutline?.length) {
+        setGenState(prev => ({ ...prev, [id]: { phase: 'not_implemented', error: 'Generation not yet implemented for this artifact type.', failureType: null } }))
+        generatingRef.current.delete(id)
+        return
+      }
+
+      const publishProgress = async (nextSectionUnits, phase = 'generating', statePatch = {}) => {
+        const progressOutput = buildArtifactProgressOutput({
+          workspaceId, stage1Id: stage1ActiveId, stage2Id: stage2ActiveId, stage3Id: stage3ActiveId,
+          handoff: durableHandoff, plan: durablePlan, artifactItem: durableItem,
+          sectionUnits: nextSectionUnits,
+          artifactBasis,
+          previousOutput: outputs[id] || null,
+        })
+        const { ok, record } = await persistArtifactOutput(progressOutput, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+        if (!ok) throw Object.assign(new Error('Output progress could not be written to storage. The generated units have not been saved.'), { failureType: 'persistence_failed' })
+        setOutputs(prev => ({ ...prev, [id]: { ...record, verifiedAt: new Date().toISOString() } }))
+        setGenState(prev => ({ ...prev, [id]: { phase, error: null, failureType: null, ...statePatch } }))
+      }
+
+      let sectionUnits = buildInitialArtifactSectionUnits(sectionOutline, outputs[id]?.sectionUnits || [])
+      for (let i = 0; i < sectionOutline.length; i++) {
+        const sectionDef = sectionOutline[i]
+        const currentUnit = sectionUnits[i]
+        if (currentUnit?.lifecycle === 'accepted' && currentUnit?.section) continue
+        setGenState(prev => ({ ...prev, [id]: { phase: 'generating', error: null, failureType: null, sectionId: sectionDef.id } }))
+
+        if (sectionDef.generationMode === 'child_units') {
+          const childDefs = deriveSectionChildDefs(sectionDef, artifactBasis)
+          let childUnits = buildInitialArtifactChildUnits(childDefs, currentUnit?.childUnits || [])
+          if (!childUnits.length) {
+            sectionUnits[i] = applySectionGenerationFailure(currentUnit, 'No source items available for child-unit section.')
+            await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: no source items available. Previous content preserved.`, failureType: 'section_failed', sectionId: sectionDef.id })
+            throw Object.assign(new Error(`${sectionDef.heading}: no source items available. Previous content preserved.`), { failureType: 'section_failed', sectionUnits })
+          }
+          for (let childIndex = 0; childIndex < childDefs.length; childIndex++) {
+            const childDef = childDefs[childIndex]
+            const currentChild = childUnits[childIndex]
+            if (currentChild?.lifecycle === 'accepted' && currentChild?.content) continue
+            setGenState(prev => ({ ...prev, [id]: { phase: 'generating', error: null, failureType: null, sectionId: sectionDef.id, childId: childDef.childId } }))
+
+            if (!hasApiKey()) {
+              const mock = generateMockArtifactChildOutput(durableItem, durableHandoff, sectionDef, childDef, artifactBasis)
+              childUnits[childIndex] = applyChildGenerationSuccess(currentChild, mock.child)
+              sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
+              await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
+              continue
+            }
+
+            const { messages } = buildArtifactChildPrompt(durableItem, durableHandoff, sectionDef, childDef, artifactBasis)
+            const response = await callAI(messages, { temperature: 0.3, maxTokens: 500 })
+            if (response.error) {
+              childUnits[childIndex] = applyChildGenerationFailure(currentChild, response.error)
+              sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
+              await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: ${childDef.label} failed - ${response.error}. Previous child items preserved. Retry ${childDef.label}.`, failureType: 'child_failed', sectionId: sectionDef.id, childId: childDef.childId })
+              throw Object.assign(new Error(`${sectionDef.heading}: ${childDef.label} failed - ${response.error}. Previous child items preserved. Retry ${childDef.label}.`), { failureType: 'child_failed', sectionUnits })
+            }
+            const parsedChild = parseArtifactChildResponse(response.result, childDef, response)
+            if (parsedChild.error) {
+              childUnits[childIndex] = applyChildGenerationFailure(currentChild, parsedChild.failureReason || parsedChild.error, parsedChild.child || null)
+              sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
+              await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: ${childDef.label} failed - ${parsedChild.failureReason || parsedChild.error}. Previous child items preserved. Retry ${childDef.label}.`, failureType: parsedChild.truncated ? 'child_truncated' : 'child_failed', sectionId: sectionDef.id, childId: childDef.childId })
+              throw Object.assign(new Error(`${sectionDef.heading}: ${childDef.label} failed - ${parsedChild.failureReason || parsedChild.error}. Previous child items preserved. Retry ${childDef.label}.`), { failureType: parsedChild.truncated ? 'child_truncated' : 'child_failed', sectionUnits })
+            }
+            childUnits[childIndex] = applyChildGenerationSuccess(currentChild, parsedChild.child)
+            sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
+            await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
+          }
+          sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
+          if (sectionUnits[i].lifecycle !== 'accepted') {
+            await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: child-unit section did not pass audit. Previous child items preserved.`, failureType: 'section_audit_failed', sectionId: sectionDef.id })
+            throw Object.assign(new Error(`${sectionDef.heading}: child-unit section did not pass audit. Previous child items preserved.`), { failureType: 'section_audit_failed', sectionUnits })
+          }
+          await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id })
+          continue
+        }
+
+        if (!hasApiKey()) {
+          const mock = generateMockArtifactSectionOutput(durableItem, durableHandoff, sectionDef, artifactBasis)
+          sectionUnits[i] = applySectionGenerationSuccess(currentUnit, mock.section, artifactBasis)
+          await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id })
+          continue
+        }
+
+        const { messages } = buildArtifactSectionPrompt(durableItem, durableHandoff, sectionDef, artifactBasis)
+        const response = await callAI(messages, { temperature: 0.3, maxTokens: 900 })
+        if (response.error) {
+          sectionUnits[i] = applySectionGenerationFailure(currentUnit, response.error)
+          await publishProgress(sectionUnits, 'failed', { error: `Section generation failed: ${response.error}. Previous content preserved. Retry this section.`, failureType: 'section_failed', sectionId: sectionDef.id })
+          throw Object.assign(new Error(`Section generation failed: ${response.error}. Previous content preserved. Retry this section.`), { failureType: 'section_failed', sectionUnits })
+        }
+        const parsed = parseArtifactSectionResponse(response.result, sectionDef, response)
+        if (parsed.error) {
+          sectionUnits[i] = applySectionGenerationFailure(currentUnit, parsed.failureReason || parsed.error, parsed.section || null)
+          await publishProgress(sectionUnits, 'failed', { error: `Section generation failed: ${parsed.failureReason || parsed.error}. Previous content preserved. Retry this section.`, failureType: parsed.truncated ? 'section_truncated' : 'section_failed', sectionId: sectionDef.id })
+          throw Object.assign(new Error(`Section generation failed: ${parsed.failureReason || parsed.error}. Previous content preserved. Retry this section.`), { failureType: parsed.truncated ? 'section_truncated' : 'section_failed', sectionUnits })
+        }
+        sectionUnits[i] = applySectionGenerationSuccess(currentUnit, parsed.section, artifactBasis)
+        if (sectionUnits[i].lifecycle !== 'accepted') {
+          await publishProgress(sectionUnits, 'failed', { error: 'Section generation failed: section audit did not pass. Previous content preserved. Retry this section.', failureType: 'section_audit_failed', sectionId: sectionDef.id })
+          throw Object.assign(new Error('Section generation failed: section audit did not pass. Previous content preserved. Retry this section.'), { failureType: 'section_audit_failed', sectionUnits })
+        }
+        await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id })
+      }
+
+      const assembled = assembleArtifactFromSectionUnits(sectionUnits)
+      if (assembled.contentSections.length !== sectionOutline.length || assembled.failedSections.length > 0) {
+        await publishProgress(sectionUnits, 'failed', { error: 'Artifact generation is partial. Previous artifact content preserved; retry failed sections.', failureType: 'section_failed' })
+        throw Object.assign(new Error('Artifact generation is partial. Previous artifact content preserved; retry failed sections.'), { failureType: 'section_failed', sectionUnits })
+      }
+      const contentSections = assembled.contentSections
+      const evidenceBasis = `Generated section-by-section from ${artifactBasis.counts.mappedHowOptions} mapped how option(s).`
+      const assumptions = artifactBasis.basisWarnings || []
+      const openQuestions = []
+      const qualityAudit = auditArtifactOutput({ contentSections, artifactBasis })
 
       // Build output record (persistedAt: null until write succeeds)
       const output = buildArtifactOutput({
         workspaceId, stage1Id: stage1ActiveId, stage2Id: stage2ActiveId, stage3Id: stage3ActiveId,
         handoff: durableHandoff, plan: durablePlan, artifactItem: durableItem,
-        contentSections, evidenceBasis, assumptions, openQuestions,
+        contentSections, evidenceBasis, assumptions, openQuestions, artifactBasis, qualityAudit,
+        sectionUnits, artifactGenerationStatus: assembled.artifactGenerationStatus,
       })
 
       // Persist — only write if generation succeeded
@@ -1188,11 +1452,11 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
 
           {/* Helper: render a card + output viewer pair */}
           {(() => {
-            const apiMode = getApiMode()
             function renderArtifact(a, selIds) {
               const gs      = genState[a.artifactId] || {}
               const output  = outputs[a.artifactId] || null
               const isStale = output ? isArtifactOutputStale(output, plan, handoff) : false
+              const artifactBasis = SUPPORTED_GENERATION_TYPES.has(a.artifactType) ? compileArtifactBasis(a, handoff) : null
               // Determine effective genPhase for display
               const effectivePhase = gs.phase || (output ? 'done' : null)
               return (
@@ -1209,11 +1473,13 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
                     isOutputStale={isStale}
                     reviewStatus={output?.reviewStatus ?? REVIEW_STATUS.NOT_REVIEWED}
                     onGenerate={!editing ? handleGenerate : null}
-                    apiMode={apiMode}
+                    artifactBasis={artifactBasis}
+                    artifactGenerationStatus={output?.artifactGenerationStatus}
+                    sectionUnits={output?.sectionUnits || []}
                   />
                   {!editing && output && (
                     <>
-                      <ArtifactOutputViewer output={output} isStale={isStale} />
+                      <ArtifactOutputViewer output={output} isStale={isStale} onRetryUnit={() => handleGenerate(a)} />
                       <ArtifactQualityReview
                         output={output}
                         onSave={handleReviewSave}

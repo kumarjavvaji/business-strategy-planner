@@ -30,9 +30,7 @@ import {
   MAPPING_STATUS,
   phaseSlug,
   optionSlug,
-  suggestPhaseDeliverables,
   computeMappingStatus,
-  getMappedDeliverableIds,
   getDeliverableMappingSummary,
   getSelectedStage4Deliverables,
 } from '../utils/stage3PanelModel'
@@ -272,7 +270,20 @@ function CriticalDecisionItem({ d }) {
   )
 }
 
-function ExecutionPhaseItem({ p }) {
+function ExecutionPhaseItem({ p, phaseMapping, activeDeliverable, onUpdateHowOptionMapping, disabled }) {
+  const phaseId = phaseSlug(p?.phaseName)
+  const howOptionMappings = phaseMapping?.howOptionMappings || {}
+
+  function updateOption(opt, checked) {
+    if (!activeDeliverable?.id || !onUpdateHowOptionMapping) return
+    const optionId = optionSlug(opt?.optionName)
+    const current = howOptionMappings?.[optionId]?.mappedDeliverables || []
+    const next = checked
+      ? Array.from(new Set([...current, activeDeliverable.id]))
+      : current.filter(deliverableId => deliverableId !== activeDeliverable.id)
+    onUpdateHowOptionMapping({ phaseId, optionId, mappedDeliverables: next })
+  }
+
   return (
     <div style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)', marginBottom: 6 }}>
       <div style={{ fontSize: 10, fontWeight: 700, color: '#00e5b4', marginBottom: 5 }}>{p.phaseName}</div>
@@ -285,7 +296,27 @@ function ExecutionPhaseItem({ p }) {
           <div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>how options</div>
           {p.howOptions.map((opt, i) => (
             <div key={i} style={{ paddingLeft: 7, borderLeft: '2px solid rgba(0,229,180,.35)', marginBottom: 5 }}>
-              <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 2 }}>{opt.optionName}</div>
+              {(() => {
+                const optionMapping = howOptionMappings?.[optionSlug(opt?.optionName)]
+                const mappedDeliverables = optionMapping?.mappedDeliverables || []
+                const checked = Boolean(activeDeliverable?.id && mappedDeliverables.includes(activeDeliverable.id))
+                const mappedElsewhere = !checked && mappedDeliverables.length > 0
+                const statusLabel = checked ? 'selected' : mappedElsewhere ? 'mapped elsewhere' : 'unselected'
+                const statusColor = checked ? '#00e5b4' : mappedElsewhere ? '#3b82f6' : 'var(--muted)'
+                return (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={disabled || !activeDeliverable?.id}
+                      onChange={event => updateOption(opt, event.target.checked)}
+                      style={{ width: 12, height: 12, accentColor: '#00e5b4', cursor: disabled || !activeDeliverable?.id ? 'not-allowed' : 'pointer', flexShrink: 0 }}
+                    />
+                    <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', flex: 1 }}>{opt.optionName}</div>
+                    <span style={{ fontSize: 7, fontFamily: 'var(--fm)', color: statusColor, textTransform: 'uppercase', letterSpacing: '.04em', flexShrink: 0 }}>{statusLabel}</span>
+                  </div>
+                )
+              })()}
               <LabeledText label="when to use"  value={opt.whenToUse} />
               <LabeledText label="why it fits"  value={opt.whyItFitsThePhaseOutcome} />
               <LabeledText label="evidence"     value={opt.evidenceProduced} />
@@ -334,7 +365,7 @@ function ValidationItem({ v }) {
   )
 }
 
-function PanelContent({ panelId, content }) {
+function PanelContent({ panelId, content, panel, activeDeliverable, onUpdateHowOptionMapping, disabled }) {
   if (!content) return <div style={{ fontSize: 9, color: 'var(--muted)', fontStyle: 'italic', padding: '8px 0' }}>No content available for this panel.</div>
 
   switch (panelId) {
@@ -343,7 +374,20 @@ function PanelContent({ panelId, content }) {
     case 'criticalDecisions':
       return <div>{Array.isArray(content) ? content.map((d, i) => <CriticalDecisionItem key={i} d={d} />) : null}</div>
     case 'executionSequence':
-      return <div>{Array.isArray(content) ? content.map((p, i) => <ExecutionPhaseItem key={i} p={p} />) : null}</div>
+      return (
+        <div>
+          {Array.isArray(content) ? content.map((p, i) => (
+            <ExecutionPhaseItem
+              key={i}
+              p={p}
+              phaseMapping={panel?.executionDeliverableMappings?.[phaseSlug(p?.phaseName)]}
+              activeDeliverable={activeDeliverable}
+              onUpdateHowOptionMapping={onUpdateHowOptionMapping}
+              disabled={disabled}
+            />
+          )) : null}
+        </div>
+      )
     case 'dependencies':
       return <div>{Array.isArray(content) ? content.map((d, i) => <DependencyItem key={i} d={d} />) : null}</div>
     case 'risks':
@@ -583,18 +627,16 @@ function PhaseDeliverableRow({ phase, mapping, activeDeliverableId, activeDelive
   )
 }
 
+void PhaseDeliverableRow
+
 /**
  * Full deliverable mapping section for the Execution Sequence panel.
  * Shows phases as containers; each phase shows its how-options (or falls back to phase-level).
  */
-function ExecutionMappingSection({ panel, onUpdateMapping, onUpdateHowOptionMapping, onUpdateSelectedDeliverables, disabled }) {
+function ExecutionMappingSection({ panel, activeDeliverableId, onActiveDeliverableChange, onUpdateSelectedDeliverables, disabled }) {
   const content  = panel?.content
-  const mappings = panel?.executionDeliverableMappings
   const selectedRecords = getSelectedStage4Deliverables(panel)
   const selectedIds = selectedRecords.map(record => record.deliverableType)
-  const mappedIds = getMappedDeliverableIds(panel)
-  const defaultDeliverableId = selectedIds.includes('bu_execution_plan') ? 'bu_execution_plan' : (selectedIds[0] || mappedIds[0] || 'bu_execution_plan')
-  const [activeDeliverableId, setActiveDeliverableId] = useState(defaultDeliverableId)
 
   if (!Array.isArray(content) || content.length === 0) return null
 
@@ -618,29 +660,8 @@ function ExecutionMappingSection({ panel, onUpdateMapping, onUpdateHowOptionMapp
     const next = selectedIds.includes(deliverableId)
       ? selectedIds.filter(id => id !== deliverableId)
       : [...selectedIds, deliverableId]
-    if (!next.includes(activeDeliverableId)) setActiveDeliverableId(next[0] || '')
+    if (!next.includes(activeDeliverableId)) onActiveDeliverableChange?.(next[0] || '')
     onUpdateSelectedDeliverables?.({ deliverableTypes: next })
-  }
-
-  function handleUpdate(phaseId, deliverables) {
-    if (onUpdateMapping) onUpdateMapping({ phaseId, mappedDeliverables: deliverables })
-  }
-
-  function handleUpdateHowOption(phaseId, optionId, deliverables) {
-    if (onUpdateHowOptionMapping) onUpdateHowOptionMapping({ phaseId, optionId, mappedDeliverables: deliverables })
-  }
-
-  function getMapping(phase) {
-    const id = phaseSlug(phase?.phaseName)
-    if (mappings?.[id]) return mappings[id]
-    const suggested = suggestPhaseDeliverables(phase?.phaseName)
-    return {
-      phaseMappedDeliverables: suggested,
-      mappedDeliverables:      suggested,
-      suggestedDeliverables:   suggested,
-      mappingStatus:           suggested.length > 0 ? MAPPING_STATUS.SUGGESTED : MAPPING_STATUS.UNMAPPED,
-      howOptionMappings:       {},
-    }
   }
 
   return (
@@ -704,7 +725,7 @@ function ExecutionMappingSection({ panel, onUpdateMapping, onUpdateHowOptionMapp
           <select
             value={activeDeliverable.id}
             disabled={disabled}
-            onChange={e => setActiveDeliverableId(e.target.value)}
+            onChange={e => onActiveDeliverableChange?.(e.target.value)}
             style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--fg)', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 3, padding: '3px 6px' }}
           >
             {selectedRecords.map(record => {
@@ -717,18 +738,6 @@ function ExecutionMappingSection({ panel, onUpdateMapping, onUpdateHowOptionMapp
       <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4', marginBottom: 8 }}>
         {activeDeliverable.label}: {summary.selectedHowOptionCount} how option{summary.selectedHowOptionCount === 1 ? '' : 's'} selected across {summary.selectedPhaseCount} phase{summary.selectedPhaseCount === 1 ? '' : 's'}.
       </div>
-      {content.map((phase, i) => (
-        <PhaseDeliverableRow
-          key={phaseSlug(phase?.phaseName) || i}
-          phase={phase}
-          mapping={getMapping(phase)}
-          activeDeliverableId={activeDeliverable.id}
-          activeDeliverableLabel={activeDeliverable.label}
-          onUpdate={handleUpdate}
-          onUpdateHowOption={handleUpdateHowOption}
-          disabled={disabled}
-        />
-      ))}
         </>
       )}
     </div>
@@ -804,7 +813,7 @@ function ChildUnitProgressTracker({ panelId, childUnits = [], isRunning, onGener
 
 // ── Panel card ────────────────────────────────────────────────────────────────
 
-function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRefine, onGenerate, onAccept, onReject, hasApiKey, onUpdateMapping, onUpdateHowOptionMapping, onUpdateSelectedDeliverables }) {
+function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRefine, onGenerate, onAccept, onReject, hasApiKey, onUpdateHowOptionMapping, onUpdateSelectedDeliverables }) {
   const [expanded,        setExpanded]        = useState(false)
   const [showAudit,       setShowAudit]       = useState(false)
   const [showStrength,    setShowStrength]    = useState(false)
@@ -831,6 +840,12 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
   // Execution Sequence mapping summary
   const isExecSeq     = panelId === 'executionSequence'
   const mappingSummary = isExecSeq ? computeMappingStatus(panel) : null
+  const selectedDeliverableRecords = isExecSeq ? getSelectedStage4Deliverables(panel) : []
+  const selectedDeliverableIds = selectedDeliverableRecords.map(record => record.deliverableType)
+  const defaultActiveDeliverableId = selectedDeliverableIds.includes('bu_execution_plan') ? 'bu_execution_plan' : (selectedDeliverableIds[0] || '')
+  const [activeDeliverableId, setActiveDeliverableId] = useState(defaultActiveDeliverableId)
+  const resolvedActiveDeliverableId = selectedDeliverableIds.includes(activeDeliverableId) ? activeDeliverableId : selectedDeliverableIds[0]
+  const activeDeliverable = STAGE4_DELIVERABLES.find(deliverable => deliverable.id === resolvedActiveDeliverableId) || null
 
   const summary     = synthesizePanelSummary(panelId, content)
   const lastTouched = panel?.lastRefinedAt || panel?.lastGeneratedAt
@@ -880,7 +895,24 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
       {expanded && (
         <div style={{ padding: '10px 11px' }}>
           {/* Full panel content */}
-          <PanelContent panelId={panelId} content={content} />
+          {isExecSeq && content && (
+            <ExecutionMappingSection
+              panel={panel}
+              activeDeliverableId={resolvedActiveDeliverableId}
+              onActiveDeliverableChange={setActiveDeliverableId}
+              onUpdateSelectedDeliverables={onUpdateSelectedDeliverables}
+              disabled={actionDisabled}
+            />
+          )}
+
+          <PanelContent
+            panelId={panelId}
+            content={content}
+            panel={panel}
+            activeDeliverable={activeDeliverable}
+            onUpdateHowOptionMapping={onUpdateHowOptionMapping}
+            disabled={actionDisabled}
+          />
 
           {panel?.sourceAtomIds?.length > 0 && (
             <div style={{ marginTop: 8 }}>
@@ -990,17 +1022,6 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
               childUnits={childUnits}
               isRunning={isRunning}
               onGenerate={onGenerate}
-            />
-          )}
-
-          {/* Execution Sequence: deliverable mapping section */}
-          {isExecSeq && content && (
-            <ExecutionMappingSection
-              panel={panel}
-              onUpdateMapping={onUpdateMapping}
-              onUpdateHowOptionMapping={onUpdateHowOptionMapping}
-              onUpdateSelectedDeliverables={onUpdateSelectedDeliverables}
-              disabled={actionDisabled}
             />
           )}
 
@@ -1151,7 +1172,7 @@ function ReadinessBanner({ readinessStatus }) {
  *   onRefinePanel       — ({ panelId, prompt, impactSummary }) => void
  *   hasApiKey           — boolean — whether to show refinement controls
  */
-export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdatePhaseMapping, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey = false }) {
+export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey = false }) {
   if (!panelModel?.panels) {
     return (
       <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic', padding: '8px 0' }}>
@@ -1177,7 +1198,6 @@ export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefi
           onGenerate={onGeneratePanel}
           onAccept={onAcceptPanel}
           onReject={onRejectPanel}
-          onUpdateMapping={onUpdatePhaseMapping}
           onUpdateHowOptionMapping={onUpdateHowOptionMapping}
           onUpdateSelectedDeliverables={onUpdateSelectedStage4Deliverables}
           hasApiKey={hasApiKey}
