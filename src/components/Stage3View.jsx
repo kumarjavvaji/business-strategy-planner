@@ -46,6 +46,50 @@ import {
 } from '../utils/generationLifecycle'
 import { stage3ExecutiveLeadershipFixture } from '../fixtures/stage3ExecutiveLeadershipFixture'
 import { readCached, readArtifactAsync, writeArtifact, storageReady, getStorageDiagnostics } from '../utils/storageRouter'
+import { stage3BuPlanKey as _stage3BuPlanKeyCanonical } from '../utils/stage3BuPlanKeys'
+import {
+  compileStage4Handoff,
+  persistStage4Handoff,
+  loadStage4Handoff,
+  BU_HANDOFF_STATUS as S4_BU_STATUS,
+  HANDOFF_STATUS as S4_STATUS,
+} from '../utils/stage4Handoff'
+import {
+  buildCompiledCriticalDecisions as _buildCompiledCriticalDecisions,
+  buildCompiledDependencies as _buildCompiledDependencies,
+  buildCompiledRisks as _buildCompiledRisks,
+  buildCompiledValidationFramework as _buildCompiledValidationFramework,
+  validateStage3CompiledFieldDistinctness,
+} from '../utils/stage3Compiler'
+import {
+  normalizeToPanelModel,
+  normalizeLegacyDraftRecord,
+  applyAcceptedRefinement,
+  acceptPanel,
+  rejectPanel,
+  appendRefinementRecord,
+  createRefinementRecord,
+  createFailedRefinementRecord,
+  auditPanelCompleteness,
+  validateProposedPanelContent,
+  updatePhaseMapping,
+  updateHowOptionMapping,
+  updateSelectedStage4Deliverables,
+} from '../utils/stage3PanelModel'
+import {
+  buildPanelGenerationMessages,
+  buildPanelRefinementMessages,
+  parsePanelGenerationResponse,
+  parsePanelRefinementResponse,
+} from '../utils/stage3PanelPrompts'
+import {
+  ATOMIC_GENERATION_PANELS,
+  DEFAULT_ITEM_COUNTS,
+  generatePanelAtomically,
+  retryChildUnit,
+  initChildUnits,
+} from '../utils/stage3ChildUnitGeneration'
+import { Stage3PanelView } from './Stage3PanelView'
 
 // ── Indicator helpers ─────────────────────────────────────────────────────────
 
@@ -145,8 +189,7 @@ function stage2HandoffDraftKey(workspaceId, buName) {
 }
 
 function stage3BuPlanDraftKey(workspaceId, stage1Id, stage2Id, buName) {
-  if (!workspaceId || !stage1Id || !stage2Id || !buName) return null
-  return `bsp_v1_stage3_bu_plan_${workspaceId}_${stage1Id}_${stage2Id}_${storageSafeName(buName)}`
+  return _stage3BuPlanKeyCanonical(workspaceId, stage1Id, stage2Id, buName)
 }
 
 function stage3BuPlanBackupKey(workspaceId, stage1Id, stage2Id, buName, timestamp) {
@@ -2984,6 +3027,7 @@ function Stage3ReadinessPanels({
   captureImportStatus = null,
   onCaptureImport = null,
   idbReady = false,
+  onPersistPanelModel = null,
 }) {
   const [open, setOpen] = useState({})
   // Per-BU: whether "Operational Setup" (handoff readiness + generate + brief) is expanded
@@ -3325,7 +3369,7 @@ function Stage3ReadinessPanels({
                         </button>
                       </div>
                     )}
-                    {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && !blockReason && (
+                    {draft?.lifecycle?.status === LIFECYCLE_STATES.DRAFT_GENERATED && !blockReason && !gen?.persistError && (
                       <button
                         onClick={() => onGenerateBUPlan(unit, { ...readiness, acceptOnly: true })}
                         disabled={disabled || gen?.running}
@@ -3413,6 +3457,34 @@ function Stage3ReadinessPanels({
 
                 {/* Execution plan — rendered here when a draft exists so BU plan
                     appears in one place (the expanded readiness row), not duplicated below */}
+                {gen?.persistError && (
+                  <div style={{
+                    margin: '10px 0 4px',
+                    padding: '9px 13px',
+                    background: 'rgba(248,113,113,.07)',
+                    border: '1px solid rgba(248,113,113,.3)',
+                    borderRadius: 5,
+                    fontSize: 9,
+                    fontFamily: 'var(--fm)',
+                    color: '#f87171',
+                    lineHeight: 1.55,
+                  }}>
+                    <strong>Persistence failed — content below is from the last saved version.</strong>
+                    <br />The most recently generated content was not written to storage and will be lost on refresh.
+                    Do not accept or use this plan until generation succeeds and content is re-persisted.
+                  </div>
+                )}
+                {(draft || legacyPlan) && !gen?.persistError && draft?.persistedAt && !gen?.running && (
+                  <div style={{
+                    margin: '8px 0 2px',
+                    fontSize: 8,
+                    fontFamily: 'var(--fm)',
+                    color: 'var(--muted)',
+                    lineHeight: 1.4,
+                  }}>
+                    ✓ Content verified from storage · saved {new Date(draft.persistedAt).toLocaleString()}
+                  </div>
+                )}
                 {(draft || legacyPlan) && (
                   <Stage3BUPlanTree
                     draft={draft}
@@ -3423,6 +3495,7 @@ function Stage3ReadinessPanels({
                     onStage2Action={onStage2Action}
                     showHandoffBrief={false}
                     generationState={gen}
+                    onPanelModelChange={nextPanelModel => onPersistPanelModel?.(unit.name, nextPanelModel)}
                   />
                 )}
 
@@ -3875,6 +3948,7 @@ const STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS = {
     { id: 'handoff_classification', label: 'Handoff content is classified across coverage buckets.', category: 'handoffCoverageAudit' },
     { id: 'no_truncated_strategy_text', label: 'No generated strategic text is truncated.', category: 'compiledBUExecutionPlan' },
     { id: 'reduce_repetition', label: 'Compiled view reduces repetition compared with atomized buckets.', category: 'compiledBUExecutionPlan' },
+    { id: 'field_distinctness', label: 'Within each compiled item, fields play distinct roles and do not duplicate each other.', category: 'compiledBUExecutionPlan' },
   ],
   buAdaptationGuidance: {
     executive: ['investment authority', 'decision thresholds', 'governance cadence', 'prioritization tradeoffs', 'escalation criteria'],
@@ -4172,21 +4246,7 @@ function genericDecisionPatterns(profile) {
 }
 
 function buildCompiledCriticalDecisions(tree, handoffBrief, profile) {
-  const allDecisionText = pickBulletTexts(tree, 'decisionsRequired', null, 40)
-  const patterns = profile === 'productArchitecture' ? PM_DECISION_PATTERNS : genericDecisionPatterns(profile)
-  return patterns.map(pattern => {
-    const hits = allDecisionText.filter(text => pattern.re.test(text))
-    const basis = hits[0] || ''
-    return {
-      decisionName: pattern.name,
-      decisionQuestion: basis ? firstSentence(basis, 230) : `What ${pattern.name.toLowerCase()} position should govern execution?`,
-      whyItMatters: hits[1] ? firstSentence(hits[1], 220) : 'This decision changes scope, sequencing, dependency readiness, and the evidence required before rollout.',
-      decisionOptions: pattern.options,
-      decisionEvidenceNeeded: [...hits.slice(0, 2).map(text => firstSentence(text, 180)), 'Observed validation evidence, dependency readiness, and source-traceable rationale.'].filter(Boolean).slice(0, 4),
-      decisionTiming: /before|prior|precede|gate|sprint|pilot/i.test(basis) ? firstSentence(basis, 170) : 'Resolve before the dependent execution phase proceeds.',
-      sourceRefs: stage3SourceRefsFrom(handoffBrief),
-    }
-  })
+  return _buildCompiledCriticalDecisions(tree, handoffBrief, profile)
 }
 
 const GENERAL_PHASES = [
@@ -4214,14 +4274,7 @@ function buildCompiledExecutionSequence(tree, handoffBrief, profile) {
 }
 
 function buildCompiledDependencies(tree, handoffBrief) {
-  return pickBulletTexts(tree, 'dependencies', null, 10).slice(0, 8).map((text, idx) => ({
-    dependencyName: firstSentence(text, 80).replace(/\s+must\b.*$/i, '').replace(/\s+is required\b.*$/i, '').trim() || `Dependency ${idx + 1}`,
-    dependencyDescription: firstSentence(text, 260),
-    whyItMatters: /gate|block|before|prerequisite|required/i.test(text) ? firstSentence(text, 220) : 'This input conditions whether the BU can execute the relevant phase with confidence.',
-    requiredInput: firstSentence(text, 210),
-    consequenceIfMissing: /before|block|gate|cannot|risk/i.test(text) ? 'Execution proceeds on assumptions or blocks the dependent gate.' : 'The plan loses evidence quality and may require rework.',
-    sourceRefs: stage3SourceRefsFrom(handoffBrief),
-  }))
+  return _buildCompiledDependencies(tree, handoffBrief)
 }
 
 function genericRiskTemplates(tree, profile) {
@@ -4253,46 +4306,11 @@ function inferRiskName(text, idx, profile) {
 }
 
 function buildCompiledRisks(tree, handoffBrief, profile) {
-  const riskTexts = pickBulletTexts(tree, 'risks', null, 40)
-  const templates = profile === 'productArchitecture'
-    ? STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.pmValidationCaseGuidance.risks
-    : genericRiskTemplates(tree, profile)
-  return templates.map(template => {
-    const hits = riskTexts.filter(text => template.re.test(text))
-    const useTemplateText = profile !== 'productArchitecture'
-    return {
-      riskName: template.name,
-      riskDescription: useTemplateText ? template.description : hits[0] ? firstSentence(hits[0], 260) : template.description,
-      whyItMatters: useTemplateText ? template.description : hits[1] ? firstSentence(hits[1], 220) : template.description,
-      mitigationOptions: template.mitigations,
-      earlyWarningSignals: template.warnings,
-      evidenceThatRiskIsReduced: template.reduced,
-      sourceRefs: stage3SourceRefsFrom(handoffBrief),
-    }
-  })
+  return _buildCompiledRisks(tree, handoffBrief, profile)
 }
 
 function buildCompiledValidationFramework(tree, handoffBrief, profile) {
-  const validationTexts = pickBulletTexts(tree, 'validationSignals', null, 16)
-  const terms = roleLearningTerms(profile)
-  const questions = profile === 'productArchitecture'
-    ? ['Does the output improve a real BSA/AML or product workflow decision?', 'Is the architecture and data coverage valid enough to support the promised product boundary?', 'Is the pilot standard strong enough to justify rollout or scale?', 'Are regulatory and explainability assumptions traceable enough to proceed?']
-    : [`Does this BU execution path improve the ${terms[0] || 'operating outcome'} it is responsible for?`, `Are the ${terms[1] || 'decision'} and dependency inputs complete enough to proceed?`, `Is the evidence strong enough to advance the next BU-specific gate?`]
-  const evidenceExamples = profile === 'productArchitecture'
-    ? STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.pmValidationCaseGuidance.evidenceExamples
-    : ['observed workflow notes', 'readiness review notes', 'before/after operating comparison', 'stakeholder feedback summary', 'decision record', 'unresolved concerns log']
-  const veracityChecks = profile === 'productArchitecture'
-    ? STAGE3_COMPILED_STRATEGY_LEARNING_SIGNALS.pmValidationCaseGuidance.veracityChecks
-    : ['evidence is observed or source-traceable, not only asserted', 'contradictory feedback is documented', 'assumptions are tagged unresolved', 'decision rationale is traceable', 'evidence shows operating impact, not only preference']
-  return questions.map((question, idx) => ({
-    validationQuestion: question,
-    completionCriteria: [validationTexts[idx] ? firstSentence(validationTexts[idx], 210) : 'The target user can use the output in a realistic workflow without extra translation.', 'The evidence supports a real workflow decision or reduces observable friction.', 'Contradictory feedback and unresolved assumptions are documented.'],
-    howToDetermineCompletion: ['Observe mock, prototype, or pilot use in a realistic workflow.', 'Compare expected use against actual user interpretation.', 'Document hesitation, rejection, reinterpretation, and decision changes.', 'Confirm whether effort, confidence, or workflow quality improves.'],
-    evidenceExamples,
-    veracityChecks,
-    failureOrReworkTriggers: ['Users cannot interpret the output without analyst translation.', 'The output does not change a decision, reduce effort, or improve confidence.', 'Evidence conflicts are unresolved before the gate.'],
-    sourceRefs: stage3SourceRefsFrom(handoffBrief),
-  }))
+  return _buildCompiledValidationFramework(tree, handoffBrief, profile)
 }
 
 function maxIso(values) {
@@ -4576,6 +4594,13 @@ function buildStage3CompiledStrategyQualityAudit(compiledPlan, handoffCoverageAu
     ? auditFail(ruleById.reduce_repetition, 'Repeated content appears across compiled strategy sections.', { repeats })
     : auditPass(ruleById.reduce_repetition))
 
+  if (ruleById.field_distinctness) {
+    const fieldViolations = validateStage3CompiledFieldDistinctness(compiledPlan)
+    results.push(fieldViolations.length
+      ? auditFail(ruleById.field_distinctness, 'One or more compiled plan items have duplicate text across fields that should serve distinct roles.', { violations: fieldViolations })
+      : auditPass(ruleById.field_distinctness))
+  }
+
   return {
     rules,
     results,
@@ -4812,24 +4837,42 @@ function Stage3CompiledQualityAuditView({ audit }) {
   )
 }
 
-function CompiledStrategyView({ compiled, audit, qualityAudit, provenance }) {
+function CompiledStrategyView({ compiled, audit, qualityAudit, provenance, panelModel, runningRefinementId, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdatePhaseMapping, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey: apiKeyAvailable }) {
   if (!compiled) return null
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <CompiledStrategyProvenancePanel provenance={provenance} />
-      <StrategySection title="Strategic Objective"><LabeledText label="summary" value={compiled.strategicObjective.summary} /><LabeledText label="outcome focus" value={compiled.strategicObjective.outcomeFocus} /><LabeledText label="non-goals / boundaries" value={compiled.strategicObjective.nonGoalsOrBoundaries} /></StrategySection>
-      <StrategySection title="Critical Decisions" accent="#3b82f6">{compiled.criticalDecisions.map((decision, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 10, fontWeight: 700, color: '#3b82f6', marginBottom: 6 }}>{decision.decisionName}</div><LabeledText label="question" value={decision.decisionQuestion} /><LabeledText label="why it matters" value={decision.whyItMatters} /><LabeledText label="options" value={decision.decisionOptions} /><LabeledText label="evidence needed" value={decision.decisionEvidenceNeeded} /><LabeledText label="timing" value={decision.decisionTiming} /></div>)}</StrategySection>
-      <StrategySection title="Execution Sequence">{compiled.executionSequence.map((phase, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 10, fontWeight: 700, color: '#00e5b4', marginBottom: 5 }}>{phase.phaseName}</div><LabeledText label="phase objective" value={phase.phaseObjective} /><LabeledText label="recommended how" value={phase.recommendedHow} /><LabeledText label="why this fits the phase" value={phase.whyThisFitsThePhase} /><LabeledText label="exit criteria" value={phase.exitCriteria} /><div style={{ marginTop: 6 }}><div style={{ fontSize: 7, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>how options</div>{phase.howOptions.map((opt, oi) => <div key={oi} style={{ marginBottom: 6, paddingLeft: 7, borderLeft: '2px solid rgba(0,229,180,.35)' }}><div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 2 }}>{opt.optionName}</div><LabeledText label="when to use" value={opt.whenToUse} /><LabeledText label="why it fits" value={opt.whyItFitsThePhaseOutcome} /><LabeledText label="evidence produced" value={opt.evidenceProduced} /></div>)}</div></div>)}</StrategySection>
-      <StrategySection title="Dependencies" accent="#fb923c">{compiled.dependencies.map((dep, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 9, fontWeight: 700, color: '#fb923c', marginBottom: 5 }}>{dep.dependencyName}</div><LabeledText label="description" value={dep.dependencyDescription} /><LabeledText label="required input" value={dep.requiredInput} /><LabeledText label="consequence if missing" value={dep.consequenceIfMissing} /></div>)}</StrategySection>
-      <StrategySection title="Risk & Mitigation" accent="#f87171">{compiled.risksAndMitigations.map((risk, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 9, fontWeight: 700, color: '#f87171', marginBottom: 5 }}>{risk.riskName}</div><LabeledText label="description" value={risk.riskDescription} /><LabeledText label="mitigation options" value={risk.mitigationOptions} /><LabeledText label="early warning signals" value={risk.earlyWarningSignals} /><LabeledText label="evidence risk is reduced" value={risk.evidenceThatRiskIsReduced} /></div>)}</StrategySection>
-      <StrategySection title="Validation Framework" accent="#a3e635">{compiled.validationFramework.map((item, idx) => <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '8px 9px', background: 'var(--s2)' }}><div style={{ fontSize: 9, fontWeight: 700, color: '#a3e635', marginBottom: 5 }}>{item.validationQuestion}</div><LabeledText label="completion criteria" value={item.completionCriteria} /><LabeledText label="how to determine completion" value={item.howToDetermineCompletion} /><LabeledText label="evidence examples" value={item.evidenceExamples} /><LabeledText label="veracity checks" value={item.veracityChecks} /><LabeledText label="failure / rework triggers" value={item.failureOrReworkTriggers} /></div>)}</StrategySection>
+      {/* Panel-level governance — expandable panels with audit, refinement, history */}
+      <Stage3PanelView
+        panelModel={panelModel}
+        runningRefinementId={runningRefinementId}
+        onRefinePanel={onRefinePanel}
+        onGeneratePanel={onGeneratePanel}
+        onAcceptPanel={onAcceptPanel}
+        onRejectPanel={onRejectPanel}
+        onUpdatePhaseMapping={onUpdatePhaseMapping}
+        onUpdateHowOptionMapping={onUpdateHowOptionMapping}
+        onUpdateSelectedStage4Deliverables={onUpdateSelectedStage4Deliverables}
+        hasApiKey={apiKeyAvailable}
+      />
       <HandoffCoverageAuditView audit={audit} />
       <Stage3CompiledQualityAuditView audit={qualityAudit} />
     </div>
   )
 }
 
-function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], unitName, onStage2Action, showHandoffBrief = true, generationState = null }) {
+function aiResponseText(response) {
+  return response?.result || response?.content || response?.text || ''
+}
+
+function apiResponseTruncationReason(response) {
+  const stopReason = String(response?.stopReason || response?.stop_reason || response?.finishReason || response?.finish_reason || '').toLowerCase()
+  if (stopReason === 'max_tokens' || stopReason === 'length') return 'Truncated model output'
+  if (response?.incomplete || response?.truncated) return 'Truncated model output'
+  return null
+}
+
+function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], unitName, onStage2Action, showHandoffBrief = true, generationState = null, onPanelModelChange }) {
   const [viewMode,       setViewMode]       = useState('compiled')
   const [briefOpen,      setBriefOpen]      = useState(true)
   const [spineOpen,      setSpineOpen]      = useState(true)
@@ -4874,6 +4917,342 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], 
       return { error: error?.message || 'Compiled strategy derivation failed.', provenance: fallbackProvenance }
     }
   }, [draft, legacyPlan, handoffBrief, handoffItems, tree, resolvedExecutionDraft, generationState, fallbackProvenance])
+
+  // ── Panel model — normalized from compiled plan; carries per-panel audit + history ──
+  const [panelModel, setPanelModel] = useState(null)
+  const [runningRefinementId, setRunningRefinementId] = useState(null)
+  const [panelRefinementError, setPanelRefinementError] = useState(null)
+
+  const commitPanelModel = useCallback((updater) => {
+    setPanelModel(prev => {
+      const base = prev || draft?.panelModel || normalizeToPanelModel(compiledStrategy?.compiledBUExecutionPlan || {})
+      const next = typeof updater === 'function' ? updater(base) : updater
+      if (next && onPanelModelChange) onPanelModelChange(next)
+      return next
+    })
+  }, [compiledStrategy, draft?.panelModel, onPanelModelChange])
+
+  const panelModelAsCompiledPlan = useCallback((model = panelModel) => ({
+    strategicObjective:  model?.panels?.strategicObjective?.content || null,
+    criticalDecisions:   model?.panels?.criticalDecisions?.content || [],
+    executionSequence:   model?.panels?.executionSequence?.content || [],
+    dependencies:        model?.panels?.dependencies?.content || [],
+    risksAndMitigations: model?.panels?.risks?.content || [],
+    validationFramework: model?.panels?.validationFramework?.content || [],
+  }), [panelModel])
+
+  // Rebuild panel model when compiled plan changes (e.g. after regeneration)
+  React.useEffect(() => {
+    const compiled = compiledStrategy?.compiledBUExecutionPlan
+    if (!compiled || compiledStrategy?.error) return
+    setPanelModel(prev => {
+      if (draft?.panelModel?.panels) return draft.panelModel
+      if (!prev) return normalizeToPanelModel(compiled)
+      // Merge existing refinement history into new panel model
+      const fresh = normalizeToPanelModel(compiled)
+      const merged = { ...fresh }
+      Object.keys(prev.panels || {}).forEach(pid => {
+        const existingPanel = prev.panels[pid]
+        if (existingPanel?.refinementHistory?.length && merged.panels?.[pid]) {
+          merged.panels[pid] = {
+            ...merged.panels[pid],
+            refinementHistory: existingPanel.refinementHistory,
+            lastRefinedAt: existingPanel.lastRefinedAt,
+          }
+        }
+      })
+      return merged
+    })
+  }, [compiledStrategy, draft?.panelModel])
+
+  const handleRefinePanel = useCallback(async ({ panelId, prompt, impactSummary }) => {
+    if (!hasApiKey() || runningRefinementId) return
+    const compiled = compiledStrategy?.compiledBUExecutionPlan
+    if (!compiled) return
+
+    setRunningRefinementId(panelId)
+    setPanelRefinementError(null)
+
+    try {
+      const currentPanel  = panelModel?.panels?.[panelId]
+      const auditBefore   = currentPanel?.completenessAudit || null
+      const { messages }  = buildPanelRefinementMessages({
+        panelId,
+        panelContent:    currentPanel?.content,
+        compiledPlan:    compiled,
+        crossPanelAudit: panelModel?.crossPanelAudit,
+        prompt,
+        impactSummary,
+        auditBefore,
+      })
+
+      const response = await callAI(messages)
+      if (response?.error || response?.rateLimited) {
+        const error = response.error || 'API rate limited. Try again.'
+        const failedRecord = createFailedRefinementRecord({
+          panelId,
+          prompt,
+          impactSummary,
+          previousContent: currentPanel?.content,
+          auditBefore,
+          error,
+        })
+        commitPanelModel(prev => appendRefinementRecord(prev || normalizeToPanelModel(compiled), panelId, failedRecord))
+        setPanelRefinementError(error)
+        return
+      }
+
+      const apiTruncationReason = apiResponseTruncationReason(response)
+      const rawResponseText = aiResponseText(response)
+      if (apiTruncationReason || !rawResponseText.trim()) {
+        const error = apiTruncationReason || 'Empty response from API'
+        const failedRecord = createFailedRefinementRecord({
+          panelId,
+          prompt,
+          impactSummary,
+          previousContent: currentPanel?.content,
+          auditBefore,
+          error,
+          failureReason: error,
+        })
+        commitPanelModel(prev => appendRefinementRecord(prev || normalizeToPanelModel(compiled), panelId, failedRecord))
+        setPanelRefinementError(error)
+        return
+      }
+
+      const { content: revisedContent, error: parseError } = parsePanelRefinementResponse(panelId, rawResponseText)
+      if (parseError || !revisedContent) {
+        const error = parseError || 'Could not parse refinement response.'
+        const failedRecord = createFailedRefinementRecord({
+          panelId,
+          prompt,
+          impactSummary,
+          previousContent: currentPanel?.content,
+          auditBefore,
+          error,
+          failureReason: /empty/i.test(error) ? 'Empty response from API' : error,
+        })
+        commitPanelModel(prev => appendRefinementRecord(prev || normalizeToPanelModel(compiled), panelId, failedRecord))
+        setPanelRefinementError(error)
+        return
+      }
+
+      const currentModel = panelModel || normalizeToPanelModel(compiled)
+      const validation = validateProposedPanelContent({
+        panelId,
+        proposedContent: revisedContent,
+        currentPanelModel: currentModel,
+      })
+      const auditAfter = validation.auditAfter
+      const changedFields = Object.keys(revisedContent || {}).filter(k => {
+        const prev = currentPanel?.content?.[k]
+        return JSON.stringify(prev) !== JSON.stringify(revisedContent[k])
+      })
+
+      if (!validation.ok) {
+        const failedRecord = createFailedRefinementRecord({
+          panelId,
+          prompt,
+          impactSummary,
+          previousContent: currentPanel?.content,
+          proposedContent: revisedContent,
+          auditBefore,
+          auditAfter,
+          error: validation.failureReason,
+          failureReason: validation.failureReason,
+        })
+        commitPanelModel(prev => appendRefinementRecord(prev || currentModel, panelId, failedRecord))
+        setPanelRefinementError(validation.failureReason)
+        return
+      }
+
+      const refinementRecord = createRefinementRecord({
+        panelId,
+        prompt,
+        impactSummary,
+        previousContent: currentPanel?.content,
+        revisedContent,
+        auditBefore,
+        auditAfter,
+        changedFields,
+      })
+
+      // Apply as a new panel draft; explicit panel acceptance gates Stage 4.
+      commitPanelModel(prev => {
+        const withRecord  = appendRefinementRecord(prev || normalizeToPanelModel(compiled), panelId, refinementRecord)
+        return applyAcceptedRefinement(withRecord, panelId, revisedContent)
+      })
+    } catch (err) {
+      const error = `Panel refinement failed: ${err?.message || String(err)}`
+      const baseModel = panelModel || normalizeToPanelModel(compiled)
+      const fallbackPanel = baseModel?.panels?.[panelId]
+      const failedRecord = createFailedRefinementRecord({
+        panelId,
+        prompt,
+        impactSummary,
+        previousContent: fallbackPanel?.content,
+        auditBefore: fallbackPanel?.completenessAudit || null,
+        error,
+        failureReason: error,
+      })
+      commitPanelModel(prev => appendRefinementRecord(prev || baseModel, panelId, failedRecord))
+      setPanelRefinementError(error)
+    } finally {
+      setRunningRefinementId(null)
+    }
+  }, [compiledStrategy, panelModel, runningRefinementId, commitPanelModel])
+
+  const handleGeneratePanel = useCallback(async ({ panelId, retryIndex = null }) => {
+    if (!hasApiKey() || runningRefinementId) return
+    const currentModel = panelModel || normalizeToPanelModel(compiledStrategy?.compiledBUExecutionPlan || panelModelAsCompiledPlan())
+
+    setRunningRefinementId(panelId)
+    setPanelRefinementError(null)
+
+    const buSummary = {
+      name:                 unitName || draft?.plan?.buName || legacyPlan?.buName || handoffBrief?.businessUnitName,
+      purpose:              handoffBrief?.planningPurpose || draft?.plan?.mission || legacyPlan?.mission,
+      strategicInvolvement: handoffBrief?.decisionBasisSummary || draft?.plan?.strategicRole || legacyPlan?.strategicRole,
+      keyResponsibilities:  draft?.plan?.criticalWorkstreams || handoffBrief?.sourceStage2SectionIds || [],
+      dependencies:         draft?.plan?.crossFunctionalDependencies || [],
+      risksAndUnknowns:     draft?.plan?.risks || [],
+    }
+    const s1Summary = [
+      handoffBrief?.decisionBasisSummary,
+      handoffBrief?.planningPurpose,
+      handoffBrief?.businessUnitName,
+    ].filter(Boolean).join('\n')
+
+    try {
+      // ── Strategic Objective — single call, small enough to complete reliably ──
+      if (!ATOMIC_GENERATION_PANELS.has(panelId)) {
+        const { messages } = buildPanelGenerationMessages({
+          panelId,
+          buSummary,
+          s1Summary,
+          panels: currentModel.panels,
+        })
+        const response = await callAI(messages)
+        if (response?.error || response?.rateLimited) throw new Error(response.error || 'API rate limited.')
+        const truncReason = apiResponseTruncationReason(response)
+        if (truncReason) throw new Error(truncReason)
+        const { content, error } = parsePanelGenerationResponse(panelId, aiResponseText(response))
+        if (error || !content) throw new Error(error || 'Could not parse panel response.')
+        commitPanelModel(prev => applyAcceptedRefinement(prev || currentModel, panelId, content))
+        return
+      }
+
+      // ── Multi-item panels — atomic generation (one item per call) ──────────
+      if (retryIndex != null) {
+        // Retry a single failed child unit — leave all others untouched
+        const existingUnits = currentModel?.panels?.[panelId]?.childUnits || []
+        const siblings = existingUnits
+          .filter(u => u.index !== retryIndex && u.status === 'draft_ready')
+          .map(u => u.content)
+          .filter(Boolean)
+        const updated = await retryChildUnit({ panelId, index: retryIndex, buSummary, s1Summary, siblingsContent: siblings, callAI })
+        commitPanelModel(prev => {
+          const panel    = prev?.panels?.[panelId]
+          const units    = (panel?.childUnits || initChildUnits(panelId, DEFAULT_ITEM_COUNTS[panelId] ?? 3))
+            .map(u => u.index === retryIndex ? updated : u)
+          const assembled = units.filter(u => u.status === 'draft_ready').sort((a, b) => a.index - b.index).map(u => u.content)
+          const panelAudit = assembled.length ? auditPanelCompleteness(panelId, assembled) : null
+          return applyAcceptedRefinement(prev || currentModel, panelId, assembled, { childUnits: units, panelAudit })
+        })
+        if (updated.status === 'failed') setPanelRefinementError(`Item ${retryIndex + 1} retry failed: ${updated.error}`)
+        return
+      }
+
+      // Full atomic generation
+      const existingUnits = currentModel?.panels?.[panelId]?.childUnits || []
+
+      // Initialise child units to 'generating' state in UI immediately
+      commitPanelModel(prev => {
+        const panel = prev?.panels?.[panelId]
+        const count = DEFAULT_ITEM_COUNTS[panelId] ?? 3
+        const blank = initChildUnits(panelId, count).map(u => {
+          const prior = existingUnits.find(e => e.index === u.index && e.status === 'accepted')
+          return prior ? prior : { ...u, status: 'generating' }
+        })
+        if (!prev?.panels?.[panelId]) return prev
+        return { ...prev, panels: { ...prev.panels, [panelId]: { ...panel, childUnits: blank, lifecycle: 'generating_units' } } }
+      })
+
+      const { assembledContent, allChildUnits, failedUnits } = await generatePanelAtomically({
+        panelId,
+        buSummary,
+        s1Summary,
+        existingPanels:    currentModel.panels,
+        existingChildUnits: existingUnits,
+        callAI,
+        onChildUnitComplete: (index, content, audit) => {
+          commitPanelModel(prev => {
+            const panel = prev?.panels?.[panelId]
+            if (!panel) return prev
+            const units = (panel.childUnits || []).map(u =>
+              u.index === index ? { ...u, status: 'draft_ready', content, audit, generatedAt: new Date().toISOString() } : u
+            )
+            return { ...prev, panels: { ...prev.panels, [panelId]: { ...panel, childUnits: units } } }
+          })
+        },
+        onChildUnitFailed: (index, error) => {
+          commitPanelModel(prev => {
+            const panel = prev?.panels?.[panelId]
+            if (!panel) return prev
+            const units = (panel.childUnits || []).map(u =>
+              u.index === index ? { ...u, status: 'failed', error, generatedAt: new Date().toISOString() } : u
+            )
+            return { ...prev, panels: { ...prev.panels, [panelId]: { ...panel, childUnits: units } } }
+          })
+        },
+      })
+
+      // Apply assembled content (only completed items) — preserve prior accepted content if all failed
+      if (assembledContent.length > 0) {
+        commitPanelModel(prev =>
+          applyAcceptedRefinement(prev || currentModel, panelId, assembledContent, { childUnits: allChildUnits })
+        )
+      } else {
+        // Nothing succeeded — mark panel failed but preserve prior accepted content
+        commitPanelModel(prev => rejectPanel(prev || currentModel, panelId, 'All child units failed — no content generated.'))
+      }
+
+      if (failedUnits.length > 0) {
+        setPanelRefinementError(`${failedUnits.length} item(s) failed and can be retried individually.`)
+      }
+    } catch (err) {
+      const error = `Panel generation failed: ${err?.message || String(err)}`
+      setPanelRefinementError(error)
+      commitPanelModel(prev => rejectPanel(prev || currentModel, panelId, error))
+    } finally {
+      setRunningRefinementId(null)
+    }
+  }, [compiledStrategy, draft, legacyPlan, handoffBrief, panelModel, panelModelAsCompiledPlan, runningRefinementId, unitName, commitPanelModel])
+
+  const handleAcceptPanel = useCallback(({ panelId }) => {
+    try {
+      commitPanelModel(prev => acceptPanel(prev, panelId))
+      setPanelRefinementError(null)
+    } catch (err) {
+      setPanelRefinementError(err?.message || String(err))
+    }
+  }, [commitPanelModel])
+
+  const handleRejectPanel = useCallback(({ panelId }) => {
+    commitPanelModel(prev => rejectPanel(prev, panelId))
+  }, [commitPanelModel])
+
+  const handleUpdatePhaseMapping = useCallback(({ phaseId, mappedDeliverables }) => {
+    commitPanelModel(prev => updatePhaseMapping(prev, phaseId, mappedDeliverables))
+  }, [commitPanelModel])
+
+  const handleUpdateHowOptionMapping = useCallback(({ phaseId, optionId, mappedDeliverables }) => {
+    commitPanelModel(prev => updateHowOptionMapping(prev, phaseId, optionId, mappedDeliverables))
+  }, [commitPanelModel])
+
+  const handleUpdateSelectedStage4Deliverables = useCallback(({ deliverableTypes }) => {
+    commitPanelModel(prev => updateSelectedStage4Deliverables(prev, deliverableTypes))
+  }, [commitPanelModel])
 
   if (!tree || !tree.sections.length) {
     return (
@@ -4968,12 +5347,29 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], 
       )}
 
       {viewMode === 'compiled' && !compiledStrategy?.error ? (
-        <CompiledStrategyView
-          compiled={compiledStrategy?.compiledBUExecutionPlan}
-          audit={compiledStrategy?.handoffCoverageAudit}
-          qualityAudit={compiledStrategy?.stage3CompiledStrategyQualityAudit}
-          provenance={compiledStrategy?.provenance}
-        />
+        <>
+          {panelRefinementError && (
+            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: '#f87171', padding: '8px 10px', border: '1px solid rgba(248,113,113,.28)', borderRadius: 5, background: 'rgba(248,113,113,.06)', marginBottom: 8 }}>
+              {panelRefinementError}
+            </div>
+          )}
+          <CompiledStrategyView
+            compiled={compiledStrategy?.compiledBUExecutionPlan}
+            audit={compiledStrategy?.handoffCoverageAudit}
+            qualityAudit={compiledStrategy?.stage3CompiledStrategyQualityAudit}
+            provenance={compiledStrategy?.provenance}
+            panelModel={panelModel}
+            runningRefinementId={runningRefinementId}
+            onRefinePanel={handleRefinePanel}
+            onGeneratePanel={handleGeneratePanel}
+            onAcceptPanel={handleAcceptPanel}
+            onRejectPanel={handleRejectPanel}
+            onUpdatePhaseMapping={handleUpdatePhaseMapping}
+            onUpdateHowOptionMapping={handleUpdateHowOptionMapping}
+            onUpdateSelectedStage4Deliverables={handleUpdateSelectedStage4Deliverables}
+            hasApiKey={hasApiKey()}
+          />
+        </>
       ) : (
         <>
 
@@ -5642,6 +6038,316 @@ function ApiModeStatus({ apiMode }) {
   )
 }
 
+// ── Prepare Stage 4 Handoff panel ────────────────────────────────────────────
+
+const S4_PHASE = {
+  NOT_READY:       'not_ready',
+  CHECKING:        'checking',
+  READY_TO_PREPARE:'ready_to_prepare',
+  COMPILING:       'compiling',
+  PERSISTING:      'persisting',
+  VERIFYING:       'verifying',
+  VERIFIED:        'verified',
+  FAILED:          'failed',
+}
+
+const HANDOFF_ELIGIBLE_STATUSES = new Set([
+  LIFECYCLE_STATES.DRAFT_GENERATED,
+  LIFECYCLE_STATES.PARTIAL_DRAFT,
+  LIFECYCLE_STATES.ACCEPTED,
+])
+
+function HandoffBadge({ status }) {
+  const cfg = {
+    [S4_BU_STATUS.READY]:   { color: '#00e5b4', label: 'READY' },
+    [S4_BU_STATUS.PARTIAL]: { color: '#fb923c', label: 'PARTIAL' },
+    [S4_BU_STATUS.BLOCKED]: { color: '#f87171', label: 'BLOCKED' },
+    [S4_STATUS.READY]:      { color: '#00e5b4', label: 'READY' },
+    [S4_STATUS.PARTIAL]:    { color: '#fb923c', label: 'PARTIAL' },
+    [S4_STATUS.BLOCKED]:    { color: '#f87171', label: 'BLOCKED' },
+  }[status] || { color: 'var(--muted)', label: String(status || '').toUpperCase() }
+  return (
+    <span style={{
+      fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 700,
+      color: cfg.color, background: `${cfg.color}18`,
+      border: `1px solid ${cfg.color}44`,
+      borderRadius: 4, padding: '2px 7px', letterSpacing: '.04em',
+    }}>
+      {cfg.label}
+    </span>
+  )
+}
+
+function PrepareStage4HandoffPanel({
+  workspaceId,
+  stage1ActiveId,
+  stage2ActiveId,
+  stage3ActiveId,
+  orderedStage2BUs,
+  stage3DraftPlans,
+  idbReady,
+  onNavigateToStage4,
+  stage3ActiveRevision,   // { id, contentSnapshot, sourceBasisRevisionId, sourceStage2RevisionId }
+}) {
+  const [phase, setPhase]     = useState(S4_PHASE.NOT_READY)
+  const [handoff, setHandoff] = useState(null)
+  const [error, setError]     = useState(null)
+  const preparingRef          = React.useRef(false)
+
+  const hasRequiredIds = !!(workspaceId && stage1ActiveId && stage2ActiveId && stage3ActiveId)
+  const buNames = orderedStage2BUs.map(bu => bu.name).filter(Boolean)
+
+  // On mount / when IDs or idbReady changes, check for an existing persisted handoff
+  useEffect(() => {
+    if (!hasRequiredIds || !idbReady) {
+      setPhase(S4_PHASE.NOT_READY)
+      setHandoff(null)
+      setError(null)
+      return
+    }
+    let cancelled = false
+    setPhase(S4_PHASE.CHECKING)
+    loadStage4Handoff(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      .then(record => {
+        if (cancelled) return
+        if (record) {
+          setHandoff(record)
+          setPhase(S4_PHASE.VERIFIED)
+        } else {
+          setPhase(S4_PHASE.READY_TO_PREPARE)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPhase(S4_PHASE.READY_TO_PREPARE)
+      })
+    return () => { cancelled = true }
+  }, [workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId, idbReady])
+
+  async function handlePrepare() {
+    if (preparingRef.current) return
+    preparingRef.current = true
+    setError(null)
+    setHandoff(null)
+    try {
+      setPhase(S4_PHASE.COMPILING)
+      const compiled = await compileStage4Handoff({
+        workspaceId, stage1Id: stage1ActiveId,
+        stage2Id: stage2ActiveId, stage3Id: stage3ActiveId, buNames,
+        stage3ActiveRevision,
+      })
+
+      setPhase(S4_PHASE.PERSISTING)
+      const { ok } = await persistStage4Handoff(compiled)
+      if (!ok) {
+        setError('Handoff could not be written to storage. Retry to re-attempt.')
+        setPhase(S4_PHASE.FAILED)
+        preparingRef.current = false
+        return
+      }
+
+      setPhase(S4_PHASE.VERIFYING)
+      const verified = await loadStage4Handoff(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!verified) {
+        setError('Handoff was written but could not be read back. Reload and retry.')
+        setPhase(S4_PHASE.FAILED)
+        preparingRef.current = false
+        return
+      }
+
+      setHandoff(verified)
+      setPhase(S4_PHASE.VERIFIED)
+    } catch (err) {
+      setError(err?.message || String(err))
+      setPhase(S4_PHASE.FAILED)
+    } finally {
+      preparingRef.current = false
+    }
+  }
+
+  // Derive per-BU readiness from the IDB-sourced draft plans (hydration state)
+  const buReadiness = buNames.map(name => {
+    const draft = stage3DraftPlans?.[name]
+    const lcStatus = draft?.lifecycle?.status || draft?.status || null
+    const eligible = HANDOFF_ELIGIBLE_STATUSES.has(lcStatus)
+    const hasAtoms  = (draft?.executionAtoms || []).some(a => a?.status === 'complete')
+    const handoffEntry = handoff?.buHandoffs?.find(b => b.buName === name)
+    return { name, eligible, lcStatus, hasAtoms, handoffEntry }
+  })
+  const eligibleCount  = buReadiness.filter(b => b.eligible && b.hasAtoms).length
+  const canPrepare     = idbReady && hasRequiredIds && eligibleCount > 0
+
+  // Compact phase label for in-progress states
+  const phaseLabel = {
+    [S4_PHASE.CHECKING]:  'Checking storage…',
+    [S4_PHASE.COMPILING]: 'Reading Stage 3 BU records from storage…',
+    [S4_PHASE.PERSISTING]:'Writing handoff to storage…',
+    [S4_PHASE.VERIFYING]: 'Verifying handoff from storage…',
+  }[phase]
+
+  const cardS = {
+    background: 'var(--surface)', border: '1px solid var(--border)',
+    borderRadius: 'var(--r)', padding: '14px 16px', marginBottom: 10,
+  }
+  const fm = 'var(--fm)'
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
+        E · Prepare Stage 4 Handoff
+      </div>
+
+      {/* Error banner */}
+      {error && (
+        <div style={{
+          padding: '10px 14px', marginBottom: 8,
+          background: 'rgba(248,113,113,.07)', border: '1px solid rgba(248,113,113,.3)',
+          borderRadius: 5, fontSize: 10, fontFamily: fm, color: '#f87171', lineHeight: 1.55,
+        }}>
+          <strong>Error:</strong> {error}
+        </div>
+      )}
+
+      {/* Main card */}
+      <div style={cardS}>
+
+        {/* Title row */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 3 }}>
+              Prepare Stage 4 Handoff
+            </div>
+            <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.6 }}>
+              {phase === S4_PHASE.VERIFIED
+                ? 'Stage 4 handoff is prepared and verified from durable storage.'
+                : 'Compiles a handoff from durable Stage 3 BU execution-plan records. Only BUs with persisted records and completed atoms are forwarded.'}
+            </div>
+          </div>
+          {phase === S4_PHASE.VERIFIED && handoff && (
+            <HandoffBadge status={handoff.overallStatus} />
+          )}
+        </div>
+
+        {/* In-progress spinner states */}
+        {phaseLabel && (
+          <div style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted)', marginBottom: 8 }}>
+            {phaseLabel}
+          </div>
+        )}
+
+        {/* BU readiness rows — shown in ready_to_prepare and verified states */}
+        {(phase === S4_PHASE.READY_TO_PREPARE || phase === S4_PHASE.VERIFIED || phase === S4_PHASE.FAILED) && (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '.05em' }}>
+              BU readiness — {eligibleCount}/{buNames.length} eligible
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {buReadiness.map(({ name, eligible, hasAtoms, lcStatus, handoffEntry }) => {
+                const s4Status = handoffEntry?.status || null
+                const showS4 = phase === S4_PHASE.VERIFIED && s4Status
+                return (
+                  <div key={name} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '6px 10px', borderRadius: 4,
+                    background: 'var(--s2)', border: '1px solid var(--border)',
+                  }}>
+                    <span style={{ fontSize: 10, fontWeight: 600, flex: 1 }}>{name}</span>
+                    {showS4 ? (
+                      <HandoffBadge status={s4Status} />
+                    ) : (
+                      <span style={{
+                        fontSize: 8, fontFamily: fm, fontWeight: 600,
+                        color: eligible && hasAtoms ? '#00e5b4' : '#f87171',
+                      }}>
+                        {eligible && hasAtoms ? 'ELIGIBLE' : !eligible ? `NOT READY (${lcStatus || 'no plan'})` : 'NO COMPLETED ATOMS'}
+                      </span>
+                    )}
+                    {showS4 && handoffEntry?.blockedReason && (
+                      <span style={{ fontSize: 8, fontFamily: fm, color: '#f87171', flex: 1, textAlign: 'right' }}>
+                        {handoffEntry.blockedReason}
+                      </span>
+                    )}
+                    {showS4 && handoffEntry?.sourcePersistAt && !handoffEntry?.blockedReason && (
+                      <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)' }}>
+                        persisted {new Date(handoffEntry.sourcePersistAt).toLocaleString()}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Verified summary */}
+        {phase === S4_PHASE.VERIFIED && handoff && (
+          <div style={{
+            padding: '8px 12px', marginBottom: 10,
+            background: 'rgba(0,229,180,.06)', border: '1px solid rgba(0,229,180,.25)',
+            borderRadius: 5, fontSize: 9, fontFamily: fm, color: '#00e5b4', lineHeight: 1.5,
+          }}>
+            ✓ Verified from storage
+            {' · '}{handoff.readyCount} ready · {handoff.partialCount} partial · {handoff.blockedCount} blocked / {handoff.totalCount} BUs
+            <br />
+            Compiled {new Date(handoff.compiledAt).toLocaleString()}
+            {' · '}Persisted {new Date(handoff.persistedAt).toLocaleString()}
+          </div>
+        )}
+
+        {/* Actions row */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          {/* Primary action: prepare / recompile */}
+          {phase !== S4_PHASE.NOT_READY && !phaseLabel && (
+            <button
+              onClick={handlePrepare}
+              disabled={!canPrepare || !!phaseLabel}
+              style={{
+                fontSize: 10, fontFamily: fm, fontWeight: 600,
+                padding: '7px 18px', borderRadius: 5, cursor: canPrepare ? 'pointer' : 'default',
+                background: phase === S4_PHASE.VERIFIED ? 'var(--s2)' : 'var(--accent, #3b82f6)',
+                border: phase === S4_PHASE.VERIFIED ? '1px solid var(--border)' : '1px solid var(--accent, #3b82f6)',
+                color: phase === S4_PHASE.VERIFIED ? 'var(--muted2)' : '#000',
+                opacity: canPrepare ? 1 : 0.45,
+              }}
+            >
+              {phase === S4_PHASE.VERIFIED ? 'Recompile handoff' : 'Prepare Stage 4 Handoff'}
+            </button>
+          )}
+
+          {/* Continue to Stage 4 — only after verified */}
+          {phase === S4_PHASE.VERIFIED && onNavigateToStage4 && (
+            <button
+              onClick={onNavigateToStage4}
+              style={{
+                fontSize: 10, fontFamily: fm, fontWeight: 700,
+                padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
+                background: 'var(--accent, #3b82f6)',
+                border: '1px solid var(--accent, #3b82f6)',
+                color: '#000',
+              }}
+            >
+              Continue to Stage 4 →
+            </button>
+          )}
+
+          {/* Not ready explanation */}
+          {phase === S4_PHASE.NOT_READY && (
+            <span style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted)' }}>
+              {!hasRequiredIds ? 'Stage 1, 2, and 3 revisions required.' : !idbReady ? 'Waiting for storage…' : 'No eligible BU plans.'}
+            </span>
+          )}
+
+          {/* Can't prepare explanation */}
+          {phase === S4_PHASE.READY_TO_PREPARE && !canPrepare && (
+            <span style={{ fontSize: 9, fontFamily: fm, color: '#f87171' }}>
+              No BUs have durable completed plans. Generate and persist Stage 3 BU plans first.
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main Stage 3 view ─────────────────────────────────────────────────────────
 
 export default function Stage3View({
@@ -6231,6 +6937,32 @@ export default function Stage3View({
     return { ok: writeOk, key, draft }
   }
 
+  async function persistPanelModelForBU(unitName, panelModel) {
+    if (!unitName || !panelModel) return { ok: false, error: 'Missing BU name or panel model.' }
+    const priorDraft = stage3DraftPlans[unitName]
+    if (!priorDraft) return { ok: false, error: `No existing ${unitName} draft to update.` }
+    const key = stage3BuPlanDraftKey(effectiveWorkspaceId, stage1ActiveId, stage2ActiveId, unitName)
+    if (!key) return { ok: false, error: 'No Stage 3 draft storage key available.' }
+    const now = new Date().toISOString()
+    const ready = !!panelModel.readinessStatus?.isReady
+    const nextDraft = {
+      ...priorDraft,
+      panelModel,
+      lifecycle: {
+        ...(priorDraft.lifecycle || {}),
+        status: ready ? LIFECYCLE_STATES.ACCEPTED : LIFECYCLE_STATES.DRAFT_GENERATED,
+        panelReadinessStatus: panelModel.readinessStatus || null,
+      },
+      status: ready ? LIFECYCLE_STATES.ACCEPTED : LIFECYCLE_STATES.DRAFT_GENERATED,
+      accepted: ready,
+      updatedAt: now,
+      lastSavedAt: now,
+    }
+    const ok = await writeArtifact(key, nextDraft)
+    if (ok) setStage3DraftPlans(prev => ({ ...prev, [unitName]: nextDraft }))
+    return { ok, key, draft: nextDraft }
+  }
+
   async function handleGenerateBUPlan(unit, readiness) {
     if (!activeStage1Rev || !activeStage2Rev) return { error: 'No active upstream revisions.' }
     const blockReason = getPerBuGenerationBlock(unit, readiness, idbReady, buPlanGeneration[unit.name])
@@ -6801,6 +7533,7 @@ export default function Stage3View({
           captureImportStatus={captureImportStatus}
           onCaptureImport={handleCaptureImport}
           idbReady={idbReady}
+          onPersistPanelModel={persistPanelModelForBU}
         />
         <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
           C · Cross-BU Coordination
@@ -6822,6 +7555,47 @@ export default function Stage3View({
           </div>
         )}
         <GenerationProgress generation={generation} onRetry={handleRetryGeneration} />
+
+        {/* ── Save Stage 3 revision ─────────────────────────────────────── */}
+        {persistedExecutionPlans.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid rgba(0,229,180,.25)',
+            borderRadius: 'var(--r)', padding: '14px 16px', marginTop: 8,
+          }}>
+            <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
+              Save Stage 3 revision
+            </div>
+            <div style={{ fontSize: 10, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6, marginBottom: 10 }}>
+              {persistedExecutionPlans.length} BU plan{persistedExecutionPlans.length !== 1 ? 's' : ''} are persisted and ready.
+              Saving a Stage 3 revision unlocks the Stage 4 handoff panel.
+            </div>
+            <button
+              onClick={() => {
+                const nextNum = (stage3Revisions.length > 0 ? Math.max(...stage3Revisions.map(r => r.revisionNumber)) : 0) + 1
+                const record = buildStage3RevisionRecord({
+                  executionPlans:        persistedExecutionPlans,
+                  summaryNote:           coordinationDraft?.summaryNote || '',
+                  coordinationLayer:     coordinationDraft?.coordinationLayer || null,
+                  revisionNumber:        nextNum,
+                  sourceBasisRevisionId:  stage1ActiveId,
+                  sourceStage2RevisionId: stage2ActiveId,
+                  source:                'ai',
+                  prompt:                '',
+                  impactSummary:         `Stage 3 revision from ${persistedExecutionPlans.length} persisted BU plans.`,
+                  learningSignals:       [],
+                })
+                onSaveRevision(record)
+              }}
+              style={{
+                fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
+                padding: '7px 18px', borderRadius: 5, cursor: 'pointer',
+                background: '#00e5b4', border: '1px solid #00e5b4', color: '#000',
+              }}
+            >
+              Save Stage 3 revision →
+            </button>
+          </div>
+        )}
       </div>
     )
   }
@@ -6890,6 +7664,8 @@ export default function Stage3View({
         captureImportRef={captureImportRef}
         captureImportStatus={captureImportStatus}
         onCaptureImport={handleCaptureImport}
+        idbReady={idbReady}
+        onPersistPanelModel={persistPanelModelForBU}
       />
 
       {/* ── C. Cross-BU Coordination ──────────────────────────────────────── */}
@@ -7015,32 +7791,18 @@ export default function Stage3View({
         isSaving={isStageRefining}
       />
 
-      {/* ── Stage 4 CTA ───────────────────────────────────────────────────── */}
-      <div style={{
-        background: 'var(--surface)', border: '1px solid rgba(59,130,246,.3)',
-        borderRadius: 'var(--r)', padding: '16px 18px',
-        display: 'flex', alignItems: 'center', gap: 16,
-      }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
-            Continue to Stage 4 — Product Delivery
-          </div>
-          <div style={{ fontSize: 10, color: 'var(--muted2)', fontFamily: 'var(--fm)', lineHeight: 1.65 }}>
-            Stage 4 will translate these execution plans into PDLC strategy, epic-level requirements,
-            acceptance criteria, non-functional requirements, delivery sequencing, and implementation governance.
-          </div>
-        </div>
-        <button
-          onClick={onNavigateToStage4}
-          style={{
-            flexShrink: 0, fontSize: 10, fontFamily: 'var(--fm)', fontWeight: 600,
-            padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
-            background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted2)',
-          }}
-        >
-          Stage 4 →
-        </button>
-      </div>
+      {/* ── E. Prepare Stage 4 Handoff ────────────────────────────────────── */}
+      <PrepareStage4HandoffPanel
+        workspaceId={effectiveWorkspaceId}
+        stage1ActiveId={stage1ActiveId}
+        stage2ActiveId={stage2ActiveId}
+        stage3ActiveId={stage3ActiveId}
+        orderedStage2BUs={orderedStage2BUs}
+        stage3DraftPlans={stage3DraftPlans}
+        idbReady={idbReady}
+        onNavigateToStage4={onNavigateToStage4}
+        stage3ActiveRevision={activeRev}
+      />
 
     </div>
   )

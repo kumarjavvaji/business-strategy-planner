@@ -8,7 +8,10 @@
  *   bsp_v1_handoff_*             → IDB: stage2_handoffs    IDB-primary (LS pointer)
  *   bsp_v1_stage3_bu_plan_*      → IDB: stage3_bu_plans    IDB-primary (LS pointer)
  *   bsp_v1_stage3_coord*         → IDB: stage3_coordination IDB-primary (LS pointer)
- *   everything else              → LS only
+ *   bsp_v1_stage4_handoff_*         → IDB: stage4_handoffs         IDB-primary (LS pointer)
+ *   bsp_v1_stage4_artifact_plan_*      → IDB: stage4_artifact_plans    IDB-primary (LS pointer)
+ *   bsp_v1_stage4_artifact_output_*   → IDB: stage4_artifact_outputs  IDB-primary (LS pointer)
+ *   everything else                   → LS only
  *
  * Pointer shape stored in localStorage for IDB-primary keys:
  *   { "_idbRef": true, "store": "<storeName>", "idbKey": "<lsKey>" }
@@ -41,6 +44,9 @@ const ROUTES = [
   { prefix: 'bsp_v1_handoff_',            store: IDB_STORES.STAGE2_HANDOFFS,     dualWrite: false },
   { prefix: 'bsp_v1_stage3_bu_plan_',     store: IDB_STORES.STAGE3_BU_PLANS,     dualWrite: false },
   { prefix: 'bsp_v1_stage3_coord',        store: IDB_STORES.STAGE3_COORDINATION, dualWrite: false },
+  { prefix: 'bsp_v1_stage4_handoff_',        store: IDB_STORES.STAGE4_HANDOFFS,        dualWrite: false },
+  { prefix: 'bsp_v1_stage4_artifact_plan_',    store: IDB_STORES.STAGE4_ARTIFACT_PLANS,   dualWrite: false },
+  { prefix: 'bsp_v1_stage4_artifact_output_',  store: IDB_STORES.STAGE4_ARTIFACT_OUTPUTS, dualWrite: false },
 ]
 
 const IDB_POINTER_MARKER = '_idbRef'
@@ -96,6 +102,30 @@ export function readCached(key) {
     if (isIdbPointer(parsed)) return null  // cache not warm; caller must use async path
     _cache.set(key, parsed)
     return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Reads directly from IDB, bypassing the in-memory cache entirely.
+ *
+ * Use this when you need proof that a value is durably stored in IDB —
+ * not merely present in the optimistic cache that writeArtifact populates
+ * before the IDB write completes.  If the IDB write failed in this session,
+ * readArtifactAsync() would still return the cached (unpersisted) value;
+ * this function will correctly return null.
+ *
+ * Returns null for LS-only keys (no IDB store) or if IDB has no record.
+ */
+export async function readArtifactFromIdb(key) {
+  if (!key) return null
+  await storageReady()
+  const route = routeKey(key)
+  if (!route) return null
+  try {
+    const val = await idbRead(route.store, key)
+    return val ?? null
   } catch {
     return null
   }
@@ -228,6 +258,9 @@ async function _doInit() {
     IDB_STORES.STAGE2_HANDOFFS,
     IDB_STORES.STAGE3_BU_PLANS,
     IDB_STORES.STAGE3_COORDINATION,
+    IDB_STORES.STAGE4_HANDOFFS,
+    IDB_STORES.STAGE4_ARTIFACT_PLANS,
+    IDB_STORES.STAGE4_ARTIFACT_OUTPUTS,
   ]
   for (const store of storesToLoad) {
     try {
