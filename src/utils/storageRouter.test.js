@@ -974,7 +974,7 @@ describe('stage4ArtifactPlan — deterministic artifact suggestions and persiste
     expect(salesArts[0].selected).toBe(false)
   })
 
-  it('buildArtifactPlan creates BU-anchored authoring jobs with source basis, generation units, and quality policy', async () => {
+  it('buildArtifactPlan creates BU-anchored spec-driven authoring jobs with source basis, generation units, and quality policy', async () => {
     const { buildArtifactPlan } = await getArtifactModule()
     const handoff = makeHandoff([['Engineering', 'ready']])
     const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
@@ -986,6 +986,8 @@ describe('stage4ArtifactPlan — deterministic artifact suggestions and persiste
     expect(job).toBeDefined()
     expect(job.artifactJobId).toBe(job.artifactId)
     expect(job.artifactScope).toBe('bu')
+    expect(job.artifactSpecRef.artifactType).toBe('bu_execution_plan')
+    expect(job.artifactSpecRef.acceptanceChecks).toContain('workstream')
     expect(job.sourceBuName).toBe('Engineering')
     expect(job.sourceBasis.sourceAtomRefs).toEqual(['atom_1', 'atom_2'])
     expect(job.sourceBasis.requiredPanels).toContain('executionSequence')
@@ -995,7 +997,7 @@ describe('stage4ArtifactPlan — deterministic artifact suggestions and persiste
     expect(plan.planningDiagnostics.generationCalled).toBe(false)
   })
 
-  it('selected BU-scoped persisted artifact job resolves generator by artifactType and uses generation units', async () => {
+  it('selected BU-scoped persisted artifact job resolves generator by artifactType and uses spec generation units', async () => {
     const { buildArtifactPlan, ARTIFACT_READINESS } = await getArtifactModule()
     const { resolveArtifactGenerator } = await import('./stage4ArtifactPrompts.js')
     const handoff = makeHandoff([['Engineering', 'ready']])
@@ -1019,18 +1021,76 @@ describe('stage4ArtifactPlan — deterministic artifact suggestions and persiste
     expect(generator.getSectionOutline(job).map(section => section.id)).toEqual(job.generationUnits.map(unit => unit.sectionId))
   })
 
-  it('unsupported BU artifact type remains blocked_unsupported_generator without blocking supported selected jobs', async () => {
+  it('planned BU artifact specs create artifact-shaped generation units', async () => {
     const { buildArtifactPlan, ARTIFACT_READINESS } = await getArtifactModule()
     const handoff = makeHandoff([['Engineering', 'ready']])
     const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
-    const supportedJob = plan.artifacts.find(a => a.artifactType === 'pdlc_epic_outline')
-    const unsupportedJob = plan.artifacts.find(a => a.artifactType === 'acceptance_criteria_draft')
+    const byType = type => plan.artifacts.find(a => a.artifactType === type)
 
-    expect(supportedJob.readinessStatus).toBe(ARTIFACT_READINESS.READY)
-    expect(supportedJob.selected).toBe(true)
-    expect(unsupportedJob.readinessStatus).toBe(ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR)
-    expect(unsupportedJob.selected).toBe(false)
-    expect(unsupportedJob.blockedReason).toContain(unsupportedJob.artifactType)
+    expect(byType('bu_execution_plan').readinessStatus).toBe(ARTIFACT_READINESS.READY)
+    expect(byType('bu_execution_plan').generationUnits.some(unit => unit.items.some(item => item.requiredOutputUnits?.includes('workstream')))).toBe(true)
+    expect(byType('pdlc_epic_outline').generationUnits.some(unit => unit.items.some(item => item.requiredOutputUnits?.includes('epic name')))).toBe(true)
+    expect(byType('acceptance_criteria_draft').generationUnits.some(unit => unit.items.some(item => item.requiredOutputUnits?.includes('criterion title')))).toBe(true)
+    expect(byType('implementation_governance_checklist').generationUnits.some(unit => unit.items.some(item => item.requiredOutputUnits?.includes('checklist item')))).toBe(true)
+    expect(byType('acceptance_criteria_draft').selected).toBe(true)
+    expect(byType('implementation_governance_checklist').selected).toBe(true)
+  })
+
+  it('upgrades persisted unsupported-generator cards when artifact specs now exist', async () => {
+    const { buildArtifactPlan, upgradeArtifactPlanSpecCoverage, ARTIFACT_READINESS } = await getArtifactModule()
+    const { resolveArtifactSpec } = await import('./stage4ArtifactSpecs.js')
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    const oldPlan = {
+      ...plan,
+      artifacts: plan.artifacts.map(item => ['acceptance_criteria_draft', 'implementation_governance_checklist'].includes(item.artifactType)
+        ? {
+            ...item,
+            selected: false,
+            readinessStatus: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR,
+            blockedReason: `No generator is registered for ${item.artifactType}.`,
+            artifactSpecRef: null,
+            generationUnits: [],
+          }
+        : item),
+      businessUnitArtifacts: plan.businessUnitArtifacts.map(item => ['acceptance_criteria_draft', 'implementation_governance_checklist'].includes(item.artifactType)
+        ? {
+            ...item,
+            selected: false,
+            readinessStatus: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR,
+            blockedReason: `No generator is registered for ${item.artifactType}.`,
+            artifactSpecRef: null,
+            generationUnits: [],
+          }
+        : item),
+    }
+
+    const upgraded = upgradeArtifactPlanSpecCoverage(oldPlan, handoff, WID, S1, S2, S3)
+    const byType = type => upgraded.artifacts.find(item => item.artifactType === type)
+
+    expect(resolveArtifactSpec('acceptance_criteria_draft')).toBeTruthy()
+    expect(resolveArtifactSpec('implementation_governance_checklist')).toBeTruthy()
+    expect(byType('acceptance_criteria_draft').readinessStatus).toBe(ARTIFACT_READINESS.READY)
+    expect(byType('implementation_governance_checklist').readinessStatus).toBe(ARTIFACT_READINESS.READY)
+    expect(byType('acceptance_criteria_draft').selected).toBe(true)
+    expect(byType('implementation_governance_checklist').selected).toBe(true)
+    expect(byType('acceptance_criteria_draft').artifactSpecRef.artifactType).toBe('acceptance_criteria_draft')
+    expect(byType('implementation_governance_checklist').artifactSpecRef.artifactType).toBe('implementation_governance_checklist')
+    expect(byType('acceptance_criteria_draft').generationUnits.some(unit => unit.items.some(item => item.requiredOutputUnits?.includes('criterion title')))).toBe(true)
+    expect(byType('implementation_governance_checklist').generationUnits.some(unit => unit.items.some(item => item.requiredOutputUnits?.includes('checklist item')))).toBe(true)
+  })
+
+  it('recommended artifact with missing spec becomes blocked_missing_artifact_spec', async () => {
+    const { buildArtifactPlan, ARTIFACT_READINESS } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    const missingSpecJob = plan.artifacts.find(a => a.artifactType === 'cross_bu_dependency_map')
+
+    expect(missingSpecJob.readinessStatus).toBe(ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC)
+    expect(missingSpecJob.selected).toBe(false)
+    expect(missingSpecJob.generationUnits).toEqual([])
+    expect(missingSpecJob.blockedReason).toContain(missingSpecJob.artifactType)
+    expect(plan.planningDiagnostics.planningFailures.some(failure => failure.type === 'missing_artifact_spec')).toBe(true)
   })
 
   it('buildArtifactPlan blocks only artifacts with missing source atoms or unsupported generators', async () => {
@@ -1269,7 +1329,7 @@ describe('stage4ArtifactOutput — generation persist/verify contract', () => {
     const { buildArtifactPrompt } = await getPromptModule()
     const handoff = makeMockHandoff([['Engineering', 'ready']])
     const { isSupported, messages } = buildArtifactPrompt(
-      { artifactId: 'x', artifactType: 'acceptance_criteria_draft', scope: 'business_unit', businessUnitName: 'Engineering', title: 'Acceptance', sourceAtomIds: [] },
+      { artifactId: 'x', artifactType: 'cross_bu_dependency_map', scope: 'global', businessUnitName: null, title: 'Dependencies', sourceAtomIds: [] },
       handoff
     )
     expect(isSupported).toBe(false)

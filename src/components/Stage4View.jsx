@@ -14,6 +14,8 @@ import {
   ARTIFACT_PLAN_STATUS,
   ARTIFACT_READINESS,
   artifactReadinessBlocksGeneration,
+  upgradeArtifactPlanSpecCoverage,
+  correctPlanSelectionFromS3,
 } from '../utils/stage4ArtifactPlan'
 import {
   buildArtifactOutput,
@@ -272,10 +274,17 @@ function BuHandoffRow({ entry }) {
                 </div>
               )}
 
-              {/* Execution sections — name + objective only */}
+              {/* Execution sections — name + objective only (normalized) */}
               {entry.executionSections?.length > 0 && (
                 <div style={{ marginBottom: 10 }}>
-                  <div style={labelStyle}>Execution sections ({entry.executionSections.length})</div>
+                  <div style={labelStyle}>
+                    Execution sections ({entry.executionSections.length})
+                    {entry.executionSectionNormalization?.removedCount > 0 && (
+                      <span style={{ marginLeft: 6, fontWeight: 400, color: 'var(--muted)', fontSize: 8 }}>
+                        · {entry.executionSectionNormalization.summary}
+                      </span>
+                    )}
+                  </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     {entry.executionSections.map((s, i) => (
                       <div key={i} style={{ padding: '6px 10px', background: 'var(--s2)', borderRadius: 4, border: '1px solid var(--border)' }}>
@@ -288,6 +297,34 @@ function BuHandoffRow({ entry }) {
                       </div>
                     ))}
                   </div>
+                  {entry.executionSectionNormalization?.removedCount > 0 && (
+                    <details style={{ marginTop: 4 }}>
+                      <summary style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', cursor: 'pointer', userSelect: 'none' }}>
+                        Normalization details ({entry.executionSectionNormalization.removedCount} removed/merged
+                        {entry.executionSectionNormalization.extractedUniqueDetails?.length > 0
+                          ? `, ${entry.executionSectionNormalization.extractedUniqueDetails.length} unique delta${entry.executionSectionNormalization.extractedUniqueDetails.length === 1 ? '' : 's'} captured`
+                          : ''})
+                      </summary>
+                      <div style={{ marginTop: 3, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                        {(entry.executionSectionNormalization.diagnostics || [])
+                          .filter(d => d.issueType !== 'retained_distinct_execution_role')
+                          .map((d, i) => {
+                            const label = {
+                              unique_delta_extracted:       'Delta captured',
+                              same_execution_role:          'Role merged',
+                              merged_low_distinctness_variant: 'Minor variant',
+                              removed_no_unique_value:      'Duplicate',
+                            }[d.issueType] || d.issueType
+                            return (
+                              <div key={i} style={{ padding: '4px 8px', background: 'var(--s1)', borderRadius: 3, border: '1px solid var(--border)', fontSize: 8, fontFamily: fm, color: 'var(--muted2)' }}>
+                                <span style={{ fontWeight: 600, marginRight: 4 }}>{label}:</span>
+                                {d.reason}
+                              </div>
+                            )
+                          })}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
 
@@ -352,6 +389,7 @@ const readinessCfg = {
   [ARTIFACT_READINESS.PARTIAL]: { color: '#fb923c', label: 'PARTIAL' },
   [ARTIFACT_READINESS.BLOCKED]: { color: '#f87171', label: 'BLOCKED' },
   [ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR]: { color: '#f87171', label: 'UNSUPPORTED GENERATOR' },
+  [ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC]: { color: '#f87171', label: 'MISSING SPEC' },
   [ARTIFACT_READINESS.BLOCKED_MISSING_SOURCE]:        { color: '#f87171', label: 'MISSING SOURCE' },
   [ARTIFACT_READINESS.BLOCKED_MISSING_MAPPING]:       { color: '#f87171', label: 'MISSING MAPPING' },
   [ARTIFACT_READINESS.BLOCKED_MATERIALLY_STALE]:      { color: '#f87171', label: 'STALE SOURCE' },
@@ -434,6 +472,7 @@ function ArtifactCard({
     basis_incomplete: 'Basis incomplete',
     generator_missing: 'Generator missing',
     blocked_unsupported_generator: 'Unsupported generator',
+    blocked_missing_artifact_spec: 'Missing artifact spec',
     blocked_missing_source: 'Missing source',
     blocked_missing_mapping: 'Missing mapping',
     blocked_materially_stale: 'Stale source',
@@ -1034,8 +1073,9 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       const durableHandoff = await loadStage4Handoff(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
       if (!durableHandoff) throw Object.assign(new Error('Verified handoff not found in storage. Return to Stage 3 to prepare the handoff.'), { failureType: 'generation_failed' })
 
-      const durablePlan = await loadArtifactPlan(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
-      if (!durablePlan) throw Object.assign(new Error('Artifact plan not found in storage. Save the artifact plan before generating.'), { failureType: 'generation_failed' })
+      const loadedPlan = await loadArtifactPlan(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!loadedPlan) throw Object.assign(new Error('Artifact plan not found in storage. Save the artifact plan before generating.'), { failureType: 'generation_failed' })
+      const durablePlan = upgradeArtifactPlanSpecCoverage(loadedPlan, durableHandoff, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
 
       // Verify the artifact is still selected in the persisted plan
       const allItems = durablePlan.artifacts?.length ? durablePlan.artifacts : [...(durablePlan.globalArtifacts || []), ...(durablePlan.businessUnitArtifacts || [])]
@@ -1047,9 +1087,9 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
         setGenState(prev => ({
           ...prev,
           [id]: {
-            phase: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR,
-            error: `No registered generator for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`,
-            failureType: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR,
+            phase: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC,
+            error: `No artifact authoring spec is registered for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`,
+            failureType: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC,
           },
         }))
         generatingRef.current.delete(id)
@@ -1079,7 +1119,7 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
           }))
         : generator.getSectionOutline(durableItem)
       if (!sectionOutline?.length) {
-        setGenState(prev => ({ ...prev, [id]: { phase: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR, error: `No executable section outline is registered for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`, failureType: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR } }))
+        setGenState(prev => ({ ...prev, [id]: { phase: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC, error: `No executable section schema is registered for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`, failureType: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC } }))
         generatingRef.current.delete(id)
         return
       }
@@ -1255,11 +1295,17 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       .then(existing => {
         if (cancelled) return
         if (existing) {
-          if (isArtifactPlanStale(existing, handoff)) {
-            setPlan(existing)
+          const upgraded  = upgradeArtifactPlanSpecCoverage(existing, handoff, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+          // Retroactively honour Stage 3 selectedStage4Deliverables for plans that
+          // were created before the suggestArtifacts S3-selection fix.  Artifacts
+          // whose type was never checked in Stage 3 are corrected to selected: false
+          // so they are hidden from the active generation view without a rebuild.
+          const corrected = correctPlanSelectionFromS3(upgraded, handoff)
+          if (isArtifactPlanStale(corrected, handoff)) {
+            setPlan(corrected)
             setApPhase('stale')
           } else {
-            setPlan(existing)
+            setPlan(corrected)
             setApPhase('ready')
           }
         } else {
@@ -1464,7 +1510,9 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
             background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 5,
           }}>
             <span style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)' }}>
-              {editing ? `${selectedIds.size} selected` : `${selectedCount} of ${(displayPlan.globalArtifacts?.length || 0) + (displayPlan.businessUnitArtifacts?.length || 0)} artifacts selected`}
+              {editing
+                ? `${selectedIds.size} selected`
+                : `${selectedCount} artifact job${selectedCount !== 1 ? 's' : ''} selected for generation`}
             </span>
             {editing && (
               <>
@@ -1567,28 +1615,35 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
               )
             }
 
-            const globalSelected  = editing ? selectedIds : new Set((displayPlan.globalArtifacts || []).filter(a => a.selected).map(a => a.artifactId))
-            const buArtifacts     = displayPlan.businessUnitArtifacts || []
-            const viewBuSelected  = new Set(buArtifacts.filter(a => a.selected).map(a => a.artifactId))
+            const allGlobal       = displayPlan.globalArtifacts || []
+            const allBuArtifacts  = displayPlan.businessUnitArtifacts || []
+
+            // In active (non-editing) mode only show jobs the user selected for generation.
+            // In editing mode show all candidates so the user can toggle them.
+            const visibleGlobal   = editing ? allGlobal      : allGlobal.filter(a => a.selected)
+            const visibleBu       = editing ? allBuArtifacts : allBuArtifacts.filter(a => a.selected)
+
+            const globalSelected  = editing ? selectedIds : new Set(visibleGlobal.map(a => a.artifactId))
+            const viewBuSelected  = new Set(visibleBu.map(a => a.artifactId))
             const buSelected      = editing ? selectedIds : viewBuSelected
-            const groups          = groupByBU(buArtifacts)
+            const groups          = groupByBU(visibleBu)
 
             return (
               <>
                 {/* Global artifacts */}
-                {(displayPlan.globalArtifacts || []).length > 0 && (
+                {visibleGlobal.length > 0 && (
                   <div style={{ marginBottom: 10 }}>
                     <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 5 }}>
-                      Global Artifacts ({displayPlan.globalArtifacts.length})
+                      Global Artifacts ({visibleGlobal.length})
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                      {displayPlan.globalArtifacts.map(a => renderArtifact(a, globalSelected))}
+                      {visibleGlobal.map(a => renderArtifact(a, globalSelected))}
                     </div>
                   </div>
                 )}
 
                 {/* BU artifacts — grouped by BU */}
-                {buArtifacts.length > 0 && (
+                {visibleBu.length > 0 && (
                   <div>
                     <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
                       Business Unit Artifacts

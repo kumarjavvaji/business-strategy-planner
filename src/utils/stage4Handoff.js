@@ -29,6 +29,7 @@
 
 import { readArtifactFromIdb, readArtifactAsync, writeArtifact } from './storageRouter'
 import { stage3BuPlanKey, stage3BuPlanLegacyKey } from './stage3BuPlanKeys'
+import { normalizeExecutionSectionsForStage4 } from './stage4ExecutionSectionNormalizer'
 
 // ── Key helpers ────────────────────────────────────────────────────────────────
 
@@ -350,7 +351,9 @@ function buildBuHandoffEntry(loaded) {
   if (loaded.sourceType === BU_SOURCE_TYPE.REVISION_SNAPSHOT) {
     const plan       = loaded.snapshotPlan
     const rawSections = mapExecutionSections(plan.executionSections)
-    const sectionIds  = rawSections.map(s => s.sectionName).filter(Boolean)
+    const normResult  = normalizeExecutionSectionsForStage4(rawSections, { buName: loaded.buName })
+    const normalizedSections = normResult.retainedSections
+    const sectionIds  = normalizedSections.map(s => s.sectionName).filter(Boolean)
 
     const stage4DeliveryImplications = dedupStrings([
       ...(plan.stage4DeliveryImplications || []),
@@ -379,7 +382,8 @@ function buildBuHandoffEntry(loaded) {
       },
       stage3PanelModel: plan.panelModel || null,
       synthesisSchema:    'source_basis_v1',
-      executionSections:          rawSections,
+      executionSections:          normalizedSections,
+      executionSectionNormalization: normResult,
       stage4DeliveryImplications,
       sourceAtomExamples: [],
       diagnostics:  null,
@@ -397,6 +401,8 @@ function buildBuHandoffEntry(loaded) {
   const sourceAtomIds  = completedAtoms.map(a => a.id).filter(Boolean)
 
   const rawSections = mapExecutionSections(plan?.executionSections)
+  const normResult  = normalizeExecutionSectionsForStage4(rawSections, { buName: loaded.buName })
+  const normalizedSections = normResult.retainedSections
 
   const stage4DeliveryImplications = dedupStrings([
     ...(plan?.stage4DeliveryImplications || []),
@@ -426,7 +432,8 @@ function buildBuHandoffEntry(loaded) {
       criticalWorkstreams: plan.criticalWorkstreams || [],
     } : null,
     stage3PanelModel: record.panelModel || plan?.panelModel || null,
-    executionSections:          rawSections,
+    executionSections:          normalizedSections,
+    executionSectionNormalization: normResult,
     stage4DeliveryImplications,
     sourceAtomExamples:         compileSourceExamples(completedAtoms, 3),
     diagnostics: record.diagnostics

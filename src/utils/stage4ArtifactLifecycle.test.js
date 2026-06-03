@@ -109,7 +109,7 @@ describe('stage4 artifact section lifecycle', () => {
 
 describe('stage4 section prompts and parsing', () => {
   it('unsupported artifact type is not routed through a generic generator', () => {
-    const result = buildArtifactSectionPrompt({ artifactType: 'acceptance_criteria_draft' }, { buHandoffs: [] }, { id: 'x' }, basis)
+    const result = buildArtifactSectionPrompt({ artifactType: 'cross_bu_dependency_map' }, { buHandoffs: [] }, { id: 'x' }, basis)
     expect(result.isSupported).toBe(false)
     expect(result.messages).toBeNull()
   })

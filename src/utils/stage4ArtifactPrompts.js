@@ -18,17 +18,15 @@
 
 import { BU_HANDOFF_STATUS } from './stage4Handoff'
 import { compileArtifactBasis } from './stage4ArtifactBasis'
+import {
+  resolveArtifactSpec,
+  getArtifactSectionSchema,
+  SUPPORTED_ARTIFACT_SPEC_TYPES,
+} from './stage4ArtifactSpecs'
 
 // ── Supported types ────────────────────────────────────────────────────────────
 
-export const SUPPORTED_GENERATION_TYPES = new Set([
-  'executive_decision_brief',
-  'bu_execution_plan',
-  'bu_execution_plan_partial',
-  'pdlc_epic_outline',
-  'bu_sme_review_packet',
-  'global_sme_review_packet',
-])
+export const SUPPORTED_GENERATION_TYPES = new Set(SUPPORTED_ARTIFACT_SPEC_TYPES)
 
 // ── Shared response schema ─────────────────────────────────────────────────────
 
@@ -306,6 +304,40 @@ ${RESPONSE_SCHEMA}`
   return { messages: [{ role: 'user', content: userContent }], artifactBasis }
 }
 
+function buildSpecDrivenArtifactMessages(artifactItem, handoff) {
+  const spec = resolveArtifactSpec(artifactItem.artifactType)
+  if (!spec) return null
+  const artifactBasis = compileArtifactBasis(artifactItem, handoff)
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate a ${spec.artifactTitle} from its artifact-specific Stage 4 authoring spec.
+
+${BASIS_CONTRACT}
+
+ARTIFACT TYPE: ${spec.artifactType}
+ARTIFACT PURPOSE: ${spec.purpose}
+AUDIENCE: ${spec.audience}
+SME LENS: ${spec.smeLens}
+
+COMPACT ARTIFACT BASIS:
+${basisJson(artifactBasis)}
+
+OUTPUT RULES:
+${(spec.outputRules || []).map(rule => `- ${rule}`).join('\n')}
+
+ACCEPTANCE CHECKS:
+${(spec.acceptanceChecks || []).map(check => `- ${check}`).join('\n')}
+
+Generate exactly these sections:
+${(spec.sectionSchema || []).map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }], artifactBasis, artifactSpec: spec }
+}
+
 // ── SME Review Packet (BU-scoped) ──────────────────────────────────────────────
 
 const BU_SME_SECTIONS = [
@@ -459,13 +491,21 @@ export function buildArtifactPrompt(artifactItem, handoff) {
     case 'global_sme_review_packet':
       result = buildGlobalSmeReviewMessages(artifactItem, handoff)
       break
+    case 'acceptance_criteria_draft':
+    case 'implementation_governance_checklist':
+      result = buildSpecDrivenArtifactMessages(artifactItem, handoff)
+      break
   }
 
+  if (!result) result = buildSpecDrivenArtifactMessages(artifactItem, handoff)
   if (!result) return { messages: null, isSupported: false }
   return { ...result, isSupported: true }
 }
 
 export function getArtifactSectionOutline(artifactType) {
+  const specSchema = getArtifactSectionSchema(artifactType)
+  if (specSchema) return specSchema
+
   switch (artifactType) {
     case 'executive_decision_brief':
       return EXEC_BRIEF_SECTIONS
@@ -511,6 +551,9 @@ ${BASIS_CONTRACT}
 
 ARTIFACT TYPE: ${artifactBasis.artifactType}
 ARTIFACT INTENT: ${artifactBasis.artifactIntent}
+${resolveArtifactSpec(artifactItem.artifactType) ? `ARTIFACT SPEC PURPOSE: ${resolveArtifactSpec(artifactItem.artifactType).purpose}
+SME LENS: ${resolveArtifactSpec(artifactItem.artifactType).smeLens}
+ACCEPTANCE CHECKS: ${(resolveArtifactSpec(artifactItem.artifactType).acceptanceChecks || []).join('; ')}` : ''}
 
 REQUESTED SECTION:
 ${sectionDefToPrompt(sectionDef)}
@@ -592,6 +635,7 @@ ${sectionDefToPrompt(sectionDef)}
 ATOM TO GENERATE:
 childId="${childDef.childId}" | label="${childDef.label}"
 Generation directive: ${childDef.inputBasis}
+${resolveArtifactSpec(artifactItem.artifactType) ? `Artifact-specific atom shape must satisfy: ${(resolveArtifactSpec(artifactItem.artifactType).sectionChildUnitSchema || []).join('; ')}` : ''}
 
 ARTIFACT BASIS (compact — use to answer the directive):
 ${basisJson(ctx)}
@@ -625,6 +669,7 @@ ${sectionDefToPrompt(sectionDef)}
 
 REQUESTED CHILD:
 childId="${childDef.childId}" | label="${childDef.label}"
+${resolveArtifactSpec(artifactItem.artifactType) ? `Artifact-specific atom shape must satisfy: ${(resolveArtifactSpec(artifactItem.artifactType).sectionChildUnitSchema || []).join('; ')}` : ''}
 
 ONE SOURCE ITEM ONLY:
 ${basisJson(childDef.sourceItem)}

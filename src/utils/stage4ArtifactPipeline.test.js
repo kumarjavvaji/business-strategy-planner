@@ -536,8 +536,6 @@ describe('atom prompt content', () => {
 
 describe('unsupported artifact types', () => {
   const UNSUPPORTED = [
-    'acceptance_criteria_draft',
-    'implementation_governance_checklist',
     'risk_control_plan',
     'dependency_risk_brief',
     'operating_cadence_plan',
@@ -593,5 +591,102 @@ describe('truncation is isolated to the failing atom', () => {
     expect(children[0].content).not.toBeNull()
     expect(children[2].content).not.toBeNull()
     expect(children[3].content).not.toBeNull()
+  })
+})
+
+// ── Normalized execution sections in artifact source basis ────────────────────
+
+import { normalizeExecutionSectionsForStage4 } from './stage4ExecutionSectionNormalizer'
+
+const REPEATED_EXEC_OBJECTIVE = 'Deliver a contractor-governed explainability infrastructure sprint by onboarding four contracted developers within Sprint 1, allocating their capacity across partner integration, audit portal build, and client delivery protection.'
+
+function makeRawSection(overrides = {}) {
+  return {
+    sectionName:        overrides.sectionName || 'Execution Section',
+    objective:          overrides.objective ?? REPEATED_EXEC_OBJECTIVE,
+    executionStrategy:  overrides.executionStrategy  || [],
+    decisionsRequired:  overrides.decisionsRequired  || [],
+    sequencingAndGates: overrides.sequencingAndGates || [],
+    dependencies:       overrides.dependencies       || [],
+    risks:              overrides.risks              || [],
+    validationSignals:  overrides.validationSignals  || [],
+    sourceAtomRefs:     overrides.sourceAtomRefs     || [],
+  }
+}
+
+describe('normalized execution sections do not pollute artifact source basis', () => {
+  it('7 near-identical execution sections are reduced to 1 before artifact basis is compiled', () => {
+    const rawSections = Array.from({ length: 7 }, (_, i) =>
+      makeRawSection({ sectionName: `Section ${i}`, objective: REPEATED_EXEC_OBJECTIVE + (i > 0 ? ` (variant ${i})` : '') })
+    )
+    const result = normalizeExecutionSectionsForStage4(rawSections)
+    expect(result.retainedSections.length).toBe(1)
+    expect(result.removedSections.length).toBe(6)
+  })
+
+  it('distinct execution sections with different roles are all preserved', () => {
+    const rawSections = [
+      makeRawSection({ sectionName: 'Partner Integration', objective: 'Build API integration layer.', decisionsRequired: ['Vendor gate'] }),
+      makeRawSection({ sectionName: 'Audit Portal', objective: 'Deliver compliance module.', dependencies: ['Data pipeline'] }),
+      makeRawSection({ sectionName: 'Validation', objective: 'Confirm delivery quality via pilot.', validationSignals: ['Pilot acceptance pass'] }),
+    ]
+    const result = normalizeExecutionSectionsForStage4(rawSections)
+    expect(result.retainedSections.length).toBe(3)
+    expect(result.removedSections.length).toBe(0)
+  })
+
+  it('normalized sections carry merged sourceAtomRefs from all removed duplicates', () => {
+    const rawSections = [
+      makeRawSection({ sectionName: 'A', objective: REPEATED_EXEC_OBJECTIVE, sourceAtomRefs: ['atom_1'] }),
+      makeRawSection({ sectionName: 'B', objective: REPEATED_EXEC_OBJECTIVE, sourceAtomRefs: ['atom_2'] }),
+    ]
+    const result = normalizeExecutionSectionsForStage4(rawSections)
+    const refs   = result.retainedSections[0]?.sourceAtomRefs || []
+    expect(refs).toContain('atom_1')
+    expect(refs).toContain('atom_2')
+  })
+
+  it('normalization does not delete the underlying raw sections array (Stage 3 source atom safety)', () => {
+    const rawSections = [
+      makeRawSection({ sectionName: 'A', objective: REPEATED_EXEC_OBJECTIVE }),
+      makeRawSection({ sectionName: 'B', objective: REPEATED_EXEC_OBJECTIVE }),
+    ]
+    const before = rawSections.length
+    normalizeExecutionSectionsForStage4(rawSections)
+    expect(rawSections.length).toBe(before)
+  })
+
+  it('diagnostics trace every removed section back to its retained section', () => {
+    const VALID_REMOVAL_TYPES = new Set([
+      'removed_no_unique_value',
+      'merged_low_distinctness_variant',
+      'unique_delta_extracted',
+      'same_execution_role',
+    ])
+    const rawSections = Array.from({ length: 3 }, (_, i) =>
+      makeRawSection({ sectionName: `S${i}`, objective: REPEATED_EXEC_OBJECTIVE })
+    )
+    const result = normalizeExecutionSectionsForStage4(rawSections)
+    const removalDiags = result.diagnostics.filter(d => d.removedSectionIds?.length > 0)
+    removalDiags.forEach(d => {
+      expect(VALID_REMOVAL_TYPES.has(d.issueType)).toBe(true)
+      expect(d.retainedSectionId).toBeTruthy()
+      expect(d.remediation).toBeTruthy()
+    })
+  })
+
+  it('quality audit can detect repeated execution sections via diagnostics issueType', () => {
+    const QUALITY_FLAGS = new Set([
+      'removed_no_unique_value',
+      'merged_low_distinctness_variant',
+      'unique_delta_extracted',
+      'same_execution_role',
+    ])
+    const rawSections = Array.from({ length: 4 }, (_, i) =>
+      makeRawSection({ sectionName: `S${i}`, objective: REPEATED_EXEC_OBJECTIVE })
+    )
+    const result = normalizeExecutionSectionsForStage4(rawSections)
+    const repeatedFlags = result.diagnostics.filter(d => QUALITY_FLAGS.has(d.issueType))
+    expect(repeatedFlags.length).toBeGreaterThan(0)
   })
 })
