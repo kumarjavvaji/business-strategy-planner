@@ -378,7 +378,7 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
   const [smeLensRefineUi,   setSmeLensRefineUi]   = useState({ open: false, prompt: '', busy: false, error: null })
   const [itemRefineUi,      setItemRefineUi]      = useState({})
   const [childRefineUi,     setChildRefineUi]     = useState({})
-  const [decompositionOpen, setDecompositionOpen] = useState({})
+  const [isGeneratingAll,   setIsGeneratingAll]   = useState(false)
 
   // ── Draft persistence ───────────────────────────────────────────────────────
   const hasHydrated = useRef(false)
@@ -707,7 +707,6 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
     const isPartial = missingChildren.length > 0 || failedChildren.length > 0
 
     if (!isPartial) {
-      setDecompositionOpen(prev => ({ ...prev, [i]: false }))
       setItemOpen(prev => ({ ...prev, [i]: false }))  // collapse on full success
     }
 
@@ -724,6 +723,33 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       ...nextItemState,
       lifecycleAudit: buildStage2ItemAudit(nextItemState),
     })
+  }
+
+  // ── Generate-all orchestration ─────────────────────────────────────────────
+
+  function isEligibleForGenerateAll(iState) {
+    if (!iState) return true
+    const lifecycle = iState.lifecycle || UNIT_LIFECYCLE_STATES.NOT_STARTED
+    if (lifecycle === UNIT_LIFECYCLE_STATES.ACCEPTED) return false
+    if (lifecycle === UNIT_LIFECYCLE_STATES.GENERATING) return false
+    if ((lifecycle === UNIT_LIFECYCLE_STATES.DRAFT_READY || iState.status === 'complete') && !iState.isStale) return false
+    return true
+  }
+
+  async function handleGenerateAll() {
+    if (!parsed?.handoffStructure || isGeneratingAll) return
+    setIsGeneratingAll(true)
+    const structure = parsed.handoffStructure
+    for (let i = 0; i < structure.length; i++) {
+      const iState = itemStates[i]
+      if (!isEligibleForGenerateAll(iState)) continue
+      try {
+        await handleGenerateItem(i, structure[i])
+      } catch {
+        // continue after per-item failure
+      }
+    }
+    setIsGeneratingAll(false)
   }
 
   // ── Child atom helpers ──────────────────────────────────────────────────────
@@ -815,10 +841,6 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
       ...nextItemState,
       lifecycleAudit: buildStage2ItemAudit(nextItemState),
     })
-    // Auto-collapse decomposition on full assembly
-    if (!isPartial) {
-      setDecompositionOpen(prev => ({ ...prev, [i]: false }))
-    }
   }
 
   function handleAssembleBuHandoff() {
@@ -1237,8 +1259,35 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
 
             {parsed?.handoffStructure ? (() => {
               const canGenItemBase = apiMode === 'ai' && !!activeStage1Rev && !!parsed.domainOfWork && !isGenerating
+              const eligibleCount = parsed.handoffStructure.filter((_, i) => isEligibleForGenerateAll(itemStates[i])).length
+              const canGenAll = canGenItemBase && !isGeneratingAll && eligibleCount > 0
               return (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {/* Generate-all orchestration button */}
+                  {apiMode === 'ai' && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
+                      <button
+                        onClick={handleGenerateAll}
+                        disabled={!canGenAll}
+                        style={{
+                          fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                          padding: '3px 10px', borderRadius: 4,
+                          cursor: canGenAll ? 'pointer' : 'not-allowed',
+                          background: canGenAll ? 'rgba(59,130,246,.12)' : 'var(--surface)',
+                          border: `1px solid ${canGenAll ? 'rgba(59,130,246,.3)' : 'var(--border)'}`,
+                          color: canGenAll ? 'var(--accent)' : 'var(--muted)',
+                          opacity: canGenAll ? 1 : 0.6,
+                        }}
+                      >
+                        {isGeneratingAll ? 'Generating all…' : `Generate all handoff items (${eligibleCount} pending)`}
+                      </button>
+                      {eligibleCount === 0 && parsed.handoffStructure.length > 0 && (
+                        <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#00e5b4' }}>
+                          All items generated
+                        </span>
+                      )}
+                    </div>
+                  )}
                   {parsed.handoffStructure.map((theme, i) => {
                     const iState = itemStates[i] || ITEM_STATE_DEFAULT
                     const isGenItem = iState.status === 'generating'
@@ -1335,6 +1384,24 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                               {isItemOpen ? '▲' : '▼'}
                             </button>
                           )}
+                          {/* Accept item — in header row alongside Regenerate */}
+                          {(iState.status === 'complete' || iState.status === 'partial') && !isAcceptedItem && (
+                            <button
+                              onClick={() => handleAcceptItem(i)}
+                              disabled={!canAcceptItem}
+                              style={{
+                                flexShrink: 0, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
+                                padding: '2px 7px', borderRadius: 3,
+                                cursor: canAcceptItem ? 'pointer' : 'not-allowed',
+                                background: canAcceptItem ? 'rgba(0,229,180,.1)' : 'transparent',
+                                border: `1px solid ${canAcceptItem ? 'rgba(0,229,180,.3)' : 'var(--border)'}`,
+                                color: canAcceptItem ? '#00e5b4' : 'var(--muted)',
+                                opacity: canAcceptItem ? 1 : 0.55,
+                              }}
+                            >
+                              {isAcceptedItem ? '✓ Accepted' : 'Accept'}
+                            </button>
+                          )}
                           <button
                             onClick={() => handleGenerateItem(i, theme)}
                             disabled={!canGenItem}
@@ -1368,30 +1435,13 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                             )}
                             {renderItemValue(iState.parsedValue.value)}
 
-                            <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                              <button
-                                onClick={() => handleAcceptItem(i)}
-                                disabled={!canAcceptItem}
-                                style={{
-                                  fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
-                                  padding: '2px 7px', borderRadius: 3,
-                                  cursor: canAcceptItem ? 'pointer' : 'not-allowed',
-                                  background: canAcceptItem ? 'rgba(0,229,180,.1)' : 'transparent',
-                                  border: `1px solid ${canAcceptItem ? 'rgba(0,229,180,.3)' : 'var(--border)'}`,
-                                  color: canAcceptItem ? '#00e5b4' : 'var(--muted)',
-                                  opacity: canAcceptItem ? 1 : 0.55,
-                                }}
-                              >
-                                Accept item
-                              </button>
-                              {lifecycleAudit.blocking && (
-                                <span style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.4 }}>
-                                  Needs refinement before acceptance
-                                </span>
-                              )}
-                            </div>
+                            {lifecycleAudit.blocking && (
+                              <div style={{ marginTop: 4, fontSize: 8, fontFamily: 'var(--fm)', color: '#fb923c', lineHeight: 1.4 }}>
+                                ⚠ Needs refinement before acceptance
+                              </div>
+                            )}
 
-                            {/* UX Fix B — Refine handoff item */}
+                            {/* Refine handoff item */}
                             {apiMode === 'ai' && (() => {
                               const rui = itemRefineUi[i] || {}
                               return (
@@ -1480,24 +1530,8 @@ function Stage3HandoffShell({ bu, otherBuNames, activeStage1Rev, apiMode, worksp
                           </div>
                         )}
 
-                        {/* UX Fix C — toggle for decomposition after full assembly */}
-                        {isItemOpen && assembled && !isPartial && iState.isDecomposed && (
-                          <button
-                            onClick={() => setDecompositionOpen(prev => ({ ...prev, [i]: !prev[i] }))}
-                            style={{
-                              marginTop: 5, fontSize: 8, fontFamily: 'var(--fm)', fontWeight: 600,
-                              padding: '2px 7px', borderRadius: 3, cursor: 'pointer',
-                              background: 'transparent',
-                              border: '1px solid var(--border)',
-                              color: 'var(--muted)',
-                            }}
-                          >
-                            {decompositionOpen[i] ? '▲ Hide generation details' : '▼ Show generation details'}
-                          </button>
-                        )}
-
-                        {/* Child atoms — shown if isDecomposed AND (partial/not-assembled OR toggle open) */}
-                        {isItemOpen && iState.isDecomposed && iState.childAtoms && (assembled && !isPartial ? decompositionOpen[i] : true) && (
+                        {/* Child atoms — shown only during generation or when partial (not for fully assembled) */}
+                        {isItemOpen && iState.isDecomposed && iState.childAtoms && (isGenItem || isPartial) && (
                           <div style={{
                             marginTop: 7, padding: '8px 9px',
                             background: 'rgba(139,92,246,.04)',

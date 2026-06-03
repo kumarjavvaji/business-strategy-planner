@@ -45,7 +45,7 @@ import {
   generateMockArtifactChildOutput,
   SUPPORTED_GENERATION_TYPES,
 } from '../utils/stage4ArtifactPrompts'
-import { compileArtifactBasis, basisPreviewText } from '../utils/stage4ArtifactBasis'
+import { compileArtifactBasis, basisPreviewText, basisReadinessSummary } from '../utils/stage4ArtifactBasis'
 import { callAI, hasApiKey } from '../api/aiClient'
 import { storageReady } from '../utils/storageRouter'
 
@@ -501,18 +501,43 @@ function ArtifactCard({
         )}
 
         {/* Generation controls — view mode, selected, non-blocked */}
-        {!editing && selected && artifactBasis && !isBlocked && (
-          <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)' }}>
-            <div style={{ fontSize: 8, fontFamily: fm, color: artifactBasis.counts.mappedHowOptions > 0 ? '#00e5b4' : '#f97316', lineHeight: 1.45 }}>
-              {basisPreviewText(artifactBasis)}
-            </div>
-            {artifactBasis.basisWarnings?.length > 0 && (
-              <div style={{ fontSize: 8, fontFamily: fm, color: '#f97316', marginTop: 3 }}>
-                {artifactBasis.basisWarnings.slice(0, 2).join(' ')}
+        {!editing && selected && artifactBasis && !isBlocked && (() => {
+          const readiness = basisReadinessSummary(artifactBasis)
+          if (!readiness) return null
+          return (
+            <div style={{ marginTop: 6, padding: '7px 9px', borderRadius: 4, border: `1px solid ${readiness.isReady ? 'rgba(0,229,180,.25)' : 'rgba(249,115,22,.25)'}`, background: 'var(--surface)' }}>
+              {/* BU + source record */}
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
+                <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.04em' }}>
+                  Source
+                </span>
+                <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted2)' }}>
+                  {readiness.sourceRecord}
+                  {readiness.atomCount > 0 && ` · ${readiness.atomCount} atom${readiness.atomCount === 1 ? '' : 's'}`}
+                  {readiness.sectionCount > 0 && ` · ${readiness.sectionCount} section${readiness.sectionCount === 1 ? '' : 's'}`}
+                </span>
               </div>
-            )}
-          </div>
-        )}
+              {/* Prerequisites satisfied */}
+              {readiness.prereqsMet.length > 0 && (
+                <div style={{ fontSize: 8, fontFamily: fm, color: '#00e5b4', marginBottom: 3 }}>
+                  ✓ {readiness.prereqsMet.join(' · ')}
+                </div>
+              )}
+              {/* Prerequisites missing */}
+              {readiness.prereqsMissing.length > 0 && (
+                <div style={{ fontSize: 8, fontFamily: fm, color: '#f97316', lineHeight: 1.5 }}>
+                  {readiness.prereqsMissing.slice(0, 2).map((m, idx) => (
+                    <div key={idx}>⚠ {m}</div>
+                  ))}
+                </div>
+              )}
+              {/* Next action */}
+              <div style={{ fontSize: 8, fontFamily: fm, color: readiness.isReady ? '#00e5b4' : 'var(--muted)', marginTop: 4, fontStyle: readiness.isReady ? 'normal' : 'italic' }}>
+                → {readiness.nextAction}
+              </div>
+            </div>
+          )
+        })()}
         {!editing && selected && !isBlocked && (
           <div style={{ marginTop: 7, borderTop: '1px solid var(--border)', paddingTop: 6, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             {/* In-flight phases */}
@@ -1042,9 +1067,10 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
           const childDefs = deriveSectionChildDefs(sectionDef, artifactBasis)
           let childUnits = buildInitialArtifactChildUnits(childDefs, currentUnit?.childUnits || [])
           if (!childUnits.length) {
+            // No source items for this section — mark it failed and continue to the next section
             sectionUnits[i] = applySectionGenerationFailure(currentUnit, 'No source items available for child-unit section.')
-            await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: no source items available. Previous content preserved.`, failureType: 'section_failed', sectionId: sectionDef.id })
-            throw Object.assign(new Error(`${sectionDef.heading}: no source items available. Previous content preserved.`), { failureType: 'section_failed', sectionUnits })
+            await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id })
+            continue
           }
           for (let childIndex = 0; childIndex < childDefs.length; childIndex++) {
             const childDef = childDefs[childIndex]
@@ -1061,29 +1087,28 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
             }
 
             const { messages } = buildArtifactChildPrompt(durableItem, durableHandoff, sectionDef, childDef, artifactBasis)
-            const response = await callAI(messages, { temperature: 0.3, maxTokens: 500 })
+            const response = await callAI(messages, { temperature: 0.3, maxTokens: 700 })
             if (response.error) {
+              // Atom failed — persist its failed state and continue to the next atom
               childUnits[childIndex] = applyChildGenerationFailure(currentChild, response.error)
-              sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
-              await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: ${childDef.label} failed - ${response.error}. Previous child items preserved. Retry ${childDef.label}.`, failureType: 'child_failed', sectionId: sectionDef.id, childId: childDef.childId })
-              throw Object.assign(new Error(`${sectionDef.heading}: ${childDef.label} failed - ${response.error}. Previous child items preserved. Retry ${childDef.label}.`), { failureType: 'child_failed', sectionUnits })
+              sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
+              await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
+              continue
             }
             const parsedChild = parseArtifactChildResponse(response.result, childDef, response)
             if (parsedChild.error) {
+              // Atom failed — persist its failed state and continue to the next atom
               childUnits[childIndex] = applyChildGenerationFailure(currentChild, parsedChild.failureReason || parsedChild.error, parsedChild.child || null)
-              sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
-              await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: ${childDef.label} failed - ${parsedChild.failureReason || parsedChild.error}. Previous child items preserved. Retry ${childDef.label}.`, failureType: parsedChild.truncated ? 'child_truncated' : 'child_failed', sectionId: sectionDef.id, childId: childDef.childId })
-              throw Object.assign(new Error(`${sectionDef.heading}: ${childDef.label} failed - ${parsedChild.failureReason || parsedChild.error}. Previous child items preserved. Retry ${childDef.label}.`), { failureType: parsedChild.truncated ? 'child_truncated' : 'child_failed', sectionUnits })
+              sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
+              await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
+              continue
             }
             childUnits[childIndex] = applyChildGenerationSuccess(currentChild, parsedChild.child)
             sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
             await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
           }
+          // Assemble section from all attempted atoms — failed sections are marked, not erased
           sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
-          if (sectionUnits[i].lifecycle !== 'accepted') {
-            await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: child-unit section did not pass audit. Previous child items preserved.`, failureType: 'section_audit_failed', sectionId: sectionDef.id })
-            throw Object.assign(new Error(`${sectionDef.heading}: child-unit section did not pass audit. Previous child items preserved.`), { failureType: 'section_audit_failed', sectionUnits })
-          }
           await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id })
           continue
         }
@@ -1117,9 +1142,10 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       }
 
       const assembled = assembleArtifactFromSectionUnits(sectionUnits)
-      if (assembled.contentSections.length !== sectionOutline.length || assembled.failedSections.length > 0) {
-        await publishProgress(sectionUnits, 'failed', { error: 'Artifact generation is partial. Previous artifact content preserved; retry failed sections.', failureType: 'section_failed' })
-        throw Object.assign(new Error('Artifact generation is partial. Previous artifact content preserved; retry failed sections.'), { failureType: 'section_failed', sectionUnits })
+      if (assembled.contentSections.length === 0) {
+        // Complete failure — no sections generated at all
+        await publishProgress(sectionUnits, 'failed', { error: 'No sections were generated. Retry failed sections individually.', failureType: 'section_failed' })
+        throw Object.assign(new Error('No sections were generated. Retry failed sections individually.'), { failureType: 'section_failed', sectionUnits })
       }
       const contentSections = assembled.contentSections
       const evidenceBasis = `Generated section-by-section from ${artifactBasis.counts.mappedHowOptions} mapped how option(s).`

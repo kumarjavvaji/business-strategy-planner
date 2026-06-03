@@ -127,6 +127,160 @@ export function transitionToNeedsRefinement(panel, reason) {
   return transitionUnitToNeedsRefinement(panel, reason)
 }
 
+/**
+ * Return an inspectable list of structured issues for a panel.
+ * Every issue count surfaced in the UI should link to this list.
+ *
+ * @returns {{ issueId, panelId, field, issueType, severity, description, blocksStage4, remediationHint, autoFixable }[]}
+ */
+export function getPanelIssueList(panel, crossPanelAudit) {
+  const issues = []
+  const panelId = panel?.panelId || 'unknown'
+  const audit   = panel?.completenessAudit
+  const lifecycle = panel?.lifecycle
+
+  if (lifecycle === PANEL_LIFECYCLE.FAILED) {
+    issues.push({
+      issueId:        `${panelId}:lifecycle_failed`,
+      panelId,
+      field:          null,
+      issueType:      'lifecycle_failed',
+      severity:       'blocking',
+      description:    `Panel generation failed: ${panel.lifecycleError || 'unknown error'}`,
+      blocksStage4:   true,
+      remediationHint: 'Retry panel generation. If the failure persists, check the generation prompt or source data.',
+      autoFixable:    false,
+    })
+  }
+
+  if (audit) {
+    ;(audit.missingFields || []).forEach((f, i) => {
+      issues.push({
+        issueId:        `${panelId}:missing:${i}`,
+        panelId,
+        field:          f,
+        issueType:      'missing_required_field',
+        severity:       'blocking',
+        description:    `Required field missing: ${f}`,
+        blocksStage4:   true,
+        remediationHint: 'Regenerate or refine this panel to populate the missing field.',
+        autoFixable:    false,
+      })
+    })
+
+    ;(audit.truncatedFields || []).forEach((f, i) => {
+      issues.push({
+        issueId:        `${panelId}:truncated:${i}`,
+        panelId,
+        field:          f.split(':')[0],
+        issueType:      'genuinely_truncated',
+        severity:       'blocking',
+        description:    f,
+        blocksStage4:   true,
+        remediationHint: 'Regenerate this panel. Use a smaller prompt if truncation recurs.',
+        autoFixable:    false,
+      })
+    })
+
+    ;(audit.punctuationIssues || []).forEach((fieldPath, i) => {
+      const repair = (audit.autoRepairs || []).find(r => r.fieldPath === fieldPath)
+      issues.push({
+        issueId:        `${panelId}:punctuation:${i}`,
+        panelId,
+        field:          fieldPath,
+        issueType:      'missing_terminal_punctuation',
+        severity:       'advisory',
+        description:    `Sentence-form field ends without terminal punctuation: ${fieldPath}`,
+        blocksStage4:   false,
+        remediationHint: 'Apply auto-repair to append "." — no regeneration needed.',
+        autoFixable:    true,
+        repairedValue:  repair?.repairedValue || null,
+      })
+    })
+
+    ;(audit.weakFields || []).forEach((f, i) => {
+      issues.push({
+        issueId:        `${panelId}:weak:${i}`,
+        panelId,
+        field:          f.split(':')[0],
+        issueType:      'underfilled',
+        severity:       'warning',
+        description:    f,
+        blocksStage4:   false,
+        remediationHint: 'Refine this field with domain-specific content.',
+        autoFixable:    false,
+      })
+    })
+
+    ;(audit.duplicateFieldFindings || []).forEach((f, i) => {
+      issues.push({
+        issueId:        `${panelId}:duplicate:${i}`,
+        panelId,
+        field:          f.split('.')[0],
+        issueType:      'schema_mismatch',
+        severity:       'warning',
+        description:    f,
+        blocksStage4:   false,
+        remediationHint: 'Refine to ensure each field serves a distinct role.',
+        autoFixable:    false,
+      })
+    })
+  }
+
+  const strengthAudit = panel?.panelStrengthAudit
+  if (strengthAuditBlocks(strengthAudit)) {
+    ;(strengthAudit.findings || []).slice(0, 5).forEach((f, i) => {
+      issues.push({
+        issueId:        `${panelId}:strength:${i}`,
+        panelId,
+        field:          null,
+        issueType:      'underfilled',
+        severity:       'blocking',
+        description:    typeof f === 'string' ? f : JSON.stringify(f),
+        blocksStage4:   lifecycle === PANEL_LIFECYCLE.ACCEPTED,
+        remediationHint: strengthAudit.recommendedAction || 'Regenerate or refine with more domain-specific content.',
+        autoFixable:    false,
+      })
+    })
+  }
+
+  if (crossPanelAudit && panelId) {
+    ;(crossPanelAudit.repeatedPhrases || [])
+      .filter(r => r.panelA === panelId || r.panelB === panelId)
+      .forEach((r, i) => {
+        issues.push({
+          issueId:        `${panelId}:cross_repeated:${i}`,
+          panelId,
+          field:          null,
+          issueType:      'schema_mismatch',
+          severity:       'warning',
+          description:    r.note || `High content overlap between ${r.panelA} and ${r.panelB}`,
+          blocksStage4:   crossPanelAudit.qualityStatus === CROSS_PANEL_QUALITY_STATUSES.FAIL,
+          remediationHint: 'Refine panels to ensure each covers distinct content.',
+          autoFixable:    false,
+        })
+      })
+
+    ;(crossPanelAudit.duplicatedFieldPairs || [])
+      .filter(p => String(p.source).includes(panelId) || String(p.target).includes(panelId))
+      .forEach((p, i) => {
+        issues.push({
+          issueId:        `${panelId}:cross_dup:${i}`,
+          panelId,
+          field:          p.source,
+          issueType:      'schema_mismatch',
+          severity:       'blocking',
+          description:    p.note || `Duplicated content between ${p.source} and ${p.target}`,
+          blocksStage4:   true,
+          remediationHint: 'Remove or differentiate the duplicated content.',
+          autoFixable:    false,
+        })
+      })
+  }
+
+  return issues
+}
+
 export function countPanelIssues(panel, crossPanelAudit) {
   let count = 0
   const audit = panel?.completenessAudit
@@ -237,6 +391,7 @@ export function computeLifecycleReadiness(panels, crossPanelAudit) {
   // For phases with howOptions, mapping is complete when at least one how-option has deliverables.
   // For phases without howOptions, falls back to the legacy phase-level check.
   const mappingWarnings = []
+  let unmappedSelectedIds = []
   const execPanel = panels?.executionSequence
   if (execPanel?.lifecycle === PANEL_LIFECYCLE.ACCEPTED) {
     const execContent  = execPanel.content
@@ -278,11 +433,16 @@ export function computeLifecycleReadiness(panels, crossPanelAudit) {
         )
       }
       const incompleteSelected = Object.entries(selectedCounts).filter(([, count]) => count === 0)
+      const unmappedSelectedDeliverableIds = incompleteSelected.map(([id]) => id)
       if (incompleteSelected.length > 0) {
+        // Name each unmapped deliverable so the user can navigate to the exact mapping area.
+        // IDs use the canonical stage4ArtifactPlan format (e.g. "bu_execution_plan").
+        // The UI converts them to labels; we include the raw IDs so the warning is linkable.
         mappingWarnings.push(
-          `Stage 4 mapping incomplete: ${incompleteSelected.length} selected deliverable${incompleteSelected.length === 1 ? '' : 's'} have no mapped how options.`
+          `Stage 4 mapping incomplete: ${incompleteSelected.length} selected deliverable${incompleteSelected.length === 1 ? '' : 's'} ${incompleteSelected.length === 1 ? 'has' : 'have'} no mapped how options: ${unmappedSelectedDeliverableIds.join(', ')}.`
         )
       }
+      unmappedSelectedIds = unmappedSelectedDeliverableIds
     }
   }
 
@@ -294,6 +454,9 @@ export function computeLifecycleReadiness(panels, crossPanelAudit) {
     // Deliverable mapping readiness — separate from content readiness
     mappingReady:    mappingWarnings.length === 0,
     mappingWarnings,
+    // Identifies the specific selected deliverables that have no how-option mappings.
+    // Empty when mapping is complete or executionSequence is not yet accepted.
+    unmappedSelectedDeliverables: unmappedSelectedIds,
     lastCheckedAt: new Date().toISOString(),
   }
 }

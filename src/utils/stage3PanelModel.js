@@ -76,6 +76,22 @@ export const REFINEMENT_STATUSES = {
   FAILED:   'failed',
 }
 
+/**
+ * Distinct issue types used in completeness audit findings.
+ * Replaces the broad "TRUNCATED" label for non-truncation issues.
+ */
+export const ISSUE_TYPES = {
+  GENUINELY_TRUNCATED:          'genuinely_truncated',
+  UNDERFILLED:                  'underfilled',
+  MISSING_TERMINAL_PUNCTUATION: 'missing_terminal_punctuation',
+  NOT_ACCEPTED:                 'not_accepted',
+  PARSE_FAILED:                 'parse_failed',
+  SCHEMA_MISMATCH:              'schema_mismatch',
+  MISSING_REQUIRED_FIELD:       'missing_required_field',
+  STALE_SOURCE:                 'stale_source',
+  UNMAPPED_SOURCE_ITEM:         'unmapped_source_item',
+}
+
 // ── Execution Sequence → Stage 4 deliverable mapping ─────────────────────────
 
 /**
@@ -268,9 +284,14 @@ export function getSelectedStage4Deliverables(panel) {
   return ids.map(deliverableType => {
     const prior = existing.find(record => record?.deliverableType === deliverableType) || {}
     const count = getDeliverableMappingSummary(panel, deliverableType).selectedHowOptionCount
+    // Preserve explicit user selection: a 'user_selected' record keeps that status even when no
+    // how-options are mapped yet (prevents silent clearing when mappings are incomplete).
+    // Once a how-option is mapped (count > 0), upgrade to 'mapped'.
+    const wasUserSelected = prior.status === 'user_selected'
+    const status = count > 0 ? 'mapped' : (wasUserSelected ? 'user_selected' : 'incomplete')
     return {
       deliverableType,
-      status: count > 0 ? 'mapped' : 'incomplete',
+      status,
       selectedAt: prior.selectedAt || now,
       updatedAt: prior.updatedAt || now,
     }
@@ -558,7 +579,9 @@ export function updateSelectedStage4Deliverables(panelModel, deliverableTypes) {
     const existing = prior.find(record => record?.deliverableType === deliverableType)
     return {
       deliverableType,
-      status: 'selected',
+      // 'user_selected' persists through mapping recalculation until a how-option is mapped
+      // (at which point getSelectedStage4Deliverables upgrades it to 'mapped').
+      status: 'user_selected',
       selectedAt: existing?.selectedAt || now,
       updatedAt: now,
     }
@@ -665,6 +688,20 @@ const PLACEHOLDER_PATTERNS = [
   /^define\s+a\s+focused\s+execution\s+basis/i,  // known default fallback
   /^convert\s+stage\s+2\s+handoff/i,             // known default fallback
 ]
+
+// ── Punctuation auto-repair ───────────────────────────────────────────────────
+
+/**
+ * Append terminal punctuation to a sentence-form string value when safe.
+ * Only appends "." — does not alter content otherwise.
+ * Returns the repaired string.
+ */
+export function autoRepairPunctuation(text) {
+  if (typeof text !== 'string' || !text.trim()) return text
+  const s = text.trim()
+  if (/[.!?;:)\]"']\s*$/.test(s)) return text   // already has terminal punctuation
+  return `${s}.`
+}
 
 // ── Truncation detection ──────────────────────────────────────────────────────
 
@@ -779,6 +816,9 @@ export function auditPanelCompleteness(panelId, content) {
   const weakFields      = []
   const duplicateFieldFindings = []
   const alignmentFindings = []
+  // Missing terminal punctuation — auto-repairable; does NOT cause TRUNCATED status
+  const punctuationIssues = []
+  const autoRepairs       = []
 
   function checkItem(item, itemLabel) {
     if (!item || typeof item !== 'object') {
@@ -799,8 +839,27 @@ export function auditPanelCompleteness(panelId, content) {
       if (trunc.truncated) {
         truncatedFields.push(`${itemLabel}.${field}: ${trunc.reasons[0]}`)
       }
-      if (SENTENCE_FORM_FIELDS.has(field) && minLen > 0 && typeof val === 'string' && strVal.length >= minLen && !/[.!?;:)\]]\s*$/.test(strVal)) {
-        truncatedFields.push(`${itemLabel}.${field}: sentence-form field ends without terminal punctuation`)
+      // Missing terminal punctuation is auto-repairable — track separately, NOT as truncation.
+      // Only flag when there is no other truncation signal on this field (genuine truncation
+      // already captured above; punctuation-only is a formatting issue, not content damage).
+      if (
+        SENTENCE_FORM_FIELDS.has(field) &&
+        minLen > 0 &&
+        typeof val === 'string' &&
+        strVal.length >= minLen &&
+        !/[.!?;:)\]"']\s*$/.test(strVal) &&
+        !trunc.truncated
+      ) {
+        const fieldPath = `${itemLabel}.${field}`
+        punctuationIssues.push(fieldPath)
+        autoRepairs.push({
+          fieldPath,
+          field,
+          itemLabel,
+          issueType:    ISSUE_TYPES.MISSING_TERMINAL_PUNCTUATION,
+          repairedValue: autoRepairPunctuation(strVal),
+          autoFixable:  true,
+        })
       }
       // Placeholder check
       if (isPlaceholder(strVal)) {
@@ -892,7 +951,9 @@ export function auditPanelCompleteness(panelId, content) {
         ? duplicateFieldFindings.length
           ? 'Refine to remove duplicated fields — fields must serve distinct roles.'
           : 'Replace placeholder or weak text with domain-specific content.'
-        : 'Panel passes completeness checks.'
+        : punctuationIssues.length > 0
+          ? `Auto-repairable: ${punctuationIssues.length} field${punctuationIssues.length === 1 ? '' : 's'} missing terminal punctuation. Apply auto-repair or regenerate.`
+          : 'Panel passes completeness checks.'
 
   return {
     panelId,
@@ -903,6 +964,9 @@ export function auditPanelCompleteness(panelId, content) {
     weakFields,
     duplicateFieldFindings,
     alignmentFindings,
+    // Punctuation issues are auto-repairable and do NOT affect `status` or `blocking`.
+    punctuationIssues,
+    autoRepairs,
     recommendedAction,
     lastAuditedAt: now,
   }
@@ -1226,12 +1290,13 @@ function collectSourceAtomIds(content) {
 
 /**
  * Build the full panel model from a compiled plan.
- * Runs audits for all panels and cross-panel.
  *
- * @param {object} compiledPlan - output of compileBUExecutionPlan
- * @returns stage3BuPlan panel model
+ * @param {object}      compiledPlan         - output of compileBUExecutionPlan
+ * @param {object|null} existingPanelModel   - optional prior panel model; when provided,
+ *   user-confirmed how-option mappings and explicit Stage 4 deliverable selections are
+ *   preserved through stale recalculations instead of being reset to suggested defaults.
  */
-export function normalizeToPanelModel(compiledPlan) {
+export function normalizeToPanelModel(compiledPlan, existingPanelModel = null) {
   const contentMap = {
     strategicObjective:  compiledPlan?.strategicObjective  || null,
     criticalDecisions:   compiledPlan?.criticalDecisions   || [],
@@ -1240,6 +1305,8 @@ export function normalizeToPanelModel(compiledPlan) {
     risks:               compiledPlan?.risksAndMitigations || [],
     validationFramework: compiledPlan?.validationFramework || [],
   }
+
+  const priorExecPanel = existingPanelModel?.panels?.executionSequence || null
 
   const panels = {}
   PANEL_IDS.forEach(panelId => {
@@ -1255,10 +1322,20 @@ export function normalizeToPanelModel(compiledPlan) {
       lifecycle,
       sourceAtomIds: collectSourceAtomIds(content),
       lastGeneratedAt: new Date().toISOString(),
-      // Execution Sequence: populate suggested deliverable mappings on first normalization
+      // Execution Sequence: populate deliverable mappings and selections.
+      // When a prior model exists, merge to preserve user-confirmed mappings and explicit
+      // deliverable selections (D6: prevent stale recalculation from clearing user selections).
       ...(panelId === 'executionSequence' ? (() => {
-        const executionDeliverableMappings = buildInitialPhaseMappings(content)
-        const panelForSelection = { content, executionDeliverableMappings }
+        const executionDeliverableMappings = priorExecPanel?.executionDeliverableMappings
+          ? mergePhasesMappings(priorExecPanel.executionDeliverableMappings, content)
+          : buildInitialPhaseMappings(content)
+        // Carry forward explicit user selections; fall back to derived suggestions
+        const priorSelections = priorExecPanel?.selectedStage4Deliverables
+        const panelForSelection = {
+          content,
+          executionDeliverableMappings,
+          selectedStage4Deliverables: Array.isArray(priorSelections) ? priorSelections : undefined,
+        }
         return {
           executionDeliverableMappings,
           selectedStage4Deliverables: getSelectedStage4Deliverables(panelForSelection),

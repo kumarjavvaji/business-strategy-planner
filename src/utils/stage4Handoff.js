@@ -46,6 +46,81 @@ export function stage4HandoffKey(workspaceId, stage1Id, stage2Id, stage3Id) {
 
 export const STAGE4_HANDOFF_VERSION = 1
 
+/**
+ * Returns true when a persisted Stage 4 handoff was compiled from a different Stage 1/2/3
+ * basis than what is currently active — meaning Stage 4 artifacts may be derived from
+ * outdated upstream content.
+ *
+ * Stage 4 artifacts should be regenerated or reviewed when this returns true.
+ */
+export function isHandoffUpstreamStale(handoff, currentStage1Id, currentStage2Id, currentStage3Id) {
+  if (!handoff) return false
+  if (currentStage1Id && handoff.stage1RevisionId !== currentStage1Id) return true
+  if (currentStage2Id && handoff.stage2RevisionId !== currentStage2Id) return true
+  if (currentStage3Id && handoff.stage3RevisionId !== currentStage3Id) return true
+  return false
+}
+
+/**
+ * Build a human-readable staleness warning for a handoff that was compiled from an earlier basis.
+ * Returns null when the handoff is current.
+ */
+export function buildUpstreamStalenessWarning(handoff, currentStage1Id, currentStage2Id, currentStage3Id) {
+  if (!isHandoffUpstreamStale(handoff, currentStage1Id, currentStage2Id, currentStage3Id)) return null
+  const changed = []
+  if (currentStage1Id && handoff.stage1RevisionId !== currentStage1Id) changed.push('Stage 1')
+  if (currentStage2Id && handoff.stage2RevisionId !== currentStage2Id) changed.push('Stage 2')
+  if (currentStage3Id && handoff.stage3RevisionId !== currentStage3Id) changed.push('Stage 3')
+  return `Generated from earlier upstream basis. ${changed.join(' and ')} ${changed.length === 1 ? 'has' : 'have'} changed since this handoff was compiled. Recompile the Stage 4 handoff before generating new artifacts.`
+}
+
+/**
+ * D26/D27: Impact-aware staleness classification for a Stage 4 handoff.
+ *
+ * When a staleImpactMap (from buildStaleImpactMap) is provided, uses BU-level
+ * severity instead of raw version mismatch.  Falls back to version-mismatch-only
+ * detection for backward compatibility when no map is supplied.
+ *
+ * Returns one of:
+ *   'materially_stale'   — at least one BU is materially stale; block or warn hard
+ *   'review_recommended' — upstream changed but no material assumption detected; allow with amber warning
+ *   'unaffected'         — upstream changed but all BUs classified as unaffected
+ *   'unknown_impact'     — insufficient info to classify; warn and require review
+ *   null                 — handoff is current (no version mismatch at all)
+ */
+export function classifyHandoffStaleness(handoff, currentStage1Id, currentStage2Id, currentStage3Id, staleImpactMap = null) {
+  if (!isHandoffUpstreamStale(handoff, currentStage1Id, currentStage2Id, currentStage3Id)) return null
+
+  // When we have an impact map, use its overall severity
+  if (staleImpactMap?.summary) {
+    const { materiallyStaleBUs, unknownBUs, reviewRecommendedBUs } = staleImpactMap.summary
+    if (materiallyStaleBUs.length > 0) return 'materially_stale'
+    if (unknownBUs.length > 0)          return 'unknown_impact'
+    if (reviewRecommendedBUs.length > 0) return 'review_recommended'
+    return 'unaffected'
+  }
+
+  // Fallback: version mismatch without impact info → review_recommended (not hard block)
+  return 'review_recommended'
+}
+
+/**
+ * D26/D27: Get the impact-aware staleness for a specific BU within a handoff.
+ * Returns the BU's severity string from the impact map, or falls back to
+ * 'review_recommended' when the handoff is stale but no map is available.
+ * Returns null when the handoff is current.
+ */
+export function classifyHandoffBuStaleness(buName, handoff, currentStage1Id, currentStage2Id, currentStage3Id, staleImpactMap = null) {
+  if (!isHandoffUpstreamStale(handoff, currentStage1Id, currentStage2Id, currentStage3Id)) return null
+
+  if (staleImpactMap?.buImpacts) {
+    const buImpact = staleImpactMap.buImpacts.find(b => b.buName === buName)
+    if (buImpact) return buImpact.severity
+  }
+
+  return 'review_recommended'
+}
+
 export const BU_HANDOFF_STATUS = {
   READY:   'ready',    // durable record present, all required fields found
   PARTIAL: 'partial',  // record present but atoms/sections incomplete
@@ -451,6 +526,8 @@ export async function compileStage4Handoff({
     blockedCount,
     totalCount: buHandoffs.length,
     buHandoffs,
+    // Populated by consumers when they detect the handoff was compiled from an older basis
+    upstreamStalenessWarning: null,
   }
 }
 
