@@ -13,6 +13,9 @@ import {
   isArtifactPlanStale,
   ARTIFACT_PLAN_STATUS,
   ARTIFACT_READINESS,
+  artifactReadinessBlocksGeneration,
+  upgradeArtifactPlanSpecCoverage,
+  correctPlanSelectionFromS3,
 } from '../utils/stage4ArtifactPlan'
 import {
   buildArtifactOutput,
@@ -35,17 +38,15 @@ import {
   REVIEW_DIMENSIONS,
 } from '../utils/stage4ArtifactOutput'
 import {
-  buildArtifactSectionPrompt,
-  buildArtifactChildPrompt,
   deriveSectionChildDefs,
-  getArtifactSectionOutline,
   parseArtifactSectionResponse,
   parseArtifactChildResponse,
   generateMockArtifactSectionOutput,
   generateMockArtifactChildOutput,
   SUPPORTED_GENERATION_TYPES,
+  resolveArtifactGenerator,
 } from '../utils/stage4ArtifactPrompts'
-import { compileArtifactBasis, basisPreviewText } from '../utils/stage4ArtifactBasis'
+import { compileArtifactBasis, basisPreviewText, basisReadinessSummary } from '../utils/stage4ArtifactBasis'
 import { callAI, hasApiKey } from '../api/aiClient'
 import { storageReady } from '../utils/storageRouter'
 
@@ -273,10 +274,17 @@ function BuHandoffRow({ entry }) {
                 </div>
               )}
 
-              {/* Execution sections — name + objective only */}
+              {/* Execution sections — name + objective only (normalized) */}
               {entry.executionSections?.length > 0 && (
                 <div style={{ marginBottom: 10 }}>
-                  <div style={labelStyle}>Execution sections ({entry.executionSections.length})</div>
+                  <div style={labelStyle}>
+                    Execution sections ({entry.executionSections.length})
+                    {entry.executionSectionNormalization?.removedCount > 0 && (
+                      <span style={{ marginLeft: 6, fontWeight: 400, color: 'var(--muted)', fontSize: 8 }}>
+                        · {entry.executionSectionNormalization.summary}
+                      </span>
+                    )}
+                  </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     {entry.executionSections.map((s, i) => (
                       <div key={i} style={{ padding: '6px 10px', background: 'var(--s2)', borderRadius: 4, border: '1px solid var(--border)' }}>
@@ -289,6 +297,34 @@ function BuHandoffRow({ entry }) {
                       </div>
                     ))}
                   </div>
+                  {entry.executionSectionNormalization?.removedCount > 0 && (
+                    <details style={{ marginTop: 4 }}>
+                      <summary style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', cursor: 'pointer', userSelect: 'none' }}>
+                        Normalization details ({entry.executionSectionNormalization.removedCount} removed/merged
+                        {entry.executionSectionNormalization.extractedUniqueDetails?.length > 0
+                          ? `, ${entry.executionSectionNormalization.extractedUniqueDetails.length} unique delta${entry.executionSectionNormalization.extractedUniqueDetails.length === 1 ? '' : 's'} captured`
+                          : ''})
+                      </summary>
+                      <div style={{ marginTop: 3, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                        {(entry.executionSectionNormalization.diagnostics || [])
+                          .filter(d => d.issueType !== 'retained_distinct_execution_role')
+                          .map((d, i) => {
+                            const label = {
+                              unique_delta_extracted:       'Delta captured',
+                              same_execution_role:          'Role merged',
+                              merged_low_distinctness_variant: 'Minor variant',
+                              removed_no_unique_value:      'Duplicate',
+                            }[d.issueType] || d.issueType
+                            return (
+                              <div key={i} style={{ padding: '4px 8px', background: 'var(--s1)', borderRadius: 3, border: '1px solid var(--border)', fontSize: 8, fontFamily: fm, color: 'var(--muted2)' }}>
+                                <span style={{ fontWeight: 600, marginRight: 4 }}>{label}:</span>
+                                {d.reason}
+                              </div>
+                            )
+                          })}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
 
@@ -352,6 +388,11 @@ const readinessCfg = {
   [ARTIFACT_READINESS.READY]:   { color: '#00e5b4', label: 'READY' },
   [ARTIFACT_READINESS.PARTIAL]: { color: '#fb923c', label: 'PARTIAL' },
   [ARTIFACT_READINESS.BLOCKED]: { color: '#f87171', label: 'BLOCKED' },
+  [ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR]: { color: '#f87171', label: 'UNSUPPORTED GENERATOR' },
+  [ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC]: { color: '#f87171', label: 'MISSING SPEC' },
+  [ARTIFACT_READINESS.BLOCKED_MISSING_SOURCE]:        { color: '#f87171', label: 'MISSING SOURCE' },
+  [ARTIFACT_READINESS.BLOCKED_MISSING_MAPPING]:       { color: '#f87171', label: 'MISSING MAPPING' },
+  [ARTIFACT_READINESS.BLOCKED_MATERIALLY_STALE]:      { color: '#f87171', label: 'STALE SOURCE' },
 }
 
 function ReadinessBadge({ status }) {
@@ -416,7 +457,7 @@ function ArtifactCard({
   artifactGenerationStatus = null,
   sectionUnits = [],
 }) {
-  const isBlocked      = artifact.readinessStatus === ARTIFACT_READINESS.BLOCKED
+  const isBlocked      = artifactReadinessBlocksGeneration(artifact.readinessStatus)
   const isSupported    = SUPPORTED_GENERATION_TYPES.has(artifact.artifactType)
   const isGenerating   = ['generating', 'persisting', 'verifying'].includes(genPhase)
   const basisStatus = !isSupported ? 'generator_missing'
@@ -430,6 +471,11 @@ function ArtifactCard({
     basis_ready: 'Basis ready',
     basis_incomplete: 'Basis incomplete',
     generator_missing: 'Generator missing',
+    blocked_unsupported_generator: 'Unsupported generator',
+    blocked_missing_artifact_spec: 'Missing artifact spec',
+    blocked_missing_source: 'Missing source',
+    blocked_missing_mapping: 'Missing mapping',
+    blocked_materially_stale: 'Stale source',
   }[basisStatus]
   const generationLabel = generationStatus === 'generating'
     ? `Generating ${generatedCount}/${totalCount || '?'} sections`
@@ -494,6 +540,19 @@ function ArtifactCard({
         <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55 }}>
           {artifact.purpose}
         </div>
+        {!editing && selected && artifact.sourceBasis && (
+          <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)' }}>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginBottom: 3 }}>
+              Source basis: {(artifact.sourceBasis.requiredPanels || []).join(', ') || 'no required panels'} · {(artifact.sourceBasis.sourceAtomRefs || []).length} atom refs
+            </div>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted2)' }}>
+              Generation units: {(artifact.generationUnits || []).length} section{(artifact.generationUnits || []).length === 1 ? '' : 's'}
+              {' · '}
+              {(artifact.generationUnits || []).reduce((sum, unit) => sum + (unit.items || []).reduce((itemSum, item) => itemSum + (item.atoms || []).length, 0), 0)} atoms
+              {artifact.qualityPolicy?.checks?.length ? ` · ${artifact.qualityPolicy.checks.length} quality checks` : ''}
+            </div>
+          </div>
+        )}
         {isBlocked && artifact.blockedReason && (
           <div style={{ fontSize: 8, fontFamily: fm, color: '#f87171', marginTop: 3, lineHeight: 1.4 }}>
             Blocked: {artifact.blockedReason}
@@ -501,18 +560,43 @@ function ArtifactCard({
         )}
 
         {/* Generation controls — view mode, selected, non-blocked */}
-        {!editing && selected && artifactBasis && !isBlocked && (
-          <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)' }}>
-            <div style={{ fontSize: 8, fontFamily: fm, color: artifactBasis.counts.mappedHowOptions > 0 ? '#00e5b4' : '#f97316', lineHeight: 1.45 }}>
-              {basisPreviewText(artifactBasis)}
-            </div>
-            {artifactBasis.basisWarnings?.length > 0 && (
-              <div style={{ fontSize: 8, fontFamily: fm, color: '#f97316', marginTop: 3 }}>
-                {artifactBasis.basisWarnings.slice(0, 2).join(' ')}
+        {!editing && selected && artifactBasis && !isBlocked && (() => {
+          const readiness = basisReadinessSummary(artifactBasis)
+          if (!readiness) return null
+          return (
+            <div style={{ marginTop: 6, padding: '7px 9px', borderRadius: 4, border: `1px solid ${readiness.isReady ? 'rgba(0,229,180,.25)' : 'rgba(249,115,22,.25)'}`, background: 'var(--surface)' }}>
+              {/* BU + source record */}
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
+                <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.04em' }}>
+                  Source
+                </span>
+                <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted2)' }}>
+                  {readiness.sourceRecord}
+                  {readiness.atomCount > 0 && ` · ${readiness.atomCount} atom${readiness.atomCount === 1 ? '' : 's'}`}
+                  {readiness.sectionCount > 0 && ` · ${readiness.sectionCount} section${readiness.sectionCount === 1 ? '' : 's'}`}
+                </span>
               </div>
-            )}
-          </div>
-        )}
+              {/* Prerequisites satisfied */}
+              {readiness.prereqsMet.length > 0 && (
+                <div style={{ fontSize: 8, fontFamily: fm, color: '#00e5b4', marginBottom: 3 }}>
+                  ✓ {readiness.prereqsMet.join(' · ')}
+                </div>
+              )}
+              {/* Prerequisites missing */}
+              {readiness.prereqsMissing.length > 0 && (
+                <div style={{ fontSize: 8, fontFamily: fm, color: '#f97316', lineHeight: 1.5 }}>
+                  {readiness.prereqsMissing.slice(0, 2).map((m, idx) => (
+                    <div key={idx}>⚠ {m}</div>
+                  ))}
+                </div>
+              )}
+              {/* Next action */}
+              <div style={{ fontSize: 8, fontFamily: fm, color: readiness.isReady ? '#00e5b4' : 'var(--muted)', marginTop: 4, fontStyle: readiness.isReady ? 'normal' : 'italic' }}>
+                → {readiness.nextAction}
+              </div>
+            </div>
+          )
+        })()}
         {!editing && selected && !isBlocked && (
           <div style={{ marginTop: 7, borderTop: '1px solid var(--border)', paddingTop: 6, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             {/* In-flight phases */}
@@ -530,7 +614,7 @@ function ArtifactCard({
             )}
 
             {/* Generate / Regenerate button */}
-            {isSupported && !isGenerating && genPhase !== 'not_implemented' && (
+            {isSupported && !isGenerating && genPhase !== ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR && (
               <button
                 onClick={() => onGenerate && onGenerate(artifact)}
                 disabled={isGenerating}
@@ -969,8 +1053,8 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
   useEffect(() => {
     if (apPhase !== 'ready' || !plan || !workspaceId) return
     let cancelled = false
-    const allIds = [...(plan.globalArtifacts || []), ...(plan.businessUnitArtifacts || [])]
-      .filter(a => a.readinessStatus !== ARTIFACT_READINESS.BLOCKED)
+    const allIds = (plan.artifacts?.length ? plan.artifacts : [...(plan.globalArtifacts || []), ...(plan.businessUnitArtifacts || [])])
+      .filter(a => !artifactReadinessBlocksGeneration(a.readinessStatus))
       .map(a => a.artifactId)
     loadAllArtifactOutputs(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId, allIds)
       .then(loaded => { if (!cancelled) setOutputs(loaded) })
@@ -989,17 +1073,25 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       const durableHandoff = await loadStage4Handoff(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
       if (!durableHandoff) throw Object.assign(new Error('Verified handoff not found in storage. Return to Stage 3 to prepare the handoff.'), { failureType: 'generation_failed' })
 
-      const durablePlan = await loadArtifactPlan(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
-      if (!durablePlan) throw Object.assign(new Error('Artifact plan not found in storage. Save the artifact plan before generating.'), { failureType: 'generation_failed' })
+      const loadedPlan = await loadArtifactPlan(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+      if (!loadedPlan) throw Object.assign(new Error('Artifact plan not found in storage. Save the artifact plan before generating.'), { failureType: 'generation_failed' })
+      const durablePlan = upgradeArtifactPlanSpecCoverage(loadedPlan, durableHandoff, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
 
       // Verify the artifact is still selected in the persisted plan
-      const allItems = [...(durablePlan.globalArtifacts || []), ...(durablePlan.businessUnitArtifacts || [])]
+      const allItems = durablePlan.artifacts?.length ? durablePlan.artifacts : [...(durablePlan.globalArtifacts || []), ...(durablePlan.businessUnitArtifacts || [])]
       const durableItem = allItems.find(a => a.artifactId === id)
       if (!durableItem?.selected) throw Object.assign(new Error('This artifact is not selected in the saved plan. Select it and save the plan first.'), { failureType: 'generation_failed' })
 
-      // Check support
-      if (!SUPPORTED_GENERATION_TYPES.has(durableItem.artifactType)) {
-        setGenState(prev => ({ ...prev, [id]: { phase: 'not_implemented', error: 'Generation not yet implemented for this artifact type.', failureType: null } }))
+      const generator = resolveArtifactGenerator(durableItem.artifactType)
+      if (!generator) {
+        setGenState(prev => ({
+          ...prev,
+          [id]: {
+            phase: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC,
+            error: `No artifact authoring spec is registered for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`,
+            failureType: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC,
+          },
+        }))
         generatingRef.current.delete(id)
         return
       }
@@ -1010,9 +1102,24 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       }
 
       // Build and call — mock when no API key
-      const sectionOutline = getArtifactSectionOutline(durableItem.artifactType)
+      const sectionOutline = durableItem.generationUnits?.length
+        ? durableItem.generationUnits.map(unit => ({
+            id: unit.sectionId,
+            heading: unit.heading,
+            purpose: unit.purpose,
+            generationMode: unit.generationMode,
+            staticAtoms: unit.items?.flatMap(item => (item.atoms || []).map(atom => ({
+              atomId: String(atom.atomId || '').startsWith(`${unit.sectionId}:`)
+                ? String(atom.atomId).slice(`${unit.sectionId}:`.length)
+                : atom.atomId,
+              atomType: atom.intendedOutputRole,
+              label: item.label || atom.itemId,
+              inputBasis: atom.promptPurpose,
+            }))),
+          }))
+        : generator.getSectionOutline(durableItem)
       if (!sectionOutline?.length) {
-        setGenState(prev => ({ ...prev, [id]: { phase: 'not_implemented', error: 'Generation not yet implemented for this artifact type.', failureType: null } }))
+        setGenState(prev => ({ ...prev, [id]: { phase: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC, error: `No executable section schema is registered for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`, failureType: ARTIFACT_READINESS.BLOCKED_MISSING_ARTIFACT_SPEC } }))
         generatingRef.current.delete(id)
         return
       }
@@ -1042,9 +1149,10 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
           const childDefs = deriveSectionChildDefs(sectionDef, artifactBasis)
           let childUnits = buildInitialArtifactChildUnits(childDefs, currentUnit?.childUnits || [])
           if (!childUnits.length) {
+            // No source items for this section — mark it failed and continue to the next section
             sectionUnits[i] = applySectionGenerationFailure(currentUnit, 'No source items available for child-unit section.')
-            await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: no source items available. Previous content preserved.`, failureType: 'section_failed', sectionId: sectionDef.id })
-            throw Object.assign(new Error(`${sectionDef.heading}: no source items available. Previous content preserved.`), { failureType: 'section_failed', sectionUnits })
+            await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id })
+            continue
           }
           for (let childIndex = 0; childIndex < childDefs.length; childIndex++) {
             const childDef = childDefs[childIndex]
@@ -1060,30 +1168,29 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
               continue
             }
 
-            const { messages } = buildArtifactChildPrompt(durableItem, durableHandoff, sectionDef, childDef, artifactBasis)
-            const response = await callAI(messages, { temperature: 0.3, maxTokens: 500 })
+            const { messages } = generator.buildChildPrompt(durableItem, durableHandoff, sectionDef, childDef, artifactBasis)
+            const response = await callAI(messages, { temperature: 0.3, maxTokens: 700 })
             if (response.error) {
+              // Atom failed — persist its failed state and continue to the next atom
               childUnits[childIndex] = applyChildGenerationFailure(currentChild, response.error)
-              sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
-              await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: ${childDef.label} failed - ${response.error}. Previous child items preserved. Retry ${childDef.label}.`, failureType: 'child_failed', sectionId: sectionDef.id, childId: childDef.childId })
-              throw Object.assign(new Error(`${sectionDef.heading}: ${childDef.label} failed - ${response.error}. Previous child items preserved. Retry ${childDef.label}.`), { failureType: 'child_failed', sectionUnits })
+              sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
+              await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
+              continue
             }
             const parsedChild = parseArtifactChildResponse(response.result, childDef, response)
             if (parsedChild.error) {
+              // Atom failed — persist its failed state and continue to the next atom
               childUnits[childIndex] = applyChildGenerationFailure(currentChild, parsedChild.failureReason || parsedChild.error, parsedChild.child || null)
-              sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
-              await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: ${childDef.label} failed - ${parsedChild.failureReason || parsedChild.error}. Previous child items preserved. Retry ${childDef.label}.`, failureType: parsedChild.truncated ? 'child_truncated' : 'child_failed', sectionId: sectionDef.id, childId: childDef.childId })
-              throw Object.assign(new Error(`${sectionDef.heading}: ${childDef.label} failed - ${parsedChild.failureReason || parsedChild.error}. Previous child items preserved. Retry ${childDef.label}.`), { failureType: parsedChild.truncated ? 'child_truncated' : 'child_failed', sectionUnits })
+              sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
+              await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
+              continue
             }
             childUnits[childIndex] = applyChildGenerationSuccess(currentChild, parsedChild.child)
             sectionUnits[i] = { ...currentUnit, generationMode: 'child_units', childUnits }
             await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id, childId: childDef.childId })
           }
+          // Assemble section from all attempted atoms — failed sections are marked, not erased
           sectionUnits[i] = assembleSectionFromChildUnits({ ...currentUnit, childUnits }, childUnits)
-          if (sectionUnits[i].lifecycle !== 'accepted') {
-            await publishProgress(sectionUnits, 'failed', { error: `${sectionDef.heading}: child-unit section did not pass audit. Previous child items preserved.`, failureType: 'section_audit_failed', sectionId: sectionDef.id })
-            throw Object.assign(new Error(`${sectionDef.heading}: child-unit section did not pass audit. Previous child items preserved.`), { failureType: 'section_audit_failed', sectionUnits })
-          }
           await publishProgress(sectionUnits, 'generating', { sectionId: sectionDef.id })
           continue
         }
@@ -1095,7 +1202,7 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
           continue
         }
 
-        const { messages } = buildArtifactSectionPrompt(durableItem, durableHandoff, sectionDef, artifactBasis)
+        const { messages } = generator.buildSectionPrompt(durableItem, durableHandoff, sectionDef, artifactBasis)
         const response = await callAI(messages, { temperature: 0.3, maxTokens: 900 })
         if (response.error) {
           sectionUnits[i] = applySectionGenerationFailure(currentUnit, response.error)
@@ -1117,9 +1224,10 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       }
 
       const assembled = assembleArtifactFromSectionUnits(sectionUnits)
-      if (assembled.contentSections.length !== sectionOutline.length || assembled.failedSections.length > 0) {
-        await publishProgress(sectionUnits, 'failed', { error: 'Artifact generation is partial. Previous artifact content preserved; retry failed sections.', failureType: 'section_failed' })
-        throw Object.assign(new Error('Artifact generation is partial. Previous artifact content preserved; retry failed sections.'), { failureType: 'section_failed', sectionUnits })
+      if (assembled.contentSections.length === 0) {
+        // Complete failure — no sections generated at all
+        await publishProgress(sectionUnits, 'failed', { error: 'No sections were generated. Retry failed sections individually.', failureType: 'section_failed' })
+        throw Object.assign(new Error('No sections were generated. Retry failed sections individually.'), { failureType: 'section_failed', sectionUnits })
       }
       const contentSections = assembled.contentSections
       const evidenceBasis = `Generated section-by-section from ${artifactBasis.counts.mappedHowOptions} mapped how option(s).`
@@ -1187,11 +1295,17 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       .then(existing => {
         if (cancelled) return
         if (existing) {
-          if (isArtifactPlanStale(existing, handoff)) {
-            setPlan(existing)
+          const upgraded  = upgradeArtifactPlanSpecCoverage(existing, handoff, workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId)
+          // Retroactively honour Stage 3 selectedStage4Deliverables for plans that
+          // were created before the suggestArtifacts S3-selection fix.  Artifacts
+          // whose type was never checked in Stage 3 are corrected to selected: false
+          // so they are hidden from the active generation view without a rebuild.
+          const corrected = correctPlanSelectionFromS3(upgraded, handoff)
+          if (isArtifactPlanStale(corrected, handoff)) {
+            setPlan(corrected)
             setApPhase('stale')
           } else {
-            setPlan(existing)
+            setPlan(corrected)
             setApPhase('ready')
           }
         } else {
@@ -1234,14 +1348,22 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
 
     const applySelections = artifacts => artifacts.map(a => ({
       ...a,
-      selected: a.readinessStatus !== ARTIFACT_READINESS.BLOCKED && selectedIds.has(a.artifactId),
+      selected: !artifactReadinessBlocksGeneration(a.readinessStatus) && selectedIds.has(a.artifactId),
       updatedAt: new Date().toISOString(),
     }))
 
+    const nextGlobalArtifacts = applySelections(editingPlan.globalArtifacts)
+    const nextBusinessUnitArtifacts = applySelections(editingPlan.businessUnitArtifacts)
+    const nextSelectedById = new Map([...nextGlobalArtifacts, ...nextBusinessUnitArtifacts].map(a => [a.artifactId, a.selected]))
     const planToSave = {
       ...editingPlan,
-      globalArtifacts:      applySelections(editingPlan.globalArtifacts),
-      businessUnitArtifacts: applySelections(editingPlan.businessUnitArtifacts),
+      globalArtifacts:      nextGlobalArtifacts,
+      businessUnitArtifacts: nextBusinessUnitArtifacts,
+      artifacts: (editingPlan.artifacts || [...nextGlobalArtifacts, ...nextBusinessUnitArtifacts]).map(a => ({
+        ...a,
+        selected: !artifactReadinessBlocksGeneration(a.readinessStatus) && Boolean(nextSelectedById.get(a.artifactId)),
+        updatedAt: new Date().toISOString(),
+      })),
       status,
     }
 
@@ -1388,7 +1510,9 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
             background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 5,
           }}>
             <span style={{ fontSize: 10, fontFamily: fm, color: 'var(--muted2)' }}>
-              {editing ? `${selectedIds.size} selected` : `${selectedCount} of ${(displayPlan.globalArtifacts?.length || 0) + (displayPlan.businessUnitArtifacts?.length || 0)} artifacts selected`}
+              {editing
+                ? `${selectedIds.size} selected`
+                : `${selectedCount} artifact job${selectedCount !== 1 ? 's' : ''} selected for generation`}
             </span>
             {editing && (
               <>
@@ -1491,28 +1615,35 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
               )
             }
 
-            const globalSelected  = editing ? selectedIds : new Set((displayPlan.globalArtifacts || []).filter(a => a.selected).map(a => a.artifactId))
-            const buArtifacts     = displayPlan.businessUnitArtifacts || []
-            const viewBuSelected  = new Set(buArtifacts.filter(a => a.selected).map(a => a.artifactId))
+            const allGlobal       = displayPlan.globalArtifacts || []
+            const allBuArtifacts  = displayPlan.businessUnitArtifacts || []
+
+            // In active (non-editing) mode only show jobs the user selected for generation.
+            // In editing mode show all candidates so the user can toggle them.
+            const visibleGlobal   = editing ? allGlobal      : allGlobal.filter(a => a.selected)
+            const visibleBu       = editing ? allBuArtifacts : allBuArtifacts.filter(a => a.selected)
+
+            const globalSelected  = editing ? selectedIds : new Set(visibleGlobal.map(a => a.artifactId))
+            const viewBuSelected  = new Set(visibleBu.map(a => a.artifactId))
             const buSelected      = editing ? selectedIds : viewBuSelected
-            const groups          = groupByBU(buArtifacts)
+            const groups          = groupByBU(visibleBu)
 
             return (
               <>
                 {/* Global artifacts */}
-                {(displayPlan.globalArtifacts || []).length > 0 && (
+                {visibleGlobal.length > 0 && (
                   <div style={{ marginBottom: 10 }}>
                     <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 5 }}>
-                      Global Artifacts ({displayPlan.globalArtifacts.length})
+                      Global Artifacts ({visibleGlobal.length})
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                      {displayPlan.globalArtifacts.map(a => renderArtifact(a, globalSelected))}
+                      {visibleGlobal.map(a => renderArtifact(a, globalSelected))}
                     </div>
                   </div>
                 )}
 
                 {/* BU artifacts — grouped by BU */}
-                {buArtifacts.length > 0 && (
+                {visibleBu.length > 0 && (
                   <div>
                     <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
                       Business Unit Artifacts

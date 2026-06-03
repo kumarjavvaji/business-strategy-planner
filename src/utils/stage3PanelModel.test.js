@@ -24,9 +24,11 @@ import {
   updateRefinementStatus,
   resolvePanelDisplayStatus,
   synthesizePanelSummary,
+  autoRepairPunctuation,
   PANEL_AUDIT_STATUSES,
   CROSS_PANEL_QUALITY_STATUSES,
   REFINEMENT_STATUSES,
+  ISSUE_TYPES,
   PANEL_IDS,
   // Mapping exports
   MAPPING_STATUS,
@@ -1310,15 +1312,18 @@ describe('updateHowOptionMapping', () => {
     expect(selected.map(record => record.deliverableType)).not.toContain('bu_execution_plan')
   })
 
-  it('selected deliverable status becomes incomplete when no how options map to it', () => {
+  it('selected deliverable preserves user_selected status when no how options map to it yet', () => {
+    // D6: explicit user selections must NOT be silently overwritten to 'incomplete'.
+    // 'user_selected' persists until a how-option is mapped (which upgrades it to 'mapped').
     let pm = makePMWithHowOptions()
     pm = updateSelectedStage4Deliverables(pm, ['operating_cadence_plan'])
 
     const selected = getSelectedStage4Deliverables(pm.panels.executionSequence)
     expect(selected[0]).toMatchObject({
       deliverableType: 'operating_cadence_plan',
-      status: 'incomplete',
+      status: 'user_selected',   // preserved — not cleared to 'incomplete'
     })
+    // Mapping readiness is still false (no how-option feeds this deliverable)
     expect(computeDeliverableMappingReadiness(pm.panels.executionSequence, ['operating_cadence_plan']).mappingReady).toBe(false)
   })
 
@@ -1494,7 +1499,9 @@ describe('mapping readiness — Stage 4 preparation distinct from content readin
     expect(readiness.mappingReady).toBe(true)
   })
 
-  it('accepted execution sequence blocks Stage 4 readiness when a selected deliverable has no mapped how option', () => {
+  it('accepted execution sequence blocks Stage 4 readiness when a user-selected deliverable has no mapped how option', () => {
+    // D6 + D13: user_selected deliverable with no how-option mapping must produce a mapping warning
+    // (not silently show as ready).
     const plan = {
       ...makeGoodCompiledPlan(),
       executionSequence: [{
@@ -1532,5 +1539,168 @@ describe('mapping readiness — Stage 4 preparation distinct from content readin
     expect(status.total).toBe(1)
     expect(typeof status.mapped).toBe('number')
     expect(typeof status.unmapped).toBe('number')
+  })
+})
+
+// ── D4 / D4a — Punctuation auto-repair, not truncation ───────────────────────
+
+describe('autoRepairPunctuation', () => {
+  it('appends period when no terminal punctuation exists', () => {
+    expect(autoRepairPunctuation('Resolve before Sprint 2 begins')).toBe('Resolve before Sprint 2 begins.')
+  })
+  it('does not alter text that already ends with period', () => {
+    expect(autoRepairPunctuation('Resolve before Sprint 2 begins.')).toBe('Resolve before Sprint 2 begins.')
+  })
+  it('does not alter text that ends with question mark or exclamation', () => {
+    expect(autoRepairPunctuation('Which path should we choose?')).toBe('Which path should we choose?')
+    expect(autoRepairPunctuation('Complete by Q2!')).toBe('Complete by Q2!')
+  })
+  it('handles empty and non-string inputs gracefully', () => {
+    expect(autoRepairPunctuation('')).toBe('')
+    expect(autoRepairPunctuation(null)).toBe(null)
+  })
+})
+
+describe('D4a — missing terminal punctuation does not cause TRUNCATED audit status', () => {
+  it('returns punctuationIssues and autoRepairs, NOT truncatedFields, for missing terminal punctuation', () => {
+    // A well-structured strategic objective whose sentence-form fields lack final periods
+    const content = {
+      summary:      'This BU owns the explainability infrastructure for AaaS BSA/AML outputs, ensuring SR 11-7 compliance',
+      outcomeFocus: 'Building modular, internally-owned explainability architecture reduces long-term partner dependencies',
+      nonGoalsOrBoundaries: ['Does not include generative AI'],
+    }
+    const audit = auditPanelCompleteness('strategicObjective', content)
+
+    expect(audit.status).toBe(PANEL_AUDIT_STATUSES.COMPLETE)  // NOT truncated
+    expect(audit.truncatedFields).toHaveLength(0)
+    expect(audit.punctuationIssues.length).toBeGreaterThan(0)
+    expect(audit.autoRepairs.length).toBeGreaterThan(0)
+    expect(audit.autoRepairs[0].issueType).toBe(ISSUE_TYPES.MISSING_TERMINAL_PUNCTUATION)
+    expect(audit.autoRepairs[0].autoFixable).toBe(true)
+    expect(audit.autoRepairs[0].repairedValue).toMatch(/\.$/)
+  })
+
+  it('panel with only punctuation issues can be accepted (not blocked)', () => {
+    const pm = normalizeToPanelModel({
+      ...makeGoodCompiledPlan(),
+      // Remove terminal punctuation from summary and outcomeFocus
+      strategicObjective: {
+        summary:      'This BU owns the explainability infrastructure for AaaS BSA/AML outputs, ensuring SR 11-7 compliance',
+        outcomeFocus: 'Building modular, internally-owned explainability architecture reduces long-term partner dependencies',
+      },
+    })
+    const panel = pm.panels.strategicObjective
+    expect(panel.completenessAudit.status).toBe(PANEL_AUDIT_STATUSES.COMPLETE)
+    expect(panel.completenessAudit.punctuationIssues.length).toBeGreaterThan(0)
+    // Can accept because status is COMPLETE (not TRUNCATED) — canAccept imported at top of file
+    expect(canAccept(panel)).toBe(true)
+  })
+
+  it('genuine truncation (partial word) still produces TRUNCATED status', () => {
+    const content = {
+      summary:      'This BU owns the explainability infrastructure for AaaS before con',
+      outcomeFocus: 'Building modular architecture reduces long-term partner dependencies.',
+    }
+    const audit = auditPanelCompleteness('strategicObjective', content)
+    expect(audit.status).toBe(PANEL_AUDIT_STATUSES.TRUNCATED)
+    expect(audit.truncatedFields.some(f => f.includes('summary'))).toBe(true)
+  })
+
+  it('autoRepair produces repaired values for all punctuation issues', () => {
+    const content = {
+      summary:      'This BU owns the explainability infrastructure for AaaS BSA/AML outputs, ensuring SR 11-7 compliance',
+      outcomeFocus: 'Building modular, internally-owned explainability architecture reduces long-term partner dependencies',
+    }
+    const audit = auditPanelCompleteness('strategicObjective', content)
+    audit.autoRepairs.forEach(repair => {
+      expect(repair.repairedValue).toMatch(/[.!?;:'"\]]\s*$/)
+      expect(repair.repairedValue.length).toBeGreaterThan(String(content[repair.field] || '').length)
+    })
+  })
+})
+
+// ── D6 — normalizeToPanelModel preserves user selections through stale rebuild ─
+
+describe('D6 — normalizeToPanelModel preserves user selections from existingPanelModel', () => {
+  function makePMWithHowOptionsForD6() {
+    const plan = {
+      ...makeGoodCompiledPlan(),
+      executionSequence: PHASES_WITH_HOW_OPTIONS.map(p => ({
+        ...p,
+        phaseObjective: 'Confirm that the proposed path meets regulatory and delivery requirements before committing to the build.',
+        recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format with Compliance team.',
+        exitCriteria:   'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 2 begins.',
+        evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+      })),
+    }
+    return normalizeToPanelModel(plan)
+  }
+
+  it('user-selected deliverables survive a stale rebuild (normalizeToPanelModel with existingPanelModel)', () => {
+    let pm = makePMWithHowOptionsForD6()
+    pm = updateSelectedStage4Deliverables(pm, ['executive_decision_brief', 'risk_control_plan'])
+
+    const selectedBefore = getSelectedStage4Deliverables(pm.panels.executionSequence)
+    expect(selectedBefore.map(r => r.deliverableType)).toContain('executive_decision_brief')
+    expect(selectedBefore.map(r => r.deliverableType)).toContain('risk_control_plan')
+
+    // Simulate stale recalculation — rebuild with the same compiled plan but carry forward prior model
+    const compiledPlan = {
+      ...makeGoodCompiledPlan(),
+      executionSequence: PHASES_WITH_HOW_OPTIONS.map(p => ({
+        ...p,
+        phaseObjective: 'Confirm that the proposed path meets regulatory and delivery requirements before committing to the build.',
+        recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format with Compliance team.',
+        exitCriteria:   'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 2 begins.',
+        evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+      })),
+    }
+    const rebuilt = normalizeToPanelModel(compiledPlan, pm)
+
+    const selectedAfter = getSelectedStage4Deliverables(rebuilt.panels.executionSequence)
+    expect(selectedAfter.map(r => r.deliverableType)).toContain('executive_decision_brief')
+    expect(selectedAfter.map(r => r.deliverableType)).toContain('risk_control_plan')
+  })
+
+  it('user-confirmed how-option mappings survive a stale rebuild', () => {
+    let pm = makePMWithHowOptionsForD6()
+    pm = updateHowOptionMapping(pm, 'problem_outcome_validation', 'regulatory_gap_mapping_workshop', ['executive_decision_brief', 'risk_control_plan'])
+
+    const mappingBefore = pm.panels.executionSequence.executionDeliverableMappings['problem_outcome_validation'].howOptionMappings['regulatory_gap_mapping_workshop']
+    expect(mappingBefore.mappingStatus).toBe(MAPPING_STATUS.USER_CONFIRMED)
+
+    const compiledPlan = {
+      ...makeGoodCompiledPlan(),
+      executionSequence: PHASES_WITH_HOW_OPTIONS.map(p => ({
+        ...p,
+        phaseObjective: 'Confirm that the proposed path meets regulatory and delivery requirements before committing to the build.',
+        recommendedHow: 'Structured review of completed BSA/AML model outputs against SR 11-7 examiner format with Compliance team.',
+        exitCriteria:   'Compliance team signs off that model outputs meet SR 11-7 format requirements before Sprint 2 begins.',
+        evidenceExamples: ['Signed compliance review memo', 'Two annotated model output examples'],
+      })),
+    }
+    const rebuilt = normalizeToPanelModel(compiledPlan, pm)
+
+    const mappingAfter = rebuilt.panels.executionSequence.executionDeliverableMappings['problem_outcome_validation'].howOptionMappings['regulatory_gap_mapping_workshop']
+    expect(mappingAfter.mappingStatus).toBe(MAPPING_STATUS.USER_CONFIRMED)
+    expect(mappingAfter.mappedDeliverables).toContain('executive_decision_brief')
+  })
+
+  it('normalizeToPanelModel without existingPanelModel behaves as before (backward compat)', () => {
+    const pm = normalizeToPanelModel(makeGoodCompiledPlan())
+    expect(pm.panels).toBeTruthy()
+    PANEL_IDS.forEach(pid => expect(pm.panels[pid]).toBeTruthy())
+  })
+})
+
+// ── D4 ISSUE_TYPES constant ───────────────────────────────────────────────────
+
+describe('ISSUE_TYPES constant', () => {
+  it('exports all expected issue type keys', () => {
+    expect(ISSUE_TYPES.GENUINELY_TRUNCATED).toBe('genuinely_truncated')
+    expect(ISSUE_TYPES.MISSING_TERMINAL_PUNCTUATION).toBe('missing_terminal_punctuation')
+    expect(ISSUE_TYPES.MISSING_REQUIRED_FIELD).toBe('missing_required_field')
+    expect(ISSUE_TYPES.UNDERFILLED).toBe('underfilled')
+    expect(ISSUE_TYPES.NOT_ACCEPTED).toBe('not_accepted')
   })
 })

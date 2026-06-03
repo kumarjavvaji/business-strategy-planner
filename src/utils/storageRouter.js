@@ -46,7 +46,8 @@ const ROUTES = [
   { prefix: 'bsp_v1_stage3_coord',        store: IDB_STORES.STAGE3_COORDINATION, dualWrite: false },
   { prefix: 'bsp_v1_stage4_handoff_',        store: IDB_STORES.STAGE4_HANDOFFS,        dualWrite: false },
   { prefix: 'bsp_v1_stage4_artifact_plan_',    store: IDB_STORES.STAGE4_ARTIFACT_PLANS,   dualWrite: false },
-  { prefix: 'bsp_v1_stage4_artifact_output_',  store: IDB_STORES.STAGE4_ARTIFACT_OUTPUTS, dualWrite: false },
+  { prefix: 'bsp_v1_stage4_artifact_output_',  store: IDB_STORES.STAGE4_ARTIFACT_OUTPUTS,  dualWrite: false },
+  { prefix: 'bsp_v1_stage5_learning_signals_', store: IDB_STORES.STAGE5_LEARNING_SIGNALS,  dualWrite: false },
 ]
 
 const IDB_POINTER_MARKER = '_idbRef'
@@ -261,6 +262,7 @@ async function _doInit() {
     IDB_STORES.STAGE4_HANDOFFS,
     IDB_STORES.STAGE4_ARTIFACT_PLANS,
     IDB_STORES.STAGE4_ARTIFACT_OUTPUTS,
+    IDB_STORES.STAGE5_LEARNING_SIGNALS,
   ]
   for (const store of storesToLoad) {
     try {

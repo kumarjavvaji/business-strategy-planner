@@ -18,16 +18,15 @@
 
 import { BU_HANDOFF_STATUS } from './stage4Handoff'
 import { compileArtifactBasis } from './stage4ArtifactBasis'
+import {
+  resolveArtifactSpec,
+  getArtifactSectionSchema,
+  SUPPORTED_ARTIFACT_SPEC_TYPES,
+} from './stage4ArtifactSpecs'
 
 // ── Supported types ────────────────────────────────────────────────────────────
 
-export const SUPPORTED_GENERATION_TYPES = new Set([
-  'executive_decision_brief',
-  'bu_execution_plan',
-  'bu_execution_plan_partial',
-  'bu_sme_review_packet',
-  'global_sme_review_packet',
-])
+export const SUPPORTED_GENERATION_TYPES = new Set(SUPPORTED_ARTIFACT_SPEC_TYPES)
 
 // ── Shared response schema ─────────────────────────────────────────────────────
 
@@ -67,11 +66,11 @@ const CHILD_RESPONSE_SCHEMA = `{
   "confidenceLevel": "high | medium | low"
 }`
 
-const SYSTEM_PREAMBLE = `You are a strategic delivery advisor generating structured planning artifacts from verified execution plans. Be concise and specific. Avoid generic filler. Each section body should be 3-6 tight sentences or a short bullet list. Respond ONLY with valid JSON — no markdown fences, no prose outside the JSON.`
+const SYSTEM_PREAMBLE = `You are a strategic delivery advisor generating structured planning artifacts from verified execution plans. Be concise and specific. Avoid generic filler. Each atom body should be 2-4 tight sentences or a short bullet list. Respond ONLY with valid JSON — no markdown fences, no prose outside the JSON. Every atom must answer: what decision, action, risk, gate, dependency, or review step does this clarify? Prefer specific owners, gates, timings, and named evidence over generalized strategy prose.`
 
 // ── Formatting helpers ─────────────────────────────────────────────────────────
 
-const BASIS_CONTRACT = `Use the compact artifact basis below. Transform the basis into the artifact; do not summarize it. Do not copy Stage 3 prose verbatim. Do not include unmapped tactics. Keep sections role-distinct. Prefer concrete deliverable language over explanatory narrative.`
+const BASIS_CONTRACT = `Use the compact artifact basis below. Transform the basis into the artifact; do not summarize it. Do not copy Stage 3 prose verbatim. Do not include unmapped tactics. Keep atoms role-distinct. Prefer concrete deliverable language over explanatory narrative. Do not restate the same basis across sibling atoms.`
 
 function safeList(arr) {
   return (arr || []).filter(Boolean).join('; ') || '(none)'
@@ -114,15 +113,55 @@ function sourceItemsForSection(sectionDef, artifactBasis) {
   return artifactBasis?.[sectionDef?.childSource] || []
 }
 
+function synthesisContextForBasis(artifactBasis) {
+  return {
+    artifactType:  artifactBasis.artifactType,
+    artifactIntent: artifactBasis.artifactIntent,
+    buName:        artifactBasis.buName,
+    strategicThesis: artifactBasis.strategicThesis,
+    selectedExecutionTactics: (artifactBasis.selectedExecutionTactics || []).slice(0, 4).map(t => ({
+      optionName: t.optionName, phaseName: t.phaseName, whenToUse: t.whenToUse, evidenceProduced: t.evidenceProduced,
+    })),
+    relevantDecisions:          (artifactBasis.relevantDecisions          || []).slice(0, 4).map(d => ({ id: d.id, name: d.name, summary: d.summary, timing: d.timing })),
+    relevantDependencies:       (artifactBasis.relevantDependencies       || []).slice(0, 3).map(d => ({ id: d.id, name: d.name, summary: d.summary })),
+    relevantRisks:              (artifactBasis.relevantRisks              || []).slice(0, 3).map(r => ({ id: r.id, name: r.name, summary: r.summary })),
+    relevantValidationQuestions:(artifactBasis.relevantValidationQuestions || []).slice(0, 3).map(v => ({ id: v.id, name: v.name, summary: v.summary })),
+    counts:        artifactBasis.counts,
+    basisWarnings: artifactBasis.basisWarnings || [],
+  }
+}
+
 // ── Executive Decision Brief ───────────────────────────────────────────────────
 
 const EXEC_BRIEF_SECTIONS = [
-  { id: 'executive_summary',       heading: 'Executive Summary',        purpose: 'Overall execution readiness in 2-3 sentences.' },
-  { id: 'key_decisions_required',  heading: 'Key Decisions Required',   purpose: 'Specific decisions needed before or during delivery, with decision owner.', generationMode: 'child_units', childSource: 'relevantDecisions' },
-  { id: 'cross_bu_commitments',    heading: 'Cross-BU Commitments',     purpose: 'Shared commitments and sequencing dependencies across BUs.', generationMode: 'child_units', childSource: 'relevantDependencies' },
-  { id: 'governance_requirements', heading: 'Governance Requirements',  purpose: 'Sign-off requirements, review gates, and escalation paths.', generationMode: 'child_units', childSource: 'selectedExecutionTactics' },
-  { id: 'risk_summary',            heading: 'Risk Summary',             purpose: 'Top 3-5 cross-cutting risks with brief mitigation notes.', generationMode: 'child_units', childSource: 'relevantRisks' },
-  { id: 'recommended_next_steps',  heading: 'Recommended Next Steps',   purpose: 'Immediate actions before generation of BU-specific delivery plans.' },
+  {
+    id: 'executive_summary',
+    heading: 'Executive Summary',
+    purpose: 'Overall execution readiness, open blockers, and leadership actions required.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'decision_context',   atomType: 'context',   label: 'Decision Context',         inputBasis: 'What is the core strategic decision context requiring executive awareness — what has been decided, what remains open, and why this brief is needed now?' },
+      { atomId: 'current_readiness',  atomType: 'readiness', label: 'Current Readiness',         inputBasis: 'What is the current delivery readiness level across the verified BUs — which BUs are ready, which are partial, and what the overall status implies for launch sequencing?' },
+      { atomId: 'unresolved_blockers',atomType: 'blocker',   label: 'Unresolved Blockers',       inputBasis: 'What cross-BU or executive-level blockers remain unresolved that will prevent delivery from proceeding without leadership intervention?' },
+      { atomId: 'leadership_actions', atomType: 'action',    label: 'Leadership Actions Required',inputBasis: 'What specific leadership decisions or formal commitments are required — with named owners where determinable — before BU-level delivery planning can proceed?' },
+    ],
+  },
+  { id: 'key_decisions_required',  heading: 'Key Decisions Required',   purpose: 'Specific decisions needed before or during delivery, with decision owner and timing.', generationMode: 'child_units', childSource: 'relevantDecisions',          atomType: 'decision_item' },
+  { id: 'cross_bu_commitments',    heading: 'Cross-BU Commitments',     purpose: 'Shared commitments and sequencing dependencies across BUs.',                             generationMode: 'child_units', childSource: 'relevantDependencies',       atomType: 'dependency_item' },
+  { id: 'governance_requirements', heading: 'Governance Requirements',  purpose: 'Sign-off requirements, review gates, and escalation paths per delivery tactic.',        generationMode: 'child_units', childSource: 'selectedExecutionTactics',   atomType: 'governance_item' },
+  { id: 'risk_summary',            heading: 'Risk Summary',             purpose: 'Top cross-cutting risks with owner and brief mitigation note per risk.',                 generationMode: 'child_units', childSource: 'relevantRisks',              atomType: 'risk_item' },
+  {
+    id: 'recommended_next_steps',
+    heading: 'Recommended Next Steps',
+    purpose: 'Immediate actions before generation of BU-specific delivery plans.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'immediate_decisions',  atomType: 'next_step', label: 'Immediate Decisions',     inputBasis: 'What specific decisions must be made in the next 2-4 weeks — with named decision owners — before any BU delivery plan can launch?' },
+      { atomId: 'resourcing_actions',   atomType: 'next_step', label: 'Resourcing Actions',       inputBasis: 'What resource commitments, ownership confirmations, or team structures must be formally established before delivery commences?' },
+      { atomId: 'governance_setup',     atomType: 'next_step', label: 'Governance Setup',         inputBasis: 'What governance structures, review gates, and escalation paths must be established — with accountable owners — before delivery commences?' },
+      { atomId: 'sequencing_alignment', atomType: 'next_step', label: 'Sequencing Alignment',     inputBasis: 'What cross-BU sequencing and dependency alignment must be completed — naming the dependency and the BUs involved — before individual BU plans proceed?' },
+    ],
+  },
 ]
 
 function buildExecutiveDecisionBriefMessages(artifactItem, handoff) {
@@ -157,12 +196,42 @@ ${RESPONSE_SCHEMA}`
 // ── BU Execution Plan ──────────────────────────────────────────────────────────
 
 const BU_PLAN_SECTIONS = [
-  { id: 'strategic_context',    heading: 'Strategic Context',           purpose: 'BU role in overall delivery and how it connects to the organisation strategy.' },
-  { id: 'execution_workstreams',heading: 'Execution Workstreams',       purpose: 'Key workstreams, activities, and suggested owners.', generationMode: 'child_units', childSource: 'selectedExecutionTactics' },
-  { id: 'gate_criteria',        heading: 'Gate Criteria',               purpose: 'What must be true at each delivery gate before proceeding.', generationMode: 'child_units', childSource: 'selectedExecutionTactics' },
-  { id: 'dependency_map',       heading: 'Dependency Map',              purpose: 'Internal and cross-BU dependencies that must be resolved during delivery.', generationMode: 'child_units', childSource: 'relevantDependencies' },
-  { id: 'risk_controls',        heading: 'Risk Controls',               purpose: 'Specific controls for the identified execution risks.', generationMode: 'child_units', childSource: 'relevantRisks' },
-  { id: 'validation_approach',  heading: 'Validation Approach',         purpose: 'How readiness and delivery quality will be confirmed at each phase.', generationMode: 'child_units', childSource: 'relevantValidationQuestions' },
+  {
+    id: 'strategic_context',
+    heading: 'Strategic Context',
+    purpose: 'BU role in overall delivery and how it connects to the organisation strategy.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'bu_role',               atomType: 'context', label: 'BU Role',                   inputBasis: 'What is this BU\'s specific role in the delivery programme — what does it own, what does it produce, and how does it contribute to the strategic outcome?' },
+      { atomId: 'strategic_alignment',   atomType: 'context', label: 'Strategic Alignment',        inputBasis: 'How does this BU\'s mapped execution plan advance the organisation\'s strategic thesis — naming specific tactics and the outcomes they produce?' },
+      { atomId: 'delivery_dependencies', atomType: 'context', label: 'Key Delivery Dependencies',  inputBasis: 'What critical external and cross-BU dependencies must be resolved before or during this BU\'s execution — naming the dependency and the providing party?' },
+    ],
+  },
+  { id: 'execution_workstreams', heading: 'Execution Workstreams', purpose: 'Key workstreams, activities, and suggested owners per mapped execution tactic.',        generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'workstream_item' },
+  { id: 'gate_criteria',         heading: 'Gate Criteria',         purpose: 'What must be true at each delivery gate before proceeding, per mapped execution tactic.',  generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'gate_item' },
+  { id: 'dependency_map',        heading: 'Dependency Map',        purpose: 'Internal and cross-BU dependencies that must be resolved during delivery.',                generationMode: 'child_units', childSource: 'relevantDependencies',      atomType: 'dependency_item' },
+  { id: 'risk_controls',         heading: 'Risk Controls',         purpose: 'Specific controls for the identified execution risks, with owner and trigger.',             generationMode: 'child_units', childSource: 'relevantRisks',             atomType: 'risk_item' },
+  { id: 'validation_approach',   heading: 'Validation Approach',   purpose: 'How readiness and delivery quality will be confirmed at each phase.',                       generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'validation_item' },
+]
+
+// Stage 4 registers this single BU-scoped engineering artifact so persisted
+// artifact jobs can execute without falling through to unsupported generation.
+const PDLC_EPIC_OUTLINE_SECTIONS = [
+  {
+    id: 'epic_framing',
+    heading: 'Epic Framing',
+    purpose: 'Translate the accepted BU thesis and mapped tactics into the product delivery problem statement.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'delivery_intent', atomType: 'pdlc_context', label: 'Delivery Intent', inputBasis: 'State the product delivery intent, accountable BU context, and source evidence that constrains this epic outline.' },
+      { atomId: 'source_traceability', atomType: 'traceability', label: 'Source Traceability', inputBasis: 'Name the mapped execution tactics, source panels, and evidence anchors used to derive the epic outline.' },
+    ],
+  },
+  { id: 'epic_candidates', heading: 'Epic Candidates', purpose: 'Candidate implementation epics derived one-for-one from mapped execution tactics.', generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'pdlc_epic_item' },
+  { id: 'scope_boundaries', heading: 'Scope Boundaries', purpose: 'Explicit in-scope and out-of-scope boundaries for each mapped tactic.', generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'scope_boundary_item' },
+  { id: 'delivery_sequence', heading: 'Delivery Sequence', purpose: 'Recommended phase/order and gate logic for delivering the epic set.', generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'delivery_sequence_item' },
+  { id: 'dependency_and_risk_controls', heading: 'Dependency And Risk Controls', purpose: 'Dependencies and risks that must be owned before or during epic execution.', generationMode: 'child_units', childSource: 'relevantDependencies', atomType: 'dependency_control_item' },
+  { id: 'acceptance_intent', heading: 'Acceptance Intent', purpose: 'Acceptance checks and review anchors linked to validation questions.', generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'acceptance_intent_item' },
 ]
 
 function buildBuExecutionPlanMessages(artifactItem, handoff) {
@@ -203,14 +272,100 @@ ${RESPONSE_SCHEMA}`
   return { messages: [{ role: 'user', content: userContent }], artifactBasis }
 }
 
+function buildPdlcEpicOutlineMessages(artifactItem, handoff) {
+  const bu = (handoff.buHandoffs || []).find(b => b.buName === artifactItem.businessUnitName)
+  if (!bu) return null
+  const artifactBasis = compileArtifactBasis(artifactItem, handoff)
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate a PDLC Epic Outline for "${bu.buName}" from accepted Stage 3 source atoms.
+
+${BASIS_CONTRACT}
+
+ARTIFACT TYPE: ${artifactBasis.artifactType}
+ARTIFACT INTENT: ${artifactBasis.artifactIntent}
+
+COMPACT ARTIFACT BASIS:
+${basisJson(artifactBasis)}
+
+AUTHORING RULES:
+- Convert mapped execution tactics into implementation-ready epic candidates.
+- Include owners, gates, evidence, dependencies, risks, and acceptance checks where available.
+- Do not invent unmapped epics.
+- Do not paste Stage 3 prose; use short labeled source references only.
+
+Generate exactly these sections:
+${PDLC_EPIC_OUTLINE_SECTIONS.map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }], artifactBasis }
+}
+
+function buildSpecDrivenArtifactMessages(artifactItem, handoff) {
+  const spec = resolveArtifactSpec(artifactItem.artifactType)
+  if (!spec) return null
+  const artifactBasis = compileArtifactBasis(artifactItem, handoff)
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate a ${spec.artifactTitle} from its artifact-specific Stage 4 authoring spec.
+
+${BASIS_CONTRACT}
+
+ARTIFACT TYPE: ${spec.artifactType}
+ARTIFACT PURPOSE: ${spec.purpose}
+AUDIENCE: ${spec.audience}
+SME LENS: ${spec.smeLens}
+
+COMPACT ARTIFACT BASIS:
+${basisJson(artifactBasis)}
+
+OUTPUT RULES:
+${(spec.outputRules || []).map(rule => `- ${rule}`).join('\n')}
+
+ACCEPTANCE CHECKS:
+${(spec.acceptanceChecks || []).map(check => `- ${check}`).join('\n')}
+
+Generate exactly these sections:
+${(spec.sectionSchema || []).map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }], artifactBasis, artifactSpec: spec }
+}
+
 // ── SME Review Packet (BU-scoped) ──────────────────────────────────────────────
 
 const BU_SME_SECTIONS = [
-  { id: 'review_scope',          heading: 'Review Scope',              purpose: 'What the SME is being asked to assess.' },
-  { id: 'knowledge_gaps',        heading: 'Knowledge Gaps',            purpose: 'Gaps in the plan that require specialist input to resolve.', generationMode: 'child_units', childSource: 'relevantValidationQuestions' },
-  { id: 'specialist_questions',  heading: 'Specialist Questions',      purpose: 'Specific questions for the domain expert, prioritised.', generationMode: 'child_units', childSource: 'relevantValidationQuestions' },
-  { id: 'domain_risks',          heading: 'Domain-Specific Risks',     purpose: 'Risks that require expert judgement, not general project oversight.', generationMode: 'child_units', childSource: 'relevantRisks' },
-  { id: 'recommended_experts',   heading: 'Recommended Expert Profiles','purpose': 'Profile descriptions of the specialists who should review this plan.' },
+  {
+    id: 'review_scope',
+    heading: 'Review Scope',
+    purpose: 'What the SME is being asked to assess.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'scope_deliverables', atomType: 'scope', label: 'Deliverables in Scope',  inputBasis: 'What specific deliverables, mapped execution tactics, and plan sections is the SME being asked to review — naming each tactic and what it produces?' },
+      { atomId: 'scope_evidence',     atomType: 'scope', label: 'Evidence to Review',      inputBasis: 'What evidence artefacts, validated plans, and supporting documents will the SME be given access to during the review?' },
+      { atomId: 'scope_expertise',    atomType: 'scope', label: 'Required Expertise',      inputBasis: 'What specific domain expertise — regulatory, technical, or operational — is required to conduct a credible review of this BU plan and its mapped tactics?' },
+    ],
+  },
+  { id: 'knowledge_gaps',       heading: 'Knowledge Gaps',            purpose: 'Gaps in the plan that require specialist input to resolve.',                        generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'gap_item' },
+  { id: 'specialist_questions', heading: 'Specialist Questions',      purpose: 'Specific questions for the domain expert, each requiring expert judgement.',        generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'question_item' },
+  { id: 'domain_risks',         heading: 'Domain-Specific Risks',     purpose: 'Risks that require expert judgement, not general project oversight.',                generationMode: 'child_units', childSource: 'relevantRisks',              atomType: 'risk_item' },
+  {
+    id: 'recommended_experts',
+    heading: 'Recommended Expert Profiles',
+    purpose: 'Profile descriptions of the specialists who should review this plan.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'domain_expert',      atomType: 'expert_profile', label: 'Domain Expert',       inputBasis: 'What domain-specific expertise profile — regulatory, technical, or industry — is required to review the mapped execution tactics and their evidence basis?' },
+      { atomId: 'delivery_expert',    atomType: 'expert_profile', label: 'Delivery Expert',      inputBasis: 'What delivery and execution expertise profile is required to assess the BU plan\'s feasibility, gate criteria, and delivery sequencing?' },
+      { atomId: 'review_coordinator', atomType: 'expert_profile', label: 'Review Coordinator',   inputBasis: 'Who should coordinate the SME review process — what skills and authority do they need to drive the review to a documented conclusion with clear outputs?' },
+    ],
+  },
 ]
 
 function buildBuSmeReviewMessages(artifactItem, handoff) {
@@ -251,11 +406,31 @@ ${RESPONSE_SCHEMA}`
 // ── SME Review Packet (global) ─────────────────────────────────────────────────
 
 const GLOBAL_SME_SECTIONS = [
-  { id: 'cross_bu_scope',               heading: 'Cross-BU Review Scope',           purpose: 'What the review covers and which BUs are in scope.' },
-  { id: 'capability_gaps',              heading: 'Capability Gaps',                  purpose: 'Cross-cutting gaps that appear across multiple BU plans.', generationMode: 'child_units', childSource: 'relevantValidationQuestions' },
-  { id: 'critical_specialist_questions',heading: 'Critical Specialist Questions',    purpose: 'Questions that must be resolved before delivery commitments are finalised.', generationMode: 'child_units', childSource: 'relevantValidationQuestions' },
-  { id: 'systemic_risks',               heading: 'Systemic Risks',                   purpose: 'Risks that span BUs and cannot be owned by any single team.', generationMode: 'child_units', childSource: 'relevantRisks' },
-  { id: 'review_structure',             heading: 'Recommended Review Structure',     purpose: 'How the SME review should be organised across BUs and workstreams.' },
+  {
+    id: 'cross_bu_scope',
+    heading: 'Cross-BU Review Scope',
+    purpose: 'What the review covers and which BUs are in scope.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'scope_coverage',   atomType: 'scope', label: 'BU Coverage',       inputBasis: 'Which specific BUs, delivery workstreams, and shared capabilities are included in this organisation-wide SME review, and what does each contribute to the shared delivery programme?' },
+      { atomId: 'scope_boundaries', atomType: 'scope', label: 'Review Boundaries', inputBasis: 'What is explicitly out of scope for this review, and what should be deferred to BU-level specialist review or post-delivery retrospective?' },
+      { atomId: 'review_triggers',  atomType: 'scope', label: 'Review Triggers',   inputBasis: 'What specific capability gaps, systemic risks, or delivery conditions triggered the requirement for an organisation-wide SME review rather than BU-scoped reviews?' },
+    ],
+  },
+  { id: 'capability_gaps',               heading: 'Capability Gaps',               purpose: 'Cross-cutting gaps that appear across multiple BU plans, each requiring specialist input.',                 generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'gap_item' },
+  { id: 'critical_specialist_questions', heading: 'Critical Specialist Questions', purpose: 'Questions that must be resolved before delivery commitments are finalised, one per question cluster.', generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'question_item' },
+  { id: 'systemic_risks',                heading: 'Systemic Risks',                purpose: 'Risks that span BUs and cannot be owned by any single team, one per risk.',                                generationMode: 'child_units', childSource: 'relevantRisks',              atomType: 'risk_item' },
+  {
+    id: 'review_structure',
+    heading: 'Recommended Review Structure',
+    purpose: 'How the SME review should be organised across BUs and workstreams.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'review_phases',      atomType: 'review_structure', label: 'Review Phases',       inputBasis: 'What are the recommended phases or stages for conducting the organisation-wide SME review — naming each phase, its focus, and its expected output?' },
+      { atomId: 'review_participants',atomType: 'review_structure', label: 'Review Participants',  inputBasis: 'Who should participate at each review stage — naming the roles of BU leads, SMEs, and executives and what each is expected to contribute or decide?' },
+      { atomId: 'review_outputs',     atomType: 'review_structure', label: 'Review Outputs',       inputBasis: 'What specific outputs, documented decisions, and sign-off artefacts should each review phase produce before the next phase can begin?' },
+    ],
+  },
 ]
 
 function buildGlobalSmeReviewMessages(artifactItem, handoff) {
@@ -307,31 +482,56 @@ export function buildArtifactPrompt(artifactItem, handoff) {
     case 'bu_execution_plan_partial':
       result = buildBuExecutionPlanMessages(artifactItem, handoff)
       break
+    case 'pdlc_epic_outline':
+      result = buildPdlcEpicOutlineMessages(artifactItem, handoff)
+      break
     case 'bu_sme_review_packet':
       result = buildBuSmeReviewMessages(artifactItem, handoff)
       break
     case 'global_sme_review_packet':
       result = buildGlobalSmeReviewMessages(artifactItem, handoff)
       break
+    case 'acceptance_criteria_draft':
+    case 'implementation_governance_checklist':
+      result = buildSpecDrivenArtifactMessages(artifactItem, handoff)
+      break
   }
 
+  if (!result) result = buildSpecDrivenArtifactMessages(artifactItem, handoff)
   if (!result) return { messages: null, isSupported: false }
   return { ...result, isSupported: true }
 }
 
 export function getArtifactSectionOutline(artifactType) {
+  const specSchema = getArtifactSectionSchema(artifactType)
+  if (specSchema) return specSchema
+
   switch (artifactType) {
     case 'executive_decision_brief':
       return EXEC_BRIEF_SECTIONS
     case 'bu_execution_plan':
     case 'bu_execution_plan_partial':
       return BU_PLAN_SECTIONS
+    case 'pdlc_epic_outline':
+      return PDLC_EPIC_OUTLINE_SECTIONS
     case 'bu_sme_review_packet':
       return BU_SME_SECTIONS
     case 'global_sme_review_packet':
       return GLOBAL_SME_SECTIONS
     default:
       return null
+  }
+}
+
+export function resolveArtifactGenerator(artifactType) {
+  if (!SUPPORTED_GENERATION_TYPES.has(artifactType)) return null
+  return {
+    artifactType,
+    executionMode: 'atomic_section_child_units',
+    getSectionOutline: () => getArtifactSectionOutline(artifactType),
+    buildArtifactPrompt,
+    buildSectionPrompt: buildArtifactSectionPrompt,
+    buildChildPrompt: buildArtifactChildPrompt,
   }
 }
 
@@ -351,6 +551,9 @@ ${BASIS_CONTRACT}
 
 ARTIFACT TYPE: ${artifactBasis.artifactType}
 ARTIFACT INTENT: ${artifactBasis.artifactIntent}
+${resolveArtifactSpec(artifactItem.artifactType) ? `ARTIFACT SPEC PURPOSE: ${resolveArtifactSpec(artifactItem.artifactType).purpose}
+SME LENS: ${resolveArtifactSpec(artifactItem.artifactType).smeLens}
+ACCEPTANCE CHECKS: ${(resolveArtifactSpec(artifactItem.artifactType).acceptanceChecks || []).join('; ')}` : ''}
 
 REQUESTED SECTION:
 ${sectionDefToPrompt(sectionDef)}
@@ -377,12 +580,33 @@ ${SECTION_RESPONSE_SCHEMA}`
 
 export function deriveSectionChildDefs(sectionDef, artifactBasis) {
   if (sectionDef?.generationMode !== 'child_units') return []
+
+  // Static atoms: a fixed set of synthesis sub-prompts (no per-source-item mapping)
+  if (sectionDef.staticAtoms?.length) {
+    return sectionDef.staticAtoms.map(atom => ({
+      childId:         `${sectionDef.id}:${atom.atomId}`,
+      parentSectionId: sectionDef.id,
+      sourceItemId:    atom.atomId,
+      label:           atom.label,
+      atomType:        atom.atomType,
+      inputBasis:      atom.inputBasis,
+      sourceAtomRefs:  (artifactBasis?.sourceTraceability?.sourceAtomIds || []).slice(0, 4),
+      isStaticAtom:    true,
+      sourceItem:      null,
+    }))
+  }
+
+  // Source-item atoms: one atom per item in the childSource collection
   return sourceItemsForSection(sectionDef, artifactBasis).map((item, index) => ({
-    childId: `${sectionDef.id}:${item.id || item.optionId || index + 1}`,
+    childId:         `${sectionDef.id}:${item.id || item.optionId || index + 1}`,
     parentSectionId: sectionDef.id,
-    sourceItemId: item.id || item.optionId || `item_${index + 1}`,
-    label: childLabel(item, index),
-    sourceItem: item,
+    sourceItemId:    item.id || item.optionId || `item_${index + 1}`,
+    label:           childLabel(item, index),
+    atomType:        sectionDef.atomType || 'source_item',
+    inputBasis:      null,
+    sourceAtomRefs:  item.id ? [item.id] : [],
+    isStaticAtom:    false,
+    sourceItem:      item,
   }))
 }
 
@@ -394,15 +618,47 @@ export function buildArtifactChildPrompt(artifactItem, handoff, sectionDef, chil
     return { messages: null, isSupported: false, artifactBasis, sectionDef, childDef: null }
   }
 
-  const minimalContext = {
-    artifactType: artifactBasis.artifactType,
-    artifactIntent: artifactBasis.artifactIntent,
-    buName: artifactBasis.buName,
-    strategicThesis: artifactBasis.strategicThesis,
-    sourceTraceability: artifactBasis.sourceTraceability,
-  }
+  let userContent
 
-  const userContent = `${SYSTEM_PREAMBLE}
+  if (childDef.isStaticAtom) {
+    // Static synthesis atom: no source item — answer a specific generation directive from the full basis
+    const ctx = synthesisContextForBasis(artifactBasis)
+    userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate exactly one atom for Stage 4 artifact section "${sectionDef.heading}".
+
+${BASIS_CONTRACT}
+
+PARENT SECTION:
+${sectionDefToPrompt(sectionDef)}
+
+ATOM TO GENERATE:
+childId="${childDef.childId}" | label="${childDef.label}"
+Generation directive: ${childDef.inputBasis}
+${resolveArtifactSpec(artifactItem.artifactType) ? `Artifact-specific atom shape must satisfy: ${(resolveArtifactSpec(artifactItem.artifactType).sectionChildUnitSchema || []).join('; ')}` : ''}
+
+ARTIFACT BASIS (compact — use to answer the directive):
+${basisJson(ctx)}
+
+EXPLICIT EXCLUSIONS:
+- Answer the directive with specific named content from the basis — not generic strategy language.
+- Do not generate other atoms or sections.
+- Do not paste Stage 3 prose verbatim.
+- Do not restate the generation directive as prose.
+
+RESPONSE SCHEMA:
+${CHILD_RESPONSE_SCHEMA}`
+  } else {
+    // Source-item atom: one source item only — transform it into the section's atom format
+    const minimalContext = {
+      artifactType:       artifactBasis.artifactType,
+      artifactIntent:     artifactBasis.artifactIntent,
+      buName:             artifactBasis.buName,
+      strategicThesis:    artifactBasis.strategicThesis,
+      sourceTraceability: artifactBasis.sourceTraceability,
+    }
+
+    userContent = `${SYSTEM_PREAMBLE}
 
 TASK: Generate exactly one child item for a Stage 4 artifact section.
 
@@ -413,6 +669,7 @@ ${sectionDefToPrompt(sectionDef)}
 
 REQUESTED CHILD:
 childId="${childDef.childId}" | label="${childDef.label}"
+${resolveArtifactSpec(artifactItem.artifactType) ? `Artifact-specific atom shape must satisfy: ${(resolveArtifactSpec(artifactItem.artifactType).sectionChildUnitSchema || []).join('; ')}` : ''}
 
 ONE SOURCE ITEM ONLY:
 ${basisJson(childDef.sourceItem)}
@@ -428,6 +685,7 @@ EXPLICIT EXCLUSIONS:
 
 RESPONSE SCHEMA:
 ${CHILD_RESPONSE_SCHEMA}`
+  }
 
   return {
     messages: [{ role: 'user', content: userContent }],
@@ -653,14 +911,17 @@ export function generateMockArtifactSectionOutput(artifactItem, handoff, section
 }
 
 export function generateMockArtifactChildOutput(_artifactItem, _handoff, sectionDef, childDef) {
+  const body = childDef.isStaticAtom
+    ? `[Mock] ${childDef.label}: synthesised from artifact basis. Directive: ${(childDef.inputBasis || '').slice(0, 80)}…`
+    : `[Mock] ${childDef.label}: concise ${sectionDef.heading} item generated from one mapped source item.`
   return {
     child: {
-      childId: childDef.childId,
-      heading: childDef.label,
-      body: `[Mock] ${childDef.label}: concise ${sectionDef.heading} item generated from one mapped source item.`,
-      sourceAtomIds: [],
-      openQuestions: [`[Mock] What evidence confirms ${childDef.label}?`],
-      confidenceLevel: 'low',
+      childId:        childDef.childId,
+      heading:        childDef.label,
+      body,
+      sourceAtomIds:  [],
+      openQuestions:  [`[Mock] What evidence confirms ${childDef.label}?`],
+      confidenceLevel:'low',
     },
   }
 }

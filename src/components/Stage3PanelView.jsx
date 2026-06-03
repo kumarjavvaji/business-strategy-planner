@@ -7,7 +7,7 @@
  * Relies on stage3PanelModel.js for all audit logic (no duplication here).
  */
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import {
   PANEL_IDS, PANEL_LABELS, PANEL_ACCENTS, PANEL_AUDIT_STATUSES,
   CROSS_PANEL_QUALITY_STATUSES, REFINEMENT_STATUSES,
@@ -633,10 +633,22 @@ void PhaseDeliverableRow
  * Full deliverable mapping section for the Execution Sequence panel.
  * Shows phases as containers; each phase shows its how-options (or falls back to phase-level).
  */
-function ExecutionMappingSection({ panel, activeDeliverableId, onActiveDeliverableChange, onUpdateSelectedDeliverables, disabled }) {
+function ExecutionMappingSection({ panel, activeDeliverableId, onActiveDeliverableChange, onUpdateSelectedDeliverables, disabled, focusArtifactId = null }) {
   const content  = panel?.content
   const selectedRecords = getSelectedStage4Deliverables(panel)
   const selectedIds = selectedRecords.map(record => record.deliverableType)
+  const focusedRowRef = useRef(null)
+
+  useEffect(() => {
+    if (!focusArtifactId) return
+    if (selectedIds.includes(focusArtifactId) && activeDeliverableId !== focusArtifactId) {
+      onActiveDeliverableChange?.(focusArtifactId)
+    }
+    const el = focusedRowRef.current
+    if (el) {
+      requestAnimationFrame(() => el.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+    }
+  }, [focusArtifactId, selectedIds, activeDeliverableId, onActiveDeliverableChange])
 
   if (!Array.isArray(content) || content.length === 0) return null
 
@@ -675,11 +687,22 @@ function ExecutionMappingSection({ panel, activeDeliverableId, onActiveDeliverab
       <div style={{ display: 'grid', gap: 5, marginBottom: 8 }}>
         {STAGE4_DELIVERABLES.map(deliverable => {
           const selected = selectedIds.includes(deliverable.id)
+          const isFocused = deliverable.id === focusArtifactId
           const deliverableSummary = getDeliverableMappingSummary(panel, deliverable.id)
           return (
             <label
               key={deliverable.id}
-              style={{ display: 'grid', gridTemplateColumns: '14px minmax(0, 1fr) auto', gap: 6, alignItems: 'start', padding: '5px 6px', borderRadius: 4, border: `1px solid ${selected ? 'rgba(0,229,180,.35)' : 'var(--border)'}`, background: selected ? 'rgba(0,229,180,.05)' : 'transparent', cursor: disabled ? 'not-allowed' : 'pointer' }}
+              ref={isFocused ? focusedRowRef : null}
+              data-artifact-id={deliverable.id}
+              data-anchor-id={`stage3-artifact-mapping-${deliverable.id}`}
+              style={{
+                display: 'grid', gridTemplateColumns: '14px minmax(0, 1fr) auto', gap: 6,
+                alignItems: 'start', padding: '5px 6px', borderRadius: 4,
+                border: `1px solid ${isFocused ? 'rgba(249,115,22,.6)' : selected ? 'rgba(0,229,180,.35)' : 'var(--border)'}`,
+                background: isFocused ? 'rgba(249,115,22,.07)' : selected ? 'rgba(0,229,180,.05)' : 'transparent',
+                boxShadow: isFocused ? '0 0 0 2px rgba(249,115,22,.18)' : 'none',
+                cursor: disabled ? 'not-allowed' : 'pointer',
+              }}
             >
               <input
                 type="checkbox"
@@ -813,12 +836,21 @@ function ChildUnitProgressTracker({ panelId, childUnits = [], isRunning, onGener
 
 // ── Panel card ────────────────────────────────────────────────────────────────
 
-function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRefine, onGenerate, onAccept, onReject, hasApiKey, onUpdateHowOptionMapping, onUpdateSelectedDeliverables }) {
+function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRefine, onGenerate, onAccept, onReject, hasApiKey, onUpdateHowOptionMapping, onUpdateSelectedDeliverables, isFocused = false, focusArtifactId = null }) {
   const [expanded,        setExpanded]        = useState(false)
   const [showAudit,       setShowAudit]       = useState(false)
   const [showStrength,    setShowStrength]    = useState(false)
   const [showRefinement,  setShowRefinement]  = useState(false)
   const [showHistory,     setShowHistory]     = useState(false)
+  const cardRef = useRef(null)
+
+  useEffect(() => {
+    if (!isFocused) return
+    setExpanded(true)
+    requestAnimationFrame(() => {
+      cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [isFocused])
 
   const label   = PANEL_LABELS[panelId]
   const accent  = PANEL_ACCENTS[panelId] || '#00e5b4'
@@ -857,7 +889,19 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
   }, [panelId, onRefine])
 
   return (
-    <div style={{ border: `1px solid ${accent}33`, borderRadius: 5, overflow: 'hidden', background: 'var(--surface)', marginBottom: 6 }}>
+    <div
+      ref={cardRef}
+      data-panel-id={panelId}
+      data-anchor-id={`stage3-panel-${panelId}`}
+      style={{
+        border: `1px solid ${isFocused ? 'rgba(249,115,22,.6)' : `${accent}33`}`,
+        borderRadius: 5,
+        overflow: 'hidden',
+        background: 'var(--surface)',
+        marginBottom: 6,
+        boxShadow: isFocused ? '0 0 0 2px rgba(249,115,22,.14)' : 'none',
+      }}
+    >
       {/* Collapsed header — always visible */}
       <div
         onClick={() => setExpanded(e => !e)}
@@ -902,6 +946,7 @@ function PanelCard({ panelId, panel, crossPanelAudit, runningRefinementId, onRef
               onActiveDeliverableChange={setActiveDeliverableId}
               onUpdateSelectedDeliverables={onUpdateSelectedDeliverables}
               disabled={actionDisabled}
+              focusArtifactId={focusArtifactId}
             />
           )}
 
@@ -1172,7 +1217,7 @@ function ReadinessBanner({ readinessStatus }) {
  *   onRefinePanel       — ({ panelId, prompt, impactSummary }) => void
  *   hasApiKey           — boolean — whether to show refinement controls
  */
-export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey = false }) {
+export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey = false, focusPanelId = null, focusArtifactId = null }) {
   if (!panelModel?.panels) {
     return (
       <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', fontStyle: 'italic', padding: '8px 0' }}>
@@ -1201,6 +1246,8 @@ export function Stage3PanelView({ panelModel, runningRefinementId = null, onRefi
           onUpdateHowOptionMapping={onUpdateHowOptionMapping}
           onUpdateSelectedDeliverables={onUpdateSelectedStage4Deliverables}
           hasApiKey={hasApiKey}
+          isFocused={panelId === focusPanelId}
+          focusArtifactId={panelId === 'executionSequence' ? focusArtifactId : null}
         />
       ))}
     </div>

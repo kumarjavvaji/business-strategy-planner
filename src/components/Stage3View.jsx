@@ -55,6 +55,18 @@ import {
   HANDOFF_STATUS as S4_STATUS,
 } from '../utils/stage4Handoff'
 import {
+  buildStaleImpactMap,
+  overallStaleSeverity,
+  staleImpactBlocksStage4,
+  STALE_SEVERITY,
+  PANEL_LABELS as STALE_PANEL_LABELS,
+} from '../utils/stage3StalenessImpact'
+import { computeArtifactReadinessForBu } from '../utils/stage4ArtifactBasis'
+import {
+  STAGE4_READINESS_TARGETS,
+  buildArtifactReadinessDeepLinkTarget,
+} from '../utils/stage4ReadinessNavigation'
+import {
   buildCompiledCriticalDecisions as _buildCompiledCriticalDecisions,
   buildCompiledDependencies as _buildCompiledDependencies,
   buildCompiledRisks as _buildCompiledRisks,
@@ -3028,14 +3040,50 @@ function Stage3ReadinessPanels({
   onCaptureImport = null,
   idbReady = false,
   onPersistPanelModel = null,
+  deepLinkTarget = null,
 }) {
   const [open, setOpen] = useState({})
   // Per-BU: whether "Operational Setup" (handoff readiness + generate + brief) is expanded
   // Defaults collapsed when a plan exists, open when no plan yet
   const [opsOpen, setOpsOpen] = useState({})
+  const buCardRefs = useRef({})
+
+  const dlBuId             = deepLinkTarget?.buId || deepLinkTarget?.buName || null
+  const dlBuName           = deepLinkTarget?.buName || null
+  const dlFocusPanelId     = deepLinkTarget?.panelId === STAGE4_READINESS_TARGETS.QUALITY_AUDIT ? null : deepLinkTarget?.panelId || null
+  const dlFocusArtifactId  = deepLinkTarget?.panelId === 'executionSequence' ? deepLinkTarget?.artifactId || null : null
+  const dlFocusQualityAudit = deepLinkTarget?.panelId === STAGE4_READINESS_TARGETS.QUALITY_AUDIT
+  const dlFocusBuSummary    = deepLinkTarget?.panelId === STAGE4_READINESS_TARGETS.BU_SUMMARY
+
+  useEffect(() => {
+    if (!dlBuId && !dlBuName) return
+    const key = dlBuName || dlBuId
+    setOpen(prev => ({ ...prev, [key]: true }))
+    requestAnimationFrame(() => {
+      const el = buCardRefs.current[key] || buCardRefs.current[dlBuId]
+      el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [dlBuId, dlBuName, deepLinkTarget?.anchorId])
   // Per-BU: refine panel state
   const [refineState, setRefineState] = useState({})
   const completedCount = rows.filter(row => planDrafts[row.unit.name]?.plan).length
+
+  // Lock Operational Setup open for any BU that is currently generating so the panel
+  // does not auto-collapse when hasPlan transitions false→true during generation.
+  useEffect(() => {
+    setOpsOpen(prev => {
+      let changed = false
+      const next = { ...prev }
+      rows.forEach(({ unit }) => {
+        const gen = planGeneration[unit.name]
+        if (gen?.running && next[unit.name] === undefined) {
+          next[unit.name] = true
+          changed = true
+        }
+      })
+      return changed ? next : prev
+    })
+  }, [planGeneration, rows])
 
   const modeFor = (readiness, optIn) => {
     if (readiness.completion === 'full') {
@@ -3150,9 +3198,22 @@ function Stage3ReadinessPanels({
         const missingItems = handoffItems.filter(item => !item.parsedValue && !Object.keys(item.childAtoms || {}).length && item.status !== 'complete')
 
         return (
-          <div key={unit.name || idx} style={{
+          <div
+            key={unit.name || idx}
+            ref={el => {
+              buCardRefs.current[unit.name] = el
+              if (unit.id) buCardRefs.current[unit.id] = el
+            }}
+            data-bu-id={unit.id || unit.name}
+            data-anchor-id={`stage3-bu-${unit.id || unit.name}`}
+            style={{
             background: 'var(--surface)',
-            border: '1px solid var(--border)',
+            border: dlFocusBuSummary && (dlBuName === unit.name || dlBuId === unit.id || dlBuId === unit.name)
+              ? '1px solid rgba(245,158,11,.55)'
+              : '1px solid var(--border)',
+            boxShadow: dlFocusBuSummary && (dlBuName === unit.name || dlBuId === unit.id || dlBuId === unit.name)
+              ? '0 0 0 2px rgba(245,158,11,.15)'
+              : 'none',
             borderRadius: 'var(--r)',
             marginBottom: 8,
             overflow: 'hidden',
@@ -3278,7 +3339,9 @@ function Stage3ReadinessPanels({
 
                 {/* Operational Setup — collapsed by default when plan exists */}
                 {(() => {
-                  const opsIsOpen = opsOpen[unit.name] !== undefined ? opsOpen[unit.name] : !hasPlan
+                  const opsIsOpen = opsOpen[unit.name] !== undefined
+                    ? opsOpen[unit.name]
+                    : (!hasPlan || !!gen?.running)
                   return (
                     <div style={{ border: '1px solid var(--border)', borderRadius: 5, marginBottom: 12, overflow: 'hidden' }}>
                       <div
@@ -3496,25 +3559,13 @@ function Stage3ReadinessPanels({
                     showHandoffBrief={false}
                     generationState={gen}
                     onPanelModelChange={nextPanelModel => onPersistPanelModel?.(unit.name, nextPanelModel)}
+                    focusPanelId={(dlBuName === unit.name || dlBuId === unit.id || dlBuId === unit.name) ? dlFocusPanelId : null}
+                    focusArtifactId={(dlBuName === unit.name || dlBuId === unit.id || dlBuId === unit.name) ? dlFocusArtifactId : null}
+                    focusQualityAudit={(dlBuName === unit.name || dlBuId === unit.id || dlBuId === unit.name) ? dlFocusQualityAudit : false}
                   />
                 )}
 
-                {/* Stage 2 actions — kept for operators but not the primary reading path */}
-                {handoffItems.length > 0 && !(draft || legacyPlan) && (
-                  <div style={{ marginTop: 4 }}>
-                    <SectionLabel>Source References</SectionLabel>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                      {handoffItems.map((item, itemIdx) => (
-                        <HandoffItemRow
-                          key={`${item.key}-${itemIdx}`}
-                          item={item}
-                          unitName={unit.name}
-                          onStage2Action={onStage2Action}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )}
+                {/* Source References hidden — evidenceRefs data preserved in handoff brief for internal traceability */}
               </div>
             )}
           </div>
@@ -4584,14 +4635,24 @@ function buildStage3CompiledStrategyQualityAudit(compiledPlan, handoffCoverageAu
     ? auditPass(ruleById.handoff_classification, { classifiedCount, warnings: handoffCoverageAudit?.warnings?.length || 0 })
     : auditFail(ruleById.handoff_classification, 'No handoff content was classified.'))
 
-  const truncated = /\.\.\.|…/.test(compiledText(compiledPlan))
-  results.push(truncated
-    ? auditFail(ruleById.no_truncated_strategy_text, 'Compiled strategy text contains truncation markers.')
+  // Scan each compiled section individually so the violation can name the exact sections.
+  const COMPILED_SECTION_KEYS = ['strategicObjective', 'criticalDecisions', 'executionSequence', 'dependencies', 'risksAndMitigations', 'validationFramework']
+  const truncatedSections = COMPILED_SECTION_KEYS.filter(key => {
+    const section = compiledPlan?.[key]
+    return section && /\.\.\.|…/.test(compiledText(section))
+  })
+  results.push(truncatedSections.length
+    ? auditFail(ruleById.no_truncated_strategy_text,
+        `Compiled strategy text contains truncation markers in: ${truncatedSections.join(', ')}.`,
+        { truncatedSections, remediationHint: 'Identify the source atoms for the named sections and run targeted atom regeneration — do not regenerate all accepted atoms.' })
     : auditPass(ruleById.no_truncated_strategy_text))
 
   const repeats = repeatedCompiledTextItems(compiledPlan)
   results.push(repeats.length
-    ? auditFail(ruleById.reduce_repetition, 'Repeated content appears across compiled strategy sections.', { repeats })
+    ? auditFail(ruleById.reduce_repetition, 'Repeated content appears across compiled strategy sections.', {
+        repeats,
+        remediationHint: 'Apply compile-layer deduplification: refine the repeated sections or remove identical phrases from the compiler output rather than regenerating source atoms.',
+      })
     : auditPass(ruleById.reduce_repetition))
 
   if (ruleById.field_distinctness) {
@@ -4746,43 +4807,179 @@ function CompiledStrategyProvenancePanel({ provenance }) {
   )
 }
 
+// D23 — remediation action labels mapped to a display colour
+const LOSS_REMEDIATION_ACTIONS = [
+  { id: 'convert_dependency',  label: 'Convert to dependency',           color: '#fb923c' },
+  { id: 'convert_risk',        label: 'Convert to risk',                 color: '#f87171' },
+  { id: 'convert_validation',  label: 'Convert to validation checkpoint', color: '#a3e635' },
+  { id: 'source_only',         label: 'Attach as source-only evidence',  color: '#3b82f6' },
+  { id: 'dismiss',             label: 'Dismiss with reason',             color: '#6b7280' },
+]
+
 function HandoffCoverageAuditView({ audit }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen]           = useState(false)
+  // D23 — per-loss remediation state keyed by loss index
+  // shape: { [idx]: { action: string, reason: string, at: iso } }
+  const [remediations, setRemediations] = useState({})
+  // Track which loss is showing the dismiss-reason input
+  const [dismissingIdx, setDismissingIdx] = useState(null)
+  const [dismissReason, setDismissReason] = useState('')
+
   if (!audit) return null
-  const counts = [['used in compiled strategy', audit.usedInCompiledStrategy.length], ['compressed into spine', audit.compressedIntoSpine.length], ['represented as dependencies', audit.representedAsDependency.length], ['represented as risks', audit.representedAsRisk.length], ['represented as validation', audit.representedAsValidation.length], ['deferred to coordination', audit.deferredToCoordination.length], ['deferred to Stage 4', audit.deferredToStage4.length], ['source-only', audit.sourceOnlyEvidence.length], ['unclassified', audit.unclassified?.length || 0], ['possible losses', audit.possibleLosses.length]]
+
+  const unresolvedLosses = audit.possibleLosses.filter((_, idx) => !remediations[idx])
+  const resolvedCount    = audit.possibleLosses.length - unresolvedLosses.length
+
+  const counts = [
+    ['used in compiled strategy', audit.usedInCompiledStrategy.length],
+    ['compressed into spine', audit.compressedIntoSpine.length],
+    ['represented as dependencies', audit.representedAsDependency.length],
+    ['represented as risks', audit.representedAsRisk.length],
+    ['represented as validation', audit.representedAsValidation.length],
+    ['deferred to coordination', audit.deferredToCoordination.length],
+    ['deferred to Stage 4', audit.deferredToStage4.length],
+    ['source-only', audit.sourceOnlyEvidence.length],
+    ['unclassified', audit.unclassified?.length || 0],
+    ['possible losses', unresolvedLosses.length],
+  ]
+
+  function handleRemediate(idx, actionId) {
+    if (actionId === 'dismiss') {
+      setDismissingIdx(idx)
+      setDismissReason('')
+    } else {
+      setRemediations(prev => ({ ...prev, [idx]: { action: actionId, at: new Date().toISOString() } }))
+    }
+  }
+
+  function confirmDismiss(idx) {
+    setRemediations(prev => ({ ...prev, [idx]: { action: 'dismiss', reason: dismissReason.trim() || '(no reason given)', at: new Date().toISOString() } }))
+    setDismissingIdx(null)
+    setDismissReason('')
+  }
+
+  const fm = 'var(--fm)'
+
   return (
     <div style={{ border: '1px solid rgba(251,146,60,.35)', borderRadius: 5, overflow: 'hidden' }}>
       <div onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '8px 10px', background: 'rgba(251,146,60,.06)' }}>
-        <div style={{ flex: 1 }}><div style={{ fontSize: 10, fontWeight: 700, color: '#fb923c' }}>Handoff Coverage</div><div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)' }}>{audit.possibleLosses.length} possible loss{audit.possibleLosses.length === 1 ? '' : 'es'} flagged</div></div>
-        <span style={{ fontSize: 7, color: 'var(--muted)' }}>{open ? 'hide' : 'show'}</span>
-      </div>
-      {open && <div style={{ padding: '9px 10px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 9 }}>
-        {audit.warnings?.length > 0 && <TinyList items={audit.warnings} dot="#fb923c" />}
-        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>{counts.map(([label, count]) => <Badge key={label} color={label === 'possible losses' && count ? '#f87171' : '#fb923c'} small>{count} {label}</Badge>)}</div>
-        <div style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '7px 8px', background: 'var(--s2)' }}>
-          <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>Coverage Audit Data Sources</div>
-          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.stage2HandoffItems ?? 0} Stage 2 handoff items</Badge>
-            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.sourceRefs ?? 0} source refs</Badge>
-            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.compiledStrategyText ?? 0} compiled text chars</Badge>
-            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.spineText ?? 0} spine items</Badge>
-            <Badge color="#fb923c" small>{audit.dataSourcesUsed?.atomizedText ?? 0} atomized bullets</Badge>
-          </div>
-          <div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: 'var(--muted)', marginTop: 5 }}>
-            coverageAuditAt {audit.coverageAuditAt || 'not available'}
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: '#fb923c' }}>Handoff Coverage</div>
+          <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)' }}>
+            {unresolvedLosses.length} possible loss{unresolvedLosses.length === 1 ? '' : 'es'} flagged
+            {resolvedCount > 0 && ` · ${resolvedCount} remediated`}
           </div>
         </div>
-        {audit.possibleLosses.length > 0 && <div><div style={{ fontSize: 8, fontFamily: 'var(--fm)', color: '#f87171', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>Possible Losses</div>{audit.possibleLosses.map((loss, idx) => <div key={idx} style={{ border: '1px solid rgba(248,113,113,.28)', borderRadius: 4, padding: '7px 8px', marginBottom: 6, background: 'rgba(248,113,113,.05)' }}><div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 3 }}>{loss.sourceItemTitle}</div><LabeledText label="summary" value={loss.summary} /><LabeledText label="why it may matter" value={loss.whyItMayMatter} /><LabeledText label="recommended action" value={loss.recommendedAction} /></div>)}</div>}
-      </div>}
+        <span style={{ fontSize: 7, color: 'var(--muted)' }}>{open ? 'hide' : 'show'}</span>
+      </div>
+      {open && (
+        <div style={{ padding: '9px 10px', background: 'var(--surface)', display: 'flex', flexDirection: 'column', gap: 9 }}>
+          {audit.warnings?.length > 0 && <TinyList items={audit.warnings} dot="#fb923c" />}
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+            {counts.map(([label, count]) => (
+              <Badge key={label} color={label === 'possible losses' && count ? '#f87171' : '#fb923c'} small>{count} {label}</Badge>
+            ))}
+          </div>
+          <div style={{ border: '1px solid var(--border)', borderRadius: 4, padding: '7px 8px', background: 'var(--s2)' }}>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>Coverage Audit Data Sources</div>
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+              <Badge color="#fb923c" small>{audit.dataSourcesUsed?.stage2HandoffItems ?? 0} Stage 2 handoff items</Badge>
+              <Badge color="#fb923c" small>{audit.dataSourcesUsed?.sourceRefs ?? 0} source refs</Badge>
+              <Badge color="#fb923c" small>{audit.dataSourcesUsed?.compiledStrategyText ?? 0} compiled text chars</Badge>
+              <Badge color="#fb923c" small>{audit.dataSourcesUsed?.spineText ?? 0} spine items</Badge>
+              <Badge color="#fb923c" small>{audit.dataSourcesUsed?.atomizedText ?? 0} atomized bullets</Badge>
+            </div>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginTop: 5 }}>
+              coverageAuditAt {audit.coverageAuditAt || 'not available'}
+            </div>
+          </div>
+          {/* D23 — possible losses with concrete remediation actions */}
+          {audit.possibleLosses.length > 0 && (
+            <div>
+              <div style={{ fontSize: 8, fontFamily: fm, color: '#f87171', textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 5 }}>
+                Possible Losses — select a remediation action for each item
+              </div>
+              {audit.possibleLosses.map((loss, idx) => {
+                const remediation = remediations[idx]
+                const actionCfg = LOSS_REMEDIATION_ACTIONS.find(a => a.id === remediation?.action)
+                return (
+                  <div key={idx} style={{
+                    border: `1px solid ${remediation ? 'rgba(0,229,180,.28)' : 'rgba(248,113,113,.28)'}`,
+                    borderRadius: 4, padding: '7px 8px', marginBottom: 6,
+                    background: remediation ? 'rgba(0,229,180,.04)' : 'rgba(248,113,113,.05)',
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 4 }}>
+                      <div style={{ flex: 1, fontSize: 9, fontWeight: 700, color: 'var(--text)' }}>{loss.sourceItemTitle}</div>
+                      {remediation && (
+                        <span style={{ fontSize: 8, fontFamily: fm, fontWeight: 600, color: actionCfg?.color || '#00e5b4', background: `${actionCfg?.color || '#00e5b4'}18`, border: `1px solid ${actionCfg?.color || '#00e5b4'}44`, borderRadius: 3, padding: '1px 6px', whiteSpace: 'nowrap' }}>
+                          ✓ {actionCfg?.label || remediation.action}
+                          {remediation.reason ? ` — ${remediation.reason}` : ''}
+                        </span>
+                      )}
+                    </div>
+                    {!remediation && (
+                      <>
+                        <LabeledText label="summary" value={loss.summary} />
+                        <LabeledText label="why it may matter" value={loss.whyItMayMatter} />
+                        <LabeledText label="recommended action" value={loss.recommendedAction} />
+                        {/* Dismiss-reason input */}
+                        {dismissingIdx === idx ? (
+                          <div style={{ display: 'flex', gap: 5, alignItems: 'center', marginTop: 6 }}>
+                            <input
+                              value={dismissReason}
+                              onChange={e => setDismissReason(e.target.value)}
+                              placeholder="Reason for dismissal…"
+                              style={{ flex: 1, fontSize: 8, fontFamily: fm, padding: '4px 6px', borderRadius: 3, border: '1px solid var(--border)', background: 'var(--s2)', color: 'var(--text)' }}
+                              autoFocus
+                            />
+                            <button onClick={() => confirmDismiss(idx)} style={{ fontSize: 8, fontFamily: fm, padding: '4px 10px', borderRadius: 3, cursor: 'pointer', background: '#6b728018', border: '1px solid #6b728044', color: 'var(--muted2)' }}>
+                              Confirm dismiss
+                            </button>
+                            <button onClick={() => { setDismissingIdx(null); setDismissReason('') }} style={{ fontSize: 8, fontFamily: fm, padding: '4px 8px', borderRadius: 3, cursor: 'pointer', background: 'var(--s2)', border: '1px solid var(--border)', color: 'var(--muted)' }}>
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 6 }}>
+                            {LOSS_REMEDIATION_ACTIONS.map(a => (
+                              <button
+                                key={a.id}
+                                onClick={() => handleRemediate(idx, a.id)}
+                                style={{ fontSize: 8, fontFamily: fm, padding: '3px 9px', borderRadius: 3, cursor: 'pointer', background: `${a.color}14`, border: `1px solid ${a.color}40`, color: a.color }}
+                              >
+                                {a.label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
 
-function Stage3CompiledQualityAuditView({ audit }) {
+function Stage3CompiledQualityAuditView({ audit, autoOpen = false }) {
   const [open, setOpen] = useState(false)
+  const containerRef = useRef(null)
+
+  useEffect(() => {
+    if (!autoOpen) return
+    setOpen(true)
+    requestAnimationFrame(() => {
+      containerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [autoOpen])
+
   if (!audit) return null
   return (
-    <div style={{ border: '1px solid rgba(59,130,246,.32)', borderRadius: 5, overflow: 'hidden' }}>
+    <div ref={containerRef} style={{ border: '1px solid rgba(59,130,246,.32)', borderRadius: 5, overflow: 'hidden' }}>
       <div onClick={() => setOpen(o => !o)} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '8px 10px', background: 'rgba(59,130,246,.06)' }}>
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 10, fontWeight: 700, color: '#3b82f6' }}>Compiled Strategy Quality Audit</div>
@@ -4815,7 +5012,18 @@ function Stage3CompiledQualityAuditView({ audit }) {
                 <div key={result.ruleId} style={{ border: '1px solid rgba(248,113,113,.28)', borderRadius: 4, padding: '7px 8px', marginBottom: 6, background: 'rgba(248,113,113,.05)' }}>
                   <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text)', marginBottom: 3 }}>{result.label}</div>
                   <LabeledText label="finding" value={result.message} />
-                  {result.details && Object.keys(result.details).length > 0 && (
+                  {/* D24: show exact sections for truncation and repetition violations */}
+                  {result.details?.truncatedSections?.length > 0 && (
+                    <LabeledText label="sections with truncation" value={result.details.truncatedSections.join(', ')} />
+                  )}
+                  {result.details?.repeats?.length > 0 && (
+                    <LabeledText label="repeated text blocks" value={`${result.details.repeats.length} repeated block${result.details.repeats.length === 1 ? '' : 's'} detected`} />
+                  )}
+                  {result.details?.remediationHint && (
+                    <LabeledText label="remediation" value={result.details.remediationHint} />
+                  )}
+                  {/* Show non-hint details when present */}
+                  {result.details && !result.details.truncatedSections && !result.details.repeats && !result.details.remediationHint && Object.keys(result.details).length > 0 && (
                     <LabeledText label="details" value={compiledText(result.details)} />
                   )}
                 </div>
@@ -4837,7 +5045,7 @@ function Stage3CompiledQualityAuditView({ audit }) {
   )
 }
 
-function CompiledStrategyView({ compiled, audit, qualityAudit, provenance, panelModel, runningRefinementId, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdatePhaseMapping, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey: apiKeyAvailable }) {
+function CompiledStrategyView({ compiled, audit, qualityAudit, provenance, panelModel, runningRefinementId, onRefinePanel, onGeneratePanel, onAcceptPanel, onRejectPanel, onUpdatePhaseMapping, onUpdateHowOptionMapping, onUpdateSelectedStage4Deliverables, hasApiKey: apiKeyAvailable, focusPanelId = null, focusArtifactId = null, focusQualityAudit = false }) {
   if (!compiled) return null
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -4854,9 +5062,11 @@ function CompiledStrategyView({ compiled, audit, qualityAudit, provenance, panel
         onUpdateHowOptionMapping={onUpdateHowOptionMapping}
         onUpdateSelectedStage4Deliverables={onUpdateSelectedStage4Deliverables}
         hasApiKey={apiKeyAvailable}
+        focusPanelId={focusPanelId}
+        focusArtifactId={focusArtifactId}
       />
       <HandoffCoverageAuditView audit={audit} />
-      <Stage3CompiledQualityAuditView audit={qualityAudit} />
+      <Stage3CompiledQualityAuditView audit={qualityAudit} autoOpen={focusQualityAudit} />
     </div>
   )
 }
@@ -4872,7 +5082,7 @@ function apiResponseTruncationReason(response) {
   return null
 }
 
-function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], unitName, onStage2Action, showHandoffBrief = true, generationState = null, onPanelModelChange }) {
+function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], unitName, onStage2Action, showHandoffBrief = true, generationState = null, onPanelModelChange, focusPanelId = null, focusArtifactId = null, focusQualityAudit = false }) {
   const [viewMode,       setViewMode]       = useState('compiled')
   const [briefOpen,      setBriefOpen]      = useState(true)
   const [spineOpen,      setSpineOpen]      = useState(true)
@@ -4884,6 +5094,10 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], 
   const [openSpineRaw,   setOpenSpineRaw]   = useState({})
 
   const resolvedExecutionDraft = React.useMemo(() => resolveExecutionDraftSource(draft, legacyPlan), [draft, legacyPlan])
+
+  useEffect(() => {
+    if (focusPanelId || focusArtifactId || focusQualityAudit) setViewMode('compiled')
+  }, [focusPanelId, focusArtifactId, focusQualityAudit])
 
   const tree = React.useMemo(() => {
     if (!resolvedExecutionDraft.atoms?.length) return null
@@ -5368,6 +5582,9 @@ function Stage3BUPlanTree({ draft, legacyPlan, handoffBrief, handoffItems = [], 
             onUpdateHowOptionMapping={handleUpdateHowOptionMapping}
             onUpdateSelectedStage4Deliverables={handleUpdateSelectedStage4Deliverables}
             hasApiKey={hasApiKey()}
+            focusPanelId={focusPanelId}
+            focusArtifactId={focusArtifactId}
+            focusQualityAudit={focusQualityAudit}
           />
         </>
       ) : (
@@ -6088,11 +6305,22 @@ function PrepareStage4HandoffPanel({
   idbReady,
   onNavigateToStage4,
   stage3ActiveRevision,   // { id, contentSnapshot, sourceBasisRevisionId, sourceStage2RevisionId }
+  isStale = false,        // D25: Stage 3 is upstream_stale when its source Stage 1/2 IDs don't match
+  staleReason = null,     // D25: which upstream changed ('Stage 1' | 'Stage 2')
+  staleImpactMap = null,  // D26/D27: BU+panel-level impact classification (from buildStaleImpactMap)
+  onDeepLink = null,      // (row, targetType?) => void
 }) {
   const [phase, setPhase]     = useState(S4_PHASE.NOT_READY)
   const [handoff, setHandoff] = useState(null)
   const [error, setError]     = useState(null)
+  const [impactExpanded, setImpactExpanded] = useState(false)
   const preparingRef          = React.useRef(false)
+
+  // D26/D27: overall severity from the impact map (null when not stale)
+  const overallSeverity = staleImpactMap ? overallStaleSeverity(staleImpactMap) : null
+  const isHardStale     = overallSeverity === STALE_SEVERITY.MATERIALLY_STALE || overallSeverity === STALE_SEVERITY.UNKNOWN_IMPACT
+  const isReviewOnly    = overallSeverity === STALE_SEVERITY.REVIEW_RECOMMENDED
+  const isUnaffected    = overallSeverity === STALE_SEVERITY.UNAFFECTED
 
   const hasRequiredIds = !!(workspaceId && stage1ActiveId && stage2ActiveId && stage3ActiveId)
   const buNames = orderedStage2BUs.map(bu => bu.name).filter(Boolean)
@@ -6278,20 +6506,350 @@ function PrepareStage4HandoffPanel({
           </div>
         )}
 
+        {/* D26/D27 — Impact-aware upstream stale banner */}
+        {phase === S4_PHASE.VERIFIED && isStale && !isUnaffected && (
+          <div style={{
+            padding: '10px 12px', marginBottom: 10,
+            background: isHardStale ? 'rgba(251,146,60,.07)' : 'rgba(251,191,36,.06)',
+            border: `1px solid ${isHardStale ? 'rgba(251,146,60,.4)' : 'rgba(251,191,36,.35)'}`,
+            borderRadius: 5, fontSize: 9, fontFamily: fm, lineHeight: 1.6,
+          }}>
+            <div style={{ fontWeight: 700, color: isHardStale ? '#fb923c' : '#f59e0b', marginBottom: 3, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span>
+                {isHardStale ? '⚠ Handoff basis is upstream_stale' : '◑ Upstream changed — review recommended'}
+              </span>
+              {staleImpactMap?.buImpacts?.length > 0 && (
+                <button
+                  onClick={() => setImpactExpanded(e => !e)}
+                  style={{
+                    fontSize: 8, fontFamily: fm, fontWeight: 600,
+                    background: 'transparent', border: '1px solid currentColor',
+                    borderRadius: 3, padding: '2px 7px', cursor: 'pointer',
+                    color: isHardStale ? '#fb923c' : '#f59e0b',
+                  }}
+                >
+                  {impactExpanded ? 'Hide details' : 'Show impact'}
+                </button>
+              )}
+            </div>
+
+            {/* Summary line */}
+            <div style={{ color: 'var(--muted2)', marginBottom: 4 }}>
+              {staleReason ? `${staleReason} has` : 'Upstream source has'} changed since this handoff was compiled.
+              {isHardStale
+                ? ' Material assumption changes detected — recompile before generating Stage 4 artifacts.'
+                : ' No material assumption changes detected — review is recommended but regeneration is not required.'}
+            </div>
+
+            {/* Impact summary counts */}
+            {staleImpactMap?.summary && (
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
+                {staleImpactMap.summary.materiallyStaleBUs.length > 0 && (
+                  <span style={{ fontSize: 8, fontFamily: fm, color: '#f87171', background: 'rgba(248,113,113,.1)', border: '1px solid rgba(248,113,113,.3)', borderRadius: 3, padding: '1px 6px' }}>
+                    {staleImpactMap.summary.materiallyStaleBUs.length} materially stale BU{staleImpactMap.summary.materiallyStaleBUs.length !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {staleImpactMap.summary.reviewRecommendedBUs.length > 0 && (
+                  <span style={{ fontSize: 8, fontFamily: fm, color: '#f59e0b', background: 'rgba(245,158,11,.1)', border: '1px solid rgba(245,158,11,.3)', borderRadius: 3, padding: '1px 6px' }}>
+                    {staleImpactMap.summary.reviewRecommendedBUs.length} review-recommended BU{staleImpactMap.summary.reviewRecommendedBUs.length !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {staleImpactMap.summary.unaffectedBUs.length > 0 && (
+                  <span style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', background: 'rgba(107,114,128,.08)', border: '1px solid rgba(107,114,128,.2)', borderRadius: 3, padding: '1px 6px' }}>
+                    {staleImpactMap.summary.unaffectedBUs.length} unaffected BU{staleImpactMap.summary.unaffectedBUs.length !== 1 ? 's' : ''}
+                  </span>
+                )}
+                {staleImpactMap.summary.unknownBUs.length > 0 && (
+                  <span style={{ fontSize: 8, fontFamily: fm, color: '#a78bfa', background: 'rgba(167,139,250,.08)', border: '1px solid rgba(167,139,250,.2)', borderRadius: 3, padding: '1px 6px' }}>
+                    {staleImpactMap.summary.unknownBUs.length} unknown impact
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Expandable per-BU impact table */}
+            {impactExpanded && staleImpactMap?.buImpacts?.length > 0 && (
+              <div style={{ marginTop: 8, borderTop: '1px solid rgba(107,114,128,.2)', paddingTop: 8 }}>
+                <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 6 }}>
+                  Per-BU Impact
+                </div>
+                {staleImpactMap.buImpacts.map(buImpact => {
+                  const severityColor = buImpact.severity === STALE_SEVERITY.MATERIALLY_STALE ? '#f87171'
+                    : buImpact.severity === STALE_SEVERITY.REVIEW_RECOMMENDED ? '#f59e0b'
+                    : buImpact.severity === STALE_SEVERITY.UNKNOWN_IMPACT ? '#a78bfa'
+                    : 'var(--muted)'
+                  const severityLabel = buImpact.severity === STALE_SEVERITY.MATERIALLY_STALE ? 'materially stale'
+                    : buImpact.severity === STALE_SEVERITY.REVIEW_RECOMMENDED ? 'review recommended'
+                    : buImpact.severity === STALE_SEVERITY.UNKNOWN_IMPACT ? 'unknown impact'
+                    : 'unaffected'
+                  // Panels materially stale for this BU
+                  const stalePanels = (staleImpactMap.panelImpacts || [])
+                    .filter(p => p.buName === buImpact.buName && p.severity === STALE_SEVERITY.MATERIALLY_STALE)
+                    .map(p => STALE_PANEL_LABELS[p.panelId] || p.panelId)
+                  return (
+                    <div key={buImpact.buName} style={{
+                      padding: '5px 7px', marginBottom: 4,
+                      background: 'var(--s1)', borderRadius: 3,
+                      border: '1px solid var(--border)',
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+                        <span style={{ fontWeight: 600, color: 'var(--fg)', fontSize: 8 }}>{buImpact.buName}</span>
+                        <span style={{ fontSize: 7, fontFamily: fm, color: severityColor, background: `${severityColor}18`, border: `1px solid ${severityColor}44`, borderRadius: 3, padding: '1px 5px', whiteSpace: 'nowrap' }}>
+                          {severityLabel}
+                        </span>
+                      </div>
+                      {buImpact.impactedAssumption && (
+                        <div style={{ fontSize: 8, color: 'var(--muted2)', marginTop: 2 }}>
+                          Impacted assumptions: {(buImpact.changedAssumptions || []).join(', ') || buImpact.impactedAssumption}
+                        </div>
+                      )}
+                      {!buImpact.impactedAssumption && (
+                        <div style={{ fontSize: 8, color: 'var(--muted)', marginTop: 2 }}>
+                          Impacted assumptions: none detected
+                        </div>
+                      )}
+                      {/* Affected panels (non-empty only for materially_stale) */}
+                      {buImpact.affectedPanels?.length > 0 ? (
+                        <div style={{ fontSize: 8, color: '#f87171', marginTop: 2 }}>
+                          Affected panels: {buImpact.affectedPanels.map(pid => STALE_PANEL_LABELS[pid] || pid).join(', ')}
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: 8, color: 'var(--muted)', marginTop: 2 }}>
+                          Affected panels: none
+                        </div>
+                      )}
+                      {/* Review targets for review_recommended / unknown */}
+                      {buImpact.reviewTargets?.length > 0 && (
+                        <div style={{ fontSize: 8, color: '#f59e0b', marginTop: 2 }}>
+                          Review targets: {buImpact.reviewTargets.join(' · ')}
+                        </div>
+                      )}
+                      {stalePanels.length > 0 && (
+                        <div style={{ fontSize: 8, color: '#f87171', marginTop: 2 }}>
+                          Stale panels (from panel impact): {stalePanels.join(', ')}
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+                <div style={{ fontSize: 8, color: 'var(--muted)', marginTop: 6 }}>
+                  {isHardStale
+                    ? 'Recompile the handoff after regenerating affected BU plans (section D above).'
+                    : 'Review recommended — regeneration not required unless specific assumptions are affected.'}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Verified summary */}
         {phase === S4_PHASE.VERIFIED && handoff && (
           <div style={{
             padding: '8px 12px', marginBottom: 10,
-            background: 'rgba(0,229,180,.06)', border: '1px solid rgba(0,229,180,.25)',
-            borderRadius: 5, fontSize: 9, fontFamily: fm, color: '#00e5b4', lineHeight: 1.5,
+            background: isHardStale ? 'rgba(251,146,60,.05)' : isReviewOnly ? 'rgba(245,158,11,.04)' : 'rgba(0,229,180,.06)',
+            border: `1px solid ${isHardStale ? 'rgba(251,146,60,.25)' : isReviewOnly ? 'rgba(245,158,11,.22)' : 'rgba(0,229,180,.25)'}`,
+            borderRadius: 5, fontSize: 9, fontFamily: fm,
+            color: isHardStale ? '#fb923c' : isReviewOnly ? '#f59e0b' : '#00e5b4', lineHeight: 1.5,
           }}>
-            ✓ Verified from storage
+            {isHardStale ? '⚠ Verified from storage (materially stale basis)' : isReviewOnly ? '◑ Verified from storage (review recommended)' : '✓ Verified from storage'}
             {' · '}{handoff.readyCount} ready · {handoff.partialCount} partial · {handoff.blockedCount} blocked / {handoff.totalCount} BUs
             <br />
             Compiled {new Date(handoff.compiledAt).toLocaleString()}
             {' · '}Persisted {new Date(handoff.persistedAt).toLocaleString()}
           </div>
         )}
+
+        {/* D28 — Stage 4 Artifact Readiness for each BU */}
+        {phase === S4_PHASE.VERIFIED && handoff && handoff.buHandoffs?.length > 0 && (() => {
+          // Compute readiness records for all BUs that have selected deliverables
+          const allReadiness = handoff.buHandoffs.flatMap(buHandoff => {
+            const buImpact = staleImpactMap
+              ? staleImpactMap.buImpacts?.find(b => b.buName === buHandoff.buName)
+              : null
+            const buSeverity = buImpact?.severity ?? null
+            const panelImpacts = staleImpactMap
+              ? (staleImpactMap.panelImpacts || []).filter(p => p.buName === buHandoff.buName)
+              : []
+            return computeArtifactReadinessForBu(buHandoff, buSeverity, {
+              buSeverity,
+              panelImpacts,
+              reviewTargets: buImpact?.reviewTargets || [],
+            })
+          })
+          if (allReadiness.length === 0) return null
+
+          const blockedCount = allReadiness.filter(r =>
+            r.readinessStatus !== 'ready' &&
+            r.readinessStatus !== 'ready_with_upstream_advisory' &&
+            r.readinessStatus !== 'review_recommended'
+          ).length
+          const reviewCount = allReadiness.filter(r => r.readinessStatus === 'review_recommended').length
+          const advisoryCount = allReadiness.filter(r => r.readinessStatus === 'ready_with_upstream_advisory').length
+          const readyCount  = allReadiness.filter(r => r.readinessStatus === 'ready' || r.readinessStatus === 'ready_with_upstream_advisory').length
+
+          const statusColor = r => ({
+            ready:                    '#00e5b4',
+            ready_with_upstream_advisory: '#f59e0b',
+            review_recommended:       '#f59e0b',
+            blocked_missing_mapping:  '#f87171',
+            blocked_missing_source:   '#f87171',
+            blocked_materially_stale: '#f87171',
+          }[r.readinessStatus] || '#6b7280')
+
+          const statusLabel = r => ({
+            ready:                    'ready',
+            ready_with_upstream_advisory: 'ready — advisory',
+            review_recommended:       'review recommended',
+            blocked_missing_mapping:  'blocked — no mapping',
+            blocked_missing_source:   'blocked — no source',
+            blocked_materially_stale: 'blocked — stale',
+          }[r.readinessStatus] || r.readinessStatus)
+
+          const navFor = (row, targetType = null) => buildArtifactReadinessDeepLinkTarget(row, targetType)
+          const actionButtonStyle = (color = '#f97316') => ({
+            fontSize: 7, fontFamily: fm, padding: '2px 7px', borderRadius: 3,
+            cursor: 'pointer', background: `${color}14`, border: `1px solid ${color}66`,
+            color, fontWeight: 600, textAlign: 'left',
+          })
+          const unavailableStyle = { fontSize: 7, color: '#f87171', lineHeight: 1.45 }
+
+          return (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{
+                fontSize: 8, fontFamily: fm, color: 'var(--muted)', textTransform: 'uppercase',
+                letterSpacing: '.05em', marginBottom: 6,
+              }}>
+                Stage 4 Artifact Readiness
+                <span style={{ marginLeft: 8, textTransform: 'none', letterSpacing: 0 }}>
+                  {readyCount > 0 && <span style={{ color: '#00e5b4', marginRight: 6 }}>{readyCount} ready</span>}
+                  {advisoryCount > 0 && <span style={{ color: '#f59e0b', marginRight: 6 }}>{advisoryCount} advisory</span>}
+                  {reviewCount > 0 && <span style={{ color: '#f59e0b', marginRight: 6 }}>{reviewCount} review</span>}
+                  {blockedCount > 0 && <span style={{ color: '#f87171' }}>{blockedCount} blocked</span>}
+                </span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                {allReadiness.map((r, i) => (
+                  <div key={`${r.buName}:${r.artifactId}:${i}`} style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(80px,1fr) minmax(80px,1fr) 120px auto',
+                    gap: 6, alignItems: 'start',
+                    padding: '5px 8px', borderRadius: 4,
+                    background: 'var(--s1)', border: '1px solid var(--border)',
+                    fontSize: 8, fontFamily: fm,
+                  }}>
+                    <div>
+                      <div style={{ fontWeight: 600, color: 'var(--fg)' }}>{r.artifactTitle}</div>
+                      <div style={{ color: 'var(--muted)', marginTop: 1 }}>{r.buName}</div>
+                    </div>
+                    <div style={{ color: 'var(--muted2)' }}>
+                      {r.readinessStatus === 'blocked_missing_mapping' && (
+                        <><span style={{ color: '#f87171' }}>Missing:</span> mapped how options<br />
+                        <span style={{ color: 'var(--muted)' }}>Panel: {r.sourcePanelLabel}</span></>
+                      )}
+                      {r.readinessStatus === 'blocked_missing_source' && (
+                        <><span style={{ color: '#f87171' }}>Missing:</span> Stage 3 record</>
+                      )}
+                      {r.readinessStatus === 'blocked_materially_stale' && (
+                        <><span style={{ color: '#f87171' }}>Stale:</span> upstream change</>
+                      )}
+                      {r.readinessStatus === 'review_recommended' && (
+                        <span style={{ color: '#f59e0b' }}>{r.upstreamReviewReason || 'Review before generating'}</span>
+                      )}
+                      {r.readinessStatus === 'ready_with_upstream_advisory' && (
+                        <span style={{ color: '#f59e0b' }}>
+                          {r.upstreamReviewReason || 'Upstream changed; no material impact detected. Source components accepted.'}
+                        </span>
+                      )}
+                      {r.readinessStatus === 'ready' && (
+                        <span style={{ color: 'var(--muted)' }}>
+                          {r.mappedHowOptionsCount} mapped how option{r.mappedHowOptionsCount !== 1 ? 's' : ''}
+                          {r.sourceAtomCount > 0 ? ` · ${r.sourceAtomCount} source atom${r.sourceAtomCount !== 1 ? 's' : ''}` : ''}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 7, lineHeight: 1.6 }}>
+                      {r.remediationTarget && (
+                        <div style={{ color: 'var(--muted)', marginBottom: 3 }}>{r.remediationTarget}</div>
+                      )}
+                      {r.finalReadinessReason && (
+                        <div style={{ color: 'var(--muted2)', marginBottom: 3 }}>{r.finalReadinessReason}</div>
+                      )}
+                      {r.reviewTargets?.length > 0 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, marginBottom: 4 }}>
+                          {r.reviewTargets.map(target => {
+                            const color = target.status === 'resolved'
+                              ? '#00e5b4'
+                              : target.status === 'advisory'
+                                ? '#f59e0b'
+                                : '#f87171'
+                            return (
+                              <div key={target.targetId} style={{ color, lineHeight: 1.35 }}>
+                                {target.label}: {target.status}
+                                {target.reason ? ` - ${target.reason}` : ''}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                      {r.readinessStatus === 'blocked_missing_mapping' && onDeepLink && (() => {
+                        const nav = navFor(r, STAGE4_READINESS_TARGETS.EXECUTION_MAPPING)
+                        return nav.missing.length ? (
+                          <div style={unavailableStyle}>Remediation target unavailable: missing {nav.missing.join(', ')}</div>
+                        ) : (
+                          <button onClick={() => onDeepLink(r, STAGE4_READINESS_TARGETS.EXECUTION_MAPPING)} style={actionButtonStyle('#f97316')}>
+                            Fix mapping
+                          </button>
+                        )
+                      })()}
+                      {r.readinessStatus !== 'ready' && r.readinessStatus !== 'ready_with_upstream_advisory' && r.readinessStatus !== 'review_recommended' && r.readinessStatus !== 'blocked_missing_mapping' && onDeepLink && r.sourcePanelId && (() => {
+                        const nav = navFor(r, r.sourcePanelId)
+                        return nav.missing.length ? (
+                          <div style={unavailableStyle}>Remediation target unavailable: missing {nav.missing.join(', ')}</div>
+                        ) : (
+                          <button onClick={() => onDeepLink(r, r.sourcePanelId)} style={actionButtonStyle('#f97316')}>
+                            Go to source
+                          </button>
+                        )
+                      })()}
+                      {r.readinessStatus !== 'ready' && r.readinessStatus !== 'ready_with_upstream_advisory' && r.readinessStatus !== 'review_recommended' && r.readinessStatus !== 'blocked_missing_mapping' && onDeepLink && !r.sourcePanelId && (
+                        <div style={unavailableStyle}>Remediation target unavailable: missing sourcePanelId</div>
+                      )}
+                      {r.readinessStatus === 'review_recommended' && onDeepLink && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                          {[
+                            ['BU summary/thesis', STAGE4_READINESS_TARGETS.BU_SUMMARY],
+                            ['Execution Sequence mapping', STAGE4_READINESS_TARGETS.EXECUTION_MAPPING],
+                            ['Compiled Strategy Quality Audit', STAGE4_READINESS_TARGETS.QUALITY_AUDIT],
+                          ].map(([label, targetType]) => {
+                            const nav = navFor(r, targetType)
+                            return nav.missing.length ? (
+                              <div key={targetType} style={unavailableStyle}>{label} unavailable: missing {nav.missing.join(', ')}</div>
+                            ) : (
+                              <button key={targetType} onClick={() => onDeepLink(r, targetType)} style={actionButtonStyle('#f59e0b')}>
+                                {label}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      <span style={{
+                        fontSize: 7, fontFamily: fm, fontWeight: 600,
+                        color: statusColor(r),
+                        background: `${statusColor(r)}18`,
+                        border: `1px solid ${statusColor(r)}44`,
+                        borderRadius: 3, padding: '1px 5px',
+                      }}>
+                        {statusLabel(r)}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )
+        })()}
 
         {/* Actions row */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -6313,19 +6871,28 @@ function PrepareStage4HandoffPanel({
             </button>
           )}
 
-          {/* Continue to Stage 4 — only after verified */}
+          {/* Continue to Stage 4 — only after verified.
+              D26/D27: Button style reflects impact-aware severity.
+              Hard stale (materially_stale / unknown) → warning style with explicit stale label.
+              Review-only → amber style but proceed without hard "stale" label.
+              Unaffected or no upstream change → normal accent button. */}
           {phase === S4_PHASE.VERIFIED && onNavigateToStage4 && (
             <button
               onClick={onNavigateToStage4}
               style={{
                 fontSize: 10, fontFamily: fm, fontWeight: 700,
                 padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
-                background: 'var(--accent, #3b82f6)',
-                border: '1px solid var(--accent, #3b82f6)',
-                color: '#000',
+                background: isHardStale ? 'rgba(251,146,60,.12)' : isReviewOnly ? 'rgba(245,158,11,.10)' : 'var(--accent, #3b82f6)',
+                border: `1px solid ${isHardStale ? 'rgba(251,146,60,.5)' : isReviewOnly ? 'rgba(245,158,11,.45)' : 'var(--accent, #3b82f6)'}`,
+                color: isHardStale ? '#fb923c' : isReviewOnly ? '#f59e0b' : '#000',
               }}
+              title={
+                isHardStale ? 'Material assumption changes detected — recompile the handoff before generating Stage 4 artifacts.' :
+                isReviewOnly ? 'Upstream changed — review recommended before generating Stage 4 artifacts.' :
+                undefined
+              }
             >
-              Continue to Stage 4 →
+              {isHardStale ? 'Continue to Stage 4 (stale basis) →' : isReviewOnly ? 'Continue to Stage 4 (review recommended) →' : 'Continue to Stage 4 →'}
             </button>
           )}
 
@@ -6381,6 +6948,8 @@ export default function Stage3View({
   const [idbReady, setIdbReady] = useState(false)
   const [coordinationGen, setCoordinationGen] = useState({ running: false, error: null })
   const [captureImportStatus, setCaptureImportStatus] = useState(null)
+  const [deepLinkTarget, setDeepLinkTarget] = useState(null)
+  const [deepLinkDiagnostic, setDeepLinkDiagnostic] = useState(null)
   const captureImportRef = useRef(null)
 
   // ── Derived state ───────────────────────────────────────────────────────────
@@ -6424,6 +6993,21 @@ export default function Stage3View({
   const apiMode         = getApiMode()
   const effectiveWorkspaceId = workspaceId || workspace?.id || null
   const orderedStage2BUs = orderBusinessUnitsForStage3(stage2BUs, activeStage1Rev?.contentSnapshot)
+
+  // D26/D27: Impact-aware stale classification — replaces blanket version-mismatch staleness.
+  // Built from the impactSummary of the new upstream revision so keyword-based assumption
+  // detection can distinguish materially_stale from review_recommended.
+  // Must be after orderedStage2BUs to enumerate BU names.
+  const staleImpactMap = isStale
+    ? buildStaleImpactMap({
+        buNames: orderedStage2BUs.map(bu => bu.name).filter(Boolean),
+        upstreamSource: staleReason || 'upstream',
+        upstreamRevisionId: staleReason === 'Stage 1' ? stage1ActiveId : stage2ActiveId,
+        revisionSummary: staleReason === 'Stage 1'
+          ? (activeStage1Rev?.impactSummary || null)
+          : (activeStage2Rev?.impactSummary || null),
+      })
+    : null
   const readinessRows = orderedStage2BUs.map(unit => {
     const draft = readJsonStorage(stage2HandoffDraftKey(effectiveWorkspaceId, unit.name))
     return { unit, draft, readiness: summarizeHandoffReadiness(unit, draft) }
@@ -6520,6 +7104,16 @@ export default function Stage3View({
       source: 'stage3',
     })
     onNavigateToStage2?.()
+  }
+
+  function handleArtifactReadinessDeepLink(row, targetType = null) {
+    const { target, missing } = buildArtifactReadinessDeepLinkTarget(row, targetType)
+    if (missing.length) {
+      setDeepLinkDiagnostic(`Remediation target unavailable: missing ${missing.join(', ')}.`)
+      return
+    }
+    setDeepLinkDiagnostic(null)
+    setDeepLinkTarget({ ...target, requestedAt: Date.now() })
   }
 
   // ── Source rev labels ───────────────────────────────────────────────────────
@@ -7534,6 +8128,7 @@ export default function Stage3View({
           onCaptureImport={handleCaptureImport}
           idbReady={idbReady}
           onPersistPanelModel={persistPanelModelForBU}
+          deepLinkTarget={deepLinkTarget}
         />
         <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>
           C · Cross-BU Coordination
@@ -7666,6 +8261,7 @@ export default function Stage3View({
         onCaptureImport={handleCaptureImport}
         idbReady={idbReady}
         onPersistPanelModel={persistPanelModelForBU}
+        deepLinkTarget={deepLinkTarget}
       />
 
       {/* ── C. Cross-BU Coordination ──────────────────────────────────────── */}
@@ -7680,37 +8276,89 @@ export default function Stage3View({
         onGenerate={handleGenerateCoordination}
       />
 
-      {/* ── Staleness banner ──────────────────────────────────────────────── */}
-      {isStale && (
-        <div style={{
-          background: 'rgba(251,146,60,.06)', border: '1px solid rgba(251,146,60,.35)',
-          borderRadius: 'var(--r)', padding: '12px 16px', marginBottom: 12,
-          display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
-        }}>
-          <span style={{ fontSize: 10, fontFamily: 'var(--fm)' }}>⚠</span>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: '#fb923c', marginBottom: 2 }}>
-              Stage 3 is stale
+      {/* ── Upstream change banner (impact-aware) — D26/D27 ─────────────── */}
+      {isStale && (() => {
+        const severity = staleImpactMap ? overallStaleSeverity(staleImpactMap) : null
+
+        // All BUs unaffected → hide banner entirely
+        if (severity === STALE_SEVERITY.UNAFFECTED) return null
+
+        if (severity === STALE_SEVERITY.MATERIALLY_STALE) {
+          const staleBUNames = staleImpactMap.summary.materiallyStaleBUs
+          const stalePanelLabels = [...new Set(
+            (staleImpactMap.panelImpacts || [])
+              .filter(p => p.severity === STALE_SEVERITY.MATERIALLY_STALE)
+              .map(p => STALE_PANEL_LABELS[p.panelId] || p.panelId)
+          )]
+          return (
+            <div style={{
+              background: 'rgba(248,113,113,.06)', border: '1px solid rgba(248,113,113,.3)',
+              borderRadius: 'var(--r)', padding: '12px 16px', marginBottom: 12,
+            }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#f87171', marginBottom: 4 }}>
+                ⚠ Stage 3 has material stale impacts
+              </div>
+              <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.7 }}>
+                {staleReason} has changed and material assumption changes were detected.
+                Affected {staleBUNames.length === 1 ? 'BU' : 'BUs'}: <strong>{staleBUNames.join(', ')}</strong>.
+                {stalePanelLabels.length > 0 && (
+                  <> Affected panels: {stalePanelLabels.join(', ')}.</>
+                )}
+              </div>
+              <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginTop: 4 }}>
+                Regenerate affected BU panels from the readiness panel below before recompiling the Stage 4 handoff.
+              </div>
             </div>
-            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', lineHeight: 1.6 }}>
-              {staleReason} has changed since this Stage 3 was generated.
-              Regenerate individual BUs from the readiness panel below. All-BU regeneration is not yet enabled.
+          )
+        }
+
+        if (severity === STALE_SEVERITY.REVIEW_RECOMMENDED) {
+          return (
+            <div style={{
+              background: 'rgba(245,158,11,.05)', border: '1px solid rgba(245,158,11,.28)',
+              borderRadius: 'var(--r)', padding: '12px 16px', marginBottom: 12,
+              display: 'flex', alignItems: 'flex-start', gap: 12, flexWrap: 'wrap',
+            }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, color: '#f59e0b', marginBottom: 2 }}>
+                  ◑ Upstream changed — review recommended
+                </div>
+                <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6 }}>
+                  {staleReason} has changed. No material assumption changes detected — regeneration is not required
+                  unless review identifies affected assumptions.
+                </div>
+                <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted)', marginTop: 3 }}>
+                  Review: BU summaries, Stage 4 deliverable mappings, and compiled strategy quality audit.
+                </div>
+              </div>
+              <div style={{
+                flexShrink: 0, fontSize: 9, fontFamily: 'var(--fm)',
+                padding: '4px 12px', borderRadius: 5,
+                background: 'rgba(107,114,128,.1)', border: '1px solid rgba(107,114,128,.3)',
+                color: 'var(--muted)', alignSelf: 'center',
+              }}>
+                No regen needed ↓
+              </div>
+            </div>
+          )
+        }
+
+        // unknown_impact or no impact map — show generic amber
+        return (
+          <div style={{
+            background: 'rgba(167,139,250,.05)', border: '1px solid rgba(167,139,250,.28)',
+            borderRadius: 'var(--r)', padding: '12px 16px', marginBottom: 12,
+          }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#a78bfa', marginBottom: 2 }}>
+              ⚠ Upstream changed — impact unknown
+            </div>
+            <div style={{ fontSize: 9, fontFamily: 'var(--fm)', color: 'var(--muted2)', lineHeight: 1.6 }}>
+              {staleReason || 'Upstream source'} has changed since this Stage 3 was generated.
+              No change summary is available to assess impact — review before trusting Stage 4 artifacts.
             </div>
           </div>
-          <button
-            onClick={() => setGenError('All-BU Stage 3 regeneration is not yet enabled. Use the per-BU Generate buttons in the readiness panel below.')}
-            disabled
-            style={{
-              flexShrink: 0, fontSize: 9, fontFamily: 'var(--fm)', fontWeight: 600,
-              padding: '5px 14px', borderRadius: 5, cursor: 'pointer',
-              background: 'rgba(251,146,60,.15)', border: '1px solid rgba(251,146,60,.4)',
-              color: '#fb923c',
-            }}
-          >
-            {isGenerating ? 'Generating…' : 'Regenerate Stage 3'}
-          </button>
-        </div>
-      )}
+        )
+      })()}
 
       {/* ── Generation error ──────────────────────────────────────────────── */}
       {genError && (
@@ -7802,7 +8450,22 @@ export default function Stage3View({
         idbReady={idbReady}
         onNavigateToStage4={onNavigateToStage4}
         stage3ActiveRevision={activeRev}
+        isStale={isStale}
+        staleReason={staleReason}
+        staleImpactMap={staleImpactMap}
+        onDeepLink={handleArtifactReadinessDeepLink}
       />
+
+      {deepLinkDiagnostic && (
+        <div style={{
+          marginTop: 8, padding: '8px 12px', borderRadius: 5,
+          border: '1px solid rgba(248,113,113,.28)',
+          background: 'rgba(248,113,113,.06)', color: '#f87171',
+          fontSize: 9, fontFamily: 'var(--fm)',
+        }}>
+          {deepLinkDiagnostic}
+        </div>
+      )}
 
     </div>
   )

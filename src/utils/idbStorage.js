@@ -15,17 +15,18 @@
  */
 
 const DB_NAME    = 'bsp_strategy_planner'
-const DB_VERSION = 4
+const DB_VERSION = 5
 
 export const IDB_STORES = {
-  PLANS:                   'plans',
-  STAGE2_HANDOFFS:         'stage2_handoffs',
-  STAGE3_BU_PLANS:         'stage3_bu_plans',
-  STAGE3_COORDINATION:     'stage3_coordination',
-  STAGE4_HANDOFFS:         'stage4_handoffs',
-  STAGE4_ARTIFACT_PLANS:   'stage4_artifact_plans',
-  STAGE4_ARTIFACT_OUTPUTS: 'stage4_artifact_outputs',
-  MIGRATION_AUDIT:         'migration_audit',
+  PLANS:                     'plans',
+  STAGE2_HANDOFFS:           'stage2_handoffs',
+  STAGE3_BU_PLANS:           'stage3_bu_plans',
+  STAGE3_COORDINATION:       'stage3_coordination',
+  STAGE4_HANDOFFS:           'stage4_handoffs',
+  STAGE4_ARTIFACT_PLANS:     'stage4_artifact_plans',
+  STAGE4_ARTIFACT_OUTPUTS:   'stage4_artifact_outputs',
+  STAGE5_LEARNING_SIGNALS:   'stage5_learning_signals',
+  MIGRATION_AUDIT:           'migration_audit',
 }
 
 let _db          = null
@@ -44,7 +45,12 @@ function openDB() {
         }
       }
     }
-    req.onsuccess = (e) => { _db = e.target.result; resolve(_db) }
+    req.onsuccess = (e) => {
+      _db = e.target.result
+      // Release connection when another tab needs a version upgrade
+      _db.onversionchange = () => { _db.close(); _db = null; _openPromise = null }
+      resolve(_db)
+    }
     req.onerror   = (e) => { _openPromise = null; reject(e.target.error) }
     req.onblocked = ()  => { _openPromise = null; reject(new Error('IDB open blocked by another tab')) }
   })
