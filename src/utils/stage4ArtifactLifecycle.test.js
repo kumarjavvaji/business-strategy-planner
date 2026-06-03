@@ -17,6 +17,7 @@ import {
   buildArtifactChildPrompt,
   deriveSectionChildDefs,
   getArtifactSectionOutline,
+  resolveArtifactGenerator,
   parseArtifactChildResponse,
   parseArtifactSectionResponse,
 } from './stage4ArtifactPrompts'
@@ -108,9 +109,18 @@ describe('stage4 artifact section lifecycle', () => {
 
 describe('stage4 section prompts and parsing', () => {
   it('unsupported artifact type is not routed through a generic generator', () => {
-    const result = buildArtifactSectionPrompt({ artifactType: 'pdlc_epic_outline' }, { buHandoffs: [] }, { id: 'x' }, basis)
+    const result = buildArtifactSectionPrompt({ artifactType: 'acceptance_criteria_draft' }, { buHandoffs: [] }, { id: 'x' }, basis)
     expect(result.isSupported).toBe(false)
     expect(result.messages).toBeNull()
+  })
+
+  it('pdlc_epic_outline resolves to the registered atomic generator', () => {
+    const generator = resolveArtifactGenerator('pdlc_epic_outline')
+    expect(generator).toEqual(expect.objectContaining({
+      artifactType: 'pdlc_epic_outline',
+      executionMode: 'atomic_section_child_units',
+    }))
+    expect(generator.getSectionOutline().map(section => section.id)).toContain('epic_candidates')
   })
 
   it('max_tokens response fails only the affected section', () => {
@@ -170,6 +180,7 @@ describe('stage4 section prompts and parsing', () => {
   it('implemented artifact types expose section outlines', () => {
     expect(getArtifactSectionOutline('executive_decision_brief')).toContainEqual(expect.objectContaining({ id: 'executive_summary' }))
     expect(getArtifactSectionOutline('bu_execution_plan')).toContainEqual(expect.objectContaining({ id: 'execution_workstreams' }))
+    expect(getArtifactSectionOutline('pdlc_epic_outline')).toContainEqual(expect.objectContaining({ id: 'epic_candidates' }))
     expect(getArtifactSectionOutline('global_sme_review_packet')).toContainEqual(expect.objectContaining({ id: 'cross_bu_scope' }))
   })
 

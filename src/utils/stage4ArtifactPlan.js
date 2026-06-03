@@ -15,6 +15,8 @@
 
 import { readArtifactFromIdb, writeArtifact } from './storageRouter'
 import { BU_HANDOFF_STATUS, HANDOFF_STATUS } from './stage4Handoff'
+import { compileArtifactBasis } from './stage4ArtifactBasis'
+import { deriveSectionChildDefs, getArtifactSectionOutline, SUPPORTED_GENERATION_TYPES } from './stage4ArtifactPrompts'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -26,10 +28,50 @@ export const ARTIFACT_PLAN_STATUS = {
   STALE:                'stale',
 }
 
+export const STAGE4_QUALITY_ISSUE_TYPES = [
+  'genuinely_truncated',
+  'repeated_content',
+  'copied_source_prose',
+  'missing_source_mapping',
+  'missing_actionable_content',
+  'generic_filler',
+  'unsupported_artifact_type',
+  'missing_required_section',
+  'failed_atom',
+  'parse_failed',
+  'source_basis_incomplete',
+]
+
+export const DEFAULT_STAGE4_QUALITY_POLICY = {
+  policyId: 'stage4_default_authoring_quality_policy_v1',
+  checks: [
+    'no_truncation_markers',
+    'no_incomplete_sentence_endings',
+    'no_repeated_paragraph_blocks',
+    'no_copied_stage3_prose_except_labeled_source_refs',
+    'every_generated_section_maps_to_source_atoms',
+    'every_section_adds_distinct_artifact_value',
+    'audience_appropriate',
+    'sme_reviewable',
+    'actionable_not_generic_filler',
+    'required_sections_present',
+    'missing_prerequisites_block_generation',
+  ],
+  issueTypes: STAGE4_QUALITY_ISSUE_TYPES,
+}
+
 export const ARTIFACT_READINESS = {
-  READY:   'ready',
-  PARTIAL: 'partial',
-  BLOCKED: 'blocked',
+  READY:                         'ready',
+  PARTIAL:                       'partial',
+  BLOCKED:                       'blocked',
+  BLOCKED_UNSUPPORTED_GENERATOR: 'blocked_unsupported_generator',
+  BLOCKED_MISSING_SOURCE:        'blocked_missing_source',
+  BLOCKED_MISSING_MAPPING:       'blocked_missing_mapping',
+  BLOCKED_MATERIALLY_STALE:      'blocked_materially_stale',
+}
+
+export function artifactReadinessBlocksGeneration(status) {
+  return status === ARTIFACT_READINESS.BLOCKED || String(status || '').startsWith('blocked_')
 }
 
 export const GENERATION_STATUS = {
@@ -116,6 +158,181 @@ export const BU_ARTIFACT_DEFS = {
 
 function safe(name) {
   return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '_')
+}
+
+function sourcePanelRefsForBu(bu) {
+  const panels = bu?.stage3PanelModel?.panels || bu?.panelModel?.panels || bu?.sourcePanelModel?.panels || {}
+  return Object.entries(panels).map(([panelId, panel]) => ({
+    panelId,
+    lifecycle: panel?.lifecycle || null,
+    accepted: !panel?.lifecycle || panel.lifecycle === 'accepted',
+    sourceAtomIds: panel?.sourceAtomIds || [],
+  }))
+}
+
+function requiredPanelsForBasis(basis) {
+  return [
+    'strategicObjective',
+    'executionSequence',
+    basis?.counts?.criticalDecisions > 0 ? 'criticalDecisions' : null,
+    basis?.counts?.dependencies > 0 ? 'dependencies' : null,
+    basis?.counts?.risks > 0 ? 'risks' : null,
+    basis?.counts?.validationQuestions > 0 ? 'validationFramework' : null,
+  ].filter(Boolean)
+}
+
+function artifactScopeFor(item) {
+  if (item.scope === 'global') return 'global'
+  if (item.scope === 'cross_bu') return 'cross_bu'
+  return 'bu'
+}
+
+function deriveGenerationUnits(item, artifactBasis) {
+  const sectionOutline = getArtifactSectionOutline(item.artifactType) || []
+  return sectionOutline.map(sectionDef => {
+    const childDefs = deriveSectionChildDefs(sectionDef, artifactBasis)
+    return {
+      unitId: sectionDef.id,
+      sectionId: sectionDef.id,
+      heading: sectionDef.heading,
+      purpose: sectionDef.purpose,
+      generationMode: sectionDef.generationMode || 'single',
+      sourcePanelRefs: requiredPanelsForBasis(artifactBasis),
+      items: childDefs.length ? childDefs.map(child => ({
+        itemId: child.childId,
+        label: child.label,
+        atomType: child.atomType,
+        sourceAtomRefs: child.sourceAtomRefs || [],
+        sourcePanelRefs: requiredPanelsForBasis(artifactBasis),
+        atoms: [{
+          atomId: child.childId,
+          artifactJobId: item.artifactId,
+          sectionId: sectionDef.id,
+          itemId: child.childId,
+          sourceAtomRefs: child.sourceAtomRefs || [],
+          sourcePanelRefs: requiredPanelsForBasis(artifactBasis),
+          intendedOutputRole: child.atomType || sectionDef.atomType || 'artifact_atom',
+          promptPurpose: child.inputBasis || sectionDef.purpose,
+          boundedScope: child.isStaticAtom ? 'static synthesis atom' : 'single source item transformation',
+          validationRules: DEFAULT_STAGE4_QUALITY_POLICY.checks,
+          status: 'not_started',
+          content: null,
+          rawOutputOnFailure: null,
+          error: null,
+          retryCount: 0,
+          persistedAt: null,
+        }],
+      })) : [{
+        itemId: `${sectionDef.id}:section`,
+        label: sectionDef.heading,
+        atomType: 'section',
+        sourceAtomRefs: artifactBasis?.sourceTraceability?.sourceAtomIds || [],
+        sourcePanelRefs: requiredPanelsForBasis(artifactBasis),
+        atoms: [{
+          atomId: `${sectionDef.id}:section`,
+          artifactJobId: item.artifactId,
+          sectionId: sectionDef.id,
+          itemId: `${sectionDef.id}:section`,
+          sourceAtomRefs: artifactBasis?.sourceTraceability?.sourceAtomIds || [],
+          sourcePanelRefs: requiredPanelsForBasis(artifactBasis),
+          intendedOutputRole: 'artifact_section',
+          promptPurpose: sectionDef.purpose,
+          boundedScope: 'single artifact section',
+          validationRules: DEFAULT_STAGE4_QUALITY_POLICY.checks,
+          status: 'not_started',
+          content: null,
+          rawOutputOnFailure: null,
+          error: null,
+          retryCount: 0,
+          persistedAt: null,
+        }],
+      }],
+    }
+  })
+}
+
+function readinessForArtifact(item, bu, artifactBasis) {
+  if (item.artifactType === 'blocked') {
+    return {
+      status: item.readinessStatus || ARTIFACT_READINESS.BLOCKED,
+      missingPrerequisites: [...(artifactBasis?.missingPrerequisites || [])],
+      blockers: item.blockedReason ? [{ type: 'blocked_bu_source', reason: item.blockedReason }] : [],
+      advisoryFlags: [],
+    }
+  }
+  const blockers = []
+  const missingPrerequisites = [...(artifactBasis?.missingPrerequisites || [])]
+  const advisoryFlags = []
+  let blockedStatus = null
+  if (item.artifactType !== 'blocked' && !SUPPORTED_GENERATION_TYPES.has(item.artifactType)) {
+    blockers.push({ type: 'unsupported_artifact_type', reason: `No generator is registered for ${item.artifactType}.` })
+    blockedStatus = ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR
+  }
+  if ((item.sourceAtomIds || []).length === 0 && (artifactBasis?.sourceTraceability?.sourceSectionIds || []).length === 0) {
+    blockers.push({ type: 'missing_source_atoms', reason: 'No accepted Stage 3 source atoms or source sections are available.' })
+    missingPrerequisites.push({ type: 'missing_source_atoms', description: 'Accepted Stage 3 source atoms or sections are required.' })
+    blockedStatus = blockedStatus || ARTIFACT_READINESS.BLOCKED_MISSING_SOURCE
+  }
+  if ((artifactBasis?.counts?.mappedHowOptions || 0) === 0) {
+    advisoryFlags.push({ type: 'missing_source_mapping', reason: 'No mapped how-options are available yet; generation will be blocked until mapping is complete.' })
+  }
+  if (bu?.status === BU_HANDOFF_STATUS.PARTIAL) {
+    advisoryFlags.push({ type: 'partial_source_basis', reason: 'Source BU handoff is partial.' })
+  }
+  return {
+    status: blockers.length ? blockedStatus || ARTIFACT_READINESS.BLOCKED : item.readinessStatus,
+    missingPrerequisites,
+    blockers,
+    advisoryFlags,
+  }
+}
+
+function buildAuthoringJob(item, handoff, workspaceId, stage1Id, stage2Id, stage3Id) {
+  const bu = item.businessUnitName
+    ? (handoff.buHandoffs || []).find(entry => entry.buName === item.businessUnitName)
+    : null
+  const artifactBasis = compileArtifactBasis(item, handoff)
+  const readiness = readinessForArtifact(item, bu, artifactBasis)
+  const requiredPanels = requiredPanelsForBasis(artifactBasis)
+  const sourcePanelRefs = item.businessUnitName
+    ? sourcePanelRefsForBu(bu).filter(ref => !requiredPanels.length || requiredPanels.includes(ref.panelId))
+    : (handoff.buHandoffs || []).flatMap(entry => sourcePanelRefsForBu(entry))
+  const sourceAtomRefs = artifactBasis?.sourceTraceability?.sourceAtomIds || item.sourceAtomIds || []
+  const generationUnits = deriveGenerationUnits(item, artifactBasis)
+
+  return {
+    ...item,
+    selected: !artifactReadinessBlocksGeneration(readiness.status) && item.selected,
+    artifactJobId: item.artifactId,
+    artifactTitle: item.title,
+    artifactScope: artifactScopeFor(item),
+    sourceBuId: bu?.buId || bu?.stableBuKey || bu?.buKey || item.businessUnitName || null,
+    sourceBuName: item.businessUnitName || null,
+    audience: item.scope === 'global' ? 'executive / cross-functional delivery leadership' : 'BU delivery owners and accountable reviewers',
+    sourceBasis: {
+      stage3BuRecordId: bu?.sourcePersistKey || null,
+      requiredPanels,
+      sourceAtomRefs,
+      sourcePanelRefs,
+      handoffItemRefs: bu?.sourceSectionIds || [],
+    },
+    readiness,
+    readinessStatus: readiness.status,
+    blockedReason: readiness.blockers[0]?.reason || item.blockedReason || null,
+    generationUnits,
+    qualityPolicy: DEFAULT_STAGE4_QUALITY_POLICY,
+    lifecycle: {
+      status: 'not_started',
+      generationStatus: GENERATION_STATUS.NOT_STARTED,
+      acceptedAt: null,
+      updatedAt: item.updatedAt,
+    },
+    planRefs: {
+      workspaceId,
+      stageId: 'stage4',
+      sourceRevisionIds: { stage1: stage1Id, stage2: stage2Id, stage3: stage3Id },
+    },
+  }
 }
 
 export function stage4ArtifactPlanKey(workspaceId, stage1Id, stage2Id, stage3Id) {
@@ -242,13 +459,28 @@ export function suggestArtifacts(handoff) {
 export function buildArtifactPlan(handoff, workspaceId, stage1Id, stage2Id, stage3Id) {
   const now = new Date().toISOString()
   const artifacts = suggestArtifacts(handoff)
-
-  const globalArtifacts     = artifacts.filter(a => a.scope === 'global')
-  const businessUnitArtifacts = artifacts.filter(a => a.scope === 'business_unit')
+  const authoredArtifacts = artifacts.map(item => buildAuthoringJob(item, handoff, workspaceId, stage1Id, stage2Id, stage3Id))
+  const globalArtifacts     = authoredArtifacts.filter(a => a.scope === 'global')
+  const businessUnitArtifacts = authoredArtifacts.filter(a => a.scope === 'business_unit')
+  const planningFailures = []
+  if (!handoff?.persistedAt) planningFailures.push({ type: 'missing_verified_handoff', reason: 'Verified handoff is missing or not persisted.' })
+  if (!(handoff?.buHandoffs || []).some(bu => bu.status !== BU_HANDOFF_STATUS.BLOCKED)) planningFailures.push({ type: 'no_eligible_bu_records', reason: 'No eligible BU records are available.' })
+  if (!authoredArtifacts.length) planningFailures.push({ type: 'no_artifact_candidates', reason: 'No artifact candidates could be derived from the handoff.' })
+  if (authoredArtifacts.some(artifact => artifact.readiness.blockers.some(blocker => blocker.type === 'missing_source_atoms'))) {
+    planningFailures.push({ type: 'missing_source_atoms', reason: 'One or more artifact jobs lack accepted Stage 3 source atoms or source sections.' })
+  }
 
   return {
     version:                        ARTIFACT_PLAN_VERSION,
+    planId:                         `stage4_plan_${workspaceId}_${stage1Id}_${stage2Id}_${stage3Id}`,
     workspaceId,
+    stageId:                        'stage4',
+    sourceHandoffId:                handoff.handoffId || handoff.handoffKey || `bsp_v1_stage4_handoff_${workspaceId}_${stage1Id}_${stage2Id}_${stage3Id}`,
+    sourceRevisionIds: {
+      stage1: stage1Id,
+      stage2: stage2Id,
+      stage3: stage3Id,
+    },
     stage1RevisionId:               stage1Id,
     stage2RevisionId:               stage2Id,
     stage3RevisionId:               stage3Id,
@@ -256,8 +488,15 @@ export function buildArtifactPlan(handoff, workspaceId, stage1Id, stage2Id, stag
     generatedFromHandoffPersistedAt: handoff.persistedAt,
     generatedFromHandoffCompiledAt:  handoff.compiledAt,
     status:                         ARTIFACT_PLAN_STATUS.DRAFT,
+    artifacts:                      authoredArtifacts,
     globalArtifacts,
     businessUnitArtifacts,
+    planningDiagnostics: {
+      planningFailures,
+      eligibleBuCount: (handoff?.buHandoffs || []).filter(bu => bu.status !== BU_HANDOFF_STATUS.BLOCKED).length,
+      artifactCandidateCount: authoredArtifacts.length,
+      generationCalled: false,
+    },
     reviewNotes:                    '',
     createdAt:                      now,
     updatedAt:                      now,

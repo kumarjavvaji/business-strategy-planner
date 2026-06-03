@@ -141,12 +141,54 @@ function allOutputText(contentSections) {
   return (contentSections || []).map(section => `${section.heading || ''} ${section.purpose || ''} ${section.body || ''}`).join(' ')
 }
 
+function standardizeQualityFinding(finding, context = {}) {
+  const issueType = {
+    repeated_section_language: 'repeated_content',
+    missing_mapped_tactic: 'missing_source_mapping',
+    copied_stage3_prose: 'copied_source_prose',
+    unmapped_tactic_included: 'missing_source_mapping',
+    generic_consultant_filler: 'generic_filler',
+    incomplete_section: 'genuinely_truncated',
+    excessive_prose: 'missing_actionable_content',
+    missing_required_fields: 'missing_required_section',
+    incomplete_child: 'genuinely_truncated',
+  }[finding.type] || finding.issueType || finding.type
+  const remediation = {
+    repeated_content: 'Apply compile-layer dedupe or regenerate repeated section atoms.',
+    missing_source_mapping: 'Add missing source mapping or regenerate the affected atom from mapped source basis.',
+    copied_source_prose: 'Regenerate the affected atom with transform-not-copy instruction.',
+    generic_filler: 'Regenerate the atom with concrete owner, gate, evidence, and source constraints.',
+    genuinely_truncated: 'Regenerate the failed atom or section with a smaller bounded scope.',
+    missing_actionable_content: 'Regenerate the atom with actionability and role/gate requirements.',
+    missing_required_section: 'Revise artifact plan units or regenerate the missing section atom.',
+    failed_atom: 'Retry the failed atom only.',
+    parse_failed: 'Retry the failed atom and preserve raw output for inspection.',
+    source_basis_incomplete: 'Complete the source basis before generation.',
+  }[issueType] || 'Review and remediate the affected artifact unit.'
+  return {
+    ...finding,
+    issueType,
+    sectionId: finding.sectionId || context.sectionId || null,
+    itemId: finding.itemId || context.itemId || null,
+    atomId: finding.atomId || context.atomId || null,
+    sourceRefs: finding.sourceRefs || context.sourceRefs || [],
+    exactReason: finding.detail || finding.exactReason || finding.reason || '',
+    remediationAction: finding.remediationAction || remediation,
+    autoFixable: finding.autoFixable ?? ['repeated_content', 'generic_filler'].includes(issueType),
+    regenerationRequired: finding.regenerationRequired ?? ['genuinely_truncated', 'copied_source_prose', 'parse_failed', 'failed_atom'].includes(issueType),
+  }
+}
+
 export function auditArtifactOutput({ contentSections = [], artifactBasis = null }) {
   const findings = []
   const outputText = allOutputText(contentSections)
   const normalizedOutput = normalizeSentence(outputText)
   const sectionSentences = contentSections.map(section => sentences(section.body))
   const seenSentences = new Map()
+
+  if (/\.\.\.|…|\[truncated\]/i.test(outputText)) {
+    findings.push({ type: 'truncation_marker', issueType: 'genuinely_truncated', severity: 'blocking', detail: 'Artifact output contains truncation markers.' })
+  }
 
   sectionSentences.forEach((items, sectionIndex) => {
     items.forEach(sentence => {
@@ -195,14 +237,17 @@ export function auditArtifactOutput({ contentSections = [], artifactBasis = null
     }
   })
 
-  const blocking = findings.filter(f => f.severity === 'blocking')
+  const normalizedFindings = findings.map(finding => standardizeQualityFinding(finding, {
+    sourceRefs: artifactBasis?.sourceTraceability?.sourceAtomIds || [],
+  }))
+  const blocking = normalizedFindings.filter(f => f.severity === 'blocking')
   const status = blocking.length > 0 ? ARTIFACT_QUALITY_STATUS.NEEDS_REVISION
-    : findings.length > 0 ? ARTIFACT_QUALITY_STATUS.USABLE
+    : normalizedFindings.length > 0 ? ARTIFACT_QUALITY_STATUS.USABLE
     : ARTIFACT_QUALITY_STATUS.STRONG
 
   return {
     status,
-    findings,
+    findings: normalizedFindings,
     checkedAt: new Date().toISOString(),
   }
 }
@@ -235,11 +280,15 @@ export function auditArtifactSection(section, artifactBasis = null) {
     }
   })
 
-  const blockingFindings = findings.filter(f => f.severity === 'blocking')
+  const normalizedFindings = findings.map(finding => standardizeQualityFinding(finding, {
+    sectionId: section?.sectionId || null,
+    sourceRefs: section?.sourceAtomIds || artifactBasis?.sourceTraceability?.sourceAtomIds || [],
+  }))
+  const normalizedBlockingFindings = normalizedFindings.filter(f => f.severity === 'blocking')
   return {
-    status: blockingFindings.length > 0 ? 'failed' : 'complete',
-    blockingFindings,
-    findings,
+    status: normalizedBlockingFindings.length > 0 ? 'failed' : 'complete',
+    blockingFindings: normalizedBlockingFindings,
+    findings: normalizedFindings,
     lastAuditedAt: new Date().toISOString(),
   }
 }
@@ -262,11 +311,16 @@ export function auditArtifactChild(child) {
   if (String(child?.body || '').length < 25 || /[,;:]$/.test(String(child?.body || '').trim())) {
     findings.push({ type: 'incomplete_child', severity: 'blocking', detail: 'Child item appears incomplete or truncated.' })
   }
-  const blockingFindings = findings.filter(f => f.severity === 'blocking')
+  const normalizedFindings = findings.map(finding => standardizeQualityFinding(finding, {
+    atomId: child?.childId || null,
+    itemId: child?.childId || null,
+    sourceRefs: child?.sourceAtomIds || [],
+  }))
+  const normalizedBlockingFindings = normalizedFindings.filter(f => f.severity === 'blocking')
   return {
-    status: blockingFindings.length > 0 ? 'failed' : 'complete',
-    blockingFindings,
-    findings,
+    status: normalizedBlockingFindings.length > 0 ? 'failed' : 'complete',
+    blockingFindings: normalizedBlockingFindings,
+    findings: normalizedFindings,
     lastAuditedAt: new Date().toISOString(),
   }
 }

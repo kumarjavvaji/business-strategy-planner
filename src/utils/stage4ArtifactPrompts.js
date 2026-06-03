@@ -25,6 +25,7 @@ export const SUPPORTED_GENERATION_TYPES = new Set([
   'executive_decision_brief',
   'bu_execution_plan',
   'bu_execution_plan_partial',
+  'pdlc_epic_outline',
   'bu_sme_review_packet',
   'global_sme_review_packet',
 ])
@@ -215,6 +216,26 @@ const BU_PLAN_SECTIONS = [
   { id: 'validation_approach',   heading: 'Validation Approach',   purpose: 'How readiness and delivery quality will be confirmed at each phase.',                       generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'validation_item' },
 ]
 
+// Stage 4 registers this single BU-scoped engineering artifact so persisted
+// artifact jobs can execute without falling through to unsupported generation.
+const PDLC_EPIC_OUTLINE_SECTIONS = [
+  {
+    id: 'epic_framing',
+    heading: 'Epic Framing',
+    purpose: 'Translate the accepted BU thesis and mapped tactics into the product delivery problem statement.',
+    generationMode: 'child_units',
+    staticAtoms: [
+      { atomId: 'delivery_intent', atomType: 'pdlc_context', label: 'Delivery Intent', inputBasis: 'State the product delivery intent, accountable BU context, and source evidence that constrains this epic outline.' },
+      { atomId: 'source_traceability', atomType: 'traceability', label: 'Source Traceability', inputBasis: 'Name the mapped execution tactics, source panels, and evidence anchors used to derive the epic outline.' },
+    ],
+  },
+  { id: 'epic_candidates', heading: 'Epic Candidates', purpose: 'Candidate implementation epics derived one-for-one from mapped execution tactics.', generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'pdlc_epic_item' },
+  { id: 'scope_boundaries', heading: 'Scope Boundaries', purpose: 'Explicit in-scope and out-of-scope boundaries for each mapped tactic.', generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'scope_boundary_item' },
+  { id: 'delivery_sequence', heading: 'Delivery Sequence', purpose: 'Recommended phase/order and gate logic for delivering the epic set.', generationMode: 'child_units', childSource: 'selectedExecutionTactics', atomType: 'delivery_sequence_item' },
+  { id: 'dependency_and_risk_controls', heading: 'Dependency And Risk Controls', purpose: 'Dependencies and risks that must be owned before or during epic execution.', generationMode: 'child_units', childSource: 'relevantDependencies', atomType: 'dependency_control_item' },
+  { id: 'acceptance_intent', heading: 'Acceptance Intent', purpose: 'Acceptance checks and review anchors linked to validation questions.', generationMode: 'child_units', childSource: 'relevantValidationQuestions', atomType: 'acceptance_intent_item' },
+]
+
 function buildBuExecutionPlanMessages(artifactItem, handoff) {
   const bu = (handoff.buHandoffs || []).find(b => b.buName === artifactItem.businessUnitName)
   if (!bu) return null
@@ -246,6 +267,38 @@ Use selectedExecutionTactics from COMPACT ARTIFACT BASIS only. Do not include un
 
 Generate exactly these sections:
 ${BU_PLAN_SECTIONS.map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
+
+RESPONSE SCHEMA:
+${RESPONSE_SCHEMA}`
+
+  return { messages: [{ role: 'user', content: userContent }], artifactBasis }
+}
+
+function buildPdlcEpicOutlineMessages(artifactItem, handoff) {
+  const bu = (handoff.buHandoffs || []).find(b => b.buName === artifactItem.businessUnitName)
+  if (!bu) return null
+  const artifactBasis = compileArtifactBasis(artifactItem, handoff)
+
+  const userContent = `${SYSTEM_PREAMBLE}
+
+TASK: Generate a PDLC Epic Outline for "${bu.buName}" from accepted Stage 3 source atoms.
+
+${BASIS_CONTRACT}
+
+ARTIFACT TYPE: ${artifactBasis.artifactType}
+ARTIFACT INTENT: ${artifactBasis.artifactIntent}
+
+COMPACT ARTIFACT BASIS:
+${basisJson(artifactBasis)}
+
+AUTHORING RULES:
+- Convert mapped execution tactics into implementation-ready epic candidates.
+- Include owners, gates, evidence, dependencies, risks, and acceptance checks where available.
+- Do not invent unmapped epics.
+- Do not paste Stage 3 prose; use short labeled source references only.
+
+Generate exactly these sections:
+${PDLC_EPIC_OUTLINE_SECTIONS.map((s, i) => `${i + 1}. sectionId="${s.id}" | heading="${s.heading}" | ${s.purpose}`).join('\n')}
 
 RESPONSE SCHEMA:
 ${RESPONSE_SCHEMA}`
@@ -397,6 +450,9 @@ export function buildArtifactPrompt(artifactItem, handoff) {
     case 'bu_execution_plan_partial':
       result = buildBuExecutionPlanMessages(artifactItem, handoff)
       break
+    case 'pdlc_epic_outline':
+      result = buildPdlcEpicOutlineMessages(artifactItem, handoff)
+      break
     case 'bu_sme_review_packet':
       result = buildBuSmeReviewMessages(artifactItem, handoff)
       break
@@ -416,12 +472,26 @@ export function getArtifactSectionOutline(artifactType) {
     case 'bu_execution_plan':
     case 'bu_execution_plan_partial':
       return BU_PLAN_SECTIONS
+    case 'pdlc_epic_outline':
+      return PDLC_EPIC_OUTLINE_SECTIONS
     case 'bu_sme_review_packet':
       return BU_SME_SECTIONS
     case 'global_sme_review_packet':
       return GLOBAL_SME_SECTIONS
     default:
       return null
+  }
+}
+
+export function resolveArtifactGenerator(artifactType) {
+  if (!SUPPORTED_GENERATION_TYPES.has(artifactType)) return null
+  return {
+    artifactType,
+    executionMode: 'atomic_section_child_units',
+    getSectionOutline: () => getArtifactSectionOutline(artifactType),
+    buildArtifactPrompt,
+    buildSectionPrompt: buildArtifactSectionPrompt,
+    buildChildPrompt: buildArtifactChildPrompt,
   }
 }
 

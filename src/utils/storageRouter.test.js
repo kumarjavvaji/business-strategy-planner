@@ -948,7 +948,7 @@ describe('stage4ArtifactPlan — deterministic artifact suggestions and persiste
   })
 
   it('full round-trip: build → persist → reload → verified with correct BU statuses', async () => {
-    const { buildArtifactPlan, persistArtifactPlan, ARTIFACT_READINESS } = await getArtifactModule()
+    const { buildArtifactPlan, persistArtifactPlan, ARTIFACT_READINESS, artifactReadinessBlocksGeneration } = await getArtifactModule()
     const handoff = makeHandoff([
       ['Engineering', 'ready'],
       ['HR', 'partial'],
@@ -967,10 +967,84 @@ describe('stage4ArtifactPlan — deterministic artifact suggestions and persiste
     expect(verified?.persistedAt).toBeTruthy()
     expect(verified.globalArtifacts.length).toBeGreaterThan(0)
     const engArts = verified.businessUnitArtifacts.filter(a => a.businessUnitName === 'Engineering')
-    expect(engArts.every(a => a.readinessStatus === ARTIFACT_READINESS.READY && a.selected)).toBe(true)
+    expect(engArts.some(a => a.readinessStatus === ARTIFACT_READINESS.READY && a.selected)).toBe(true)
+    expect(engArts.filter(a => artifactReadinessBlocksGeneration(a.readinessStatus)).every(a => a.selected === false)).toBe(true)
     const salesArts = verified.businessUnitArtifacts.filter(a => a.businessUnitName === 'Sales')
     expect(salesArts[0].readinessStatus).toBe(ARTIFACT_READINESS.BLOCKED)
     expect(salesArts[0].selected).toBe(false)
+  })
+
+  it('buildArtifactPlan creates BU-anchored authoring jobs with source basis, generation units, and quality policy', async () => {
+    const { buildArtifactPlan } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    const job = plan.artifacts.find(a => a.artifactType === 'bu_execution_plan')
+
+    expect(plan.planId).toBeTruthy()
+    expect(plan.stageId).toBe('stage4')
+    expect(plan.sourceRevisionIds).toEqual({ stage1: S1, stage2: S2, stage3: S3 })
+    expect(job).toBeDefined()
+    expect(job.artifactJobId).toBe(job.artifactId)
+    expect(job.artifactScope).toBe('bu')
+    expect(job.sourceBuName).toBe('Engineering')
+    expect(job.sourceBasis.sourceAtomRefs).toEqual(['atom_1', 'atom_2'])
+    expect(job.sourceBasis.requiredPanels).toContain('executionSequence')
+    expect(job.generationUnits.length).toBeGreaterThan(0)
+    expect(job.generationUnits.some(unit => unit.items?.some(item => item.atoms?.length))).toBe(true)
+    expect(job.qualityPolicy.checks).toContain('no_truncation_markers')
+    expect(plan.planningDiagnostics.generationCalled).toBe(false)
+  })
+
+  it('selected BU-scoped persisted artifact job resolves generator by artifactType and uses generation units', async () => {
+    const { buildArtifactPlan, ARTIFACT_READINESS } = await getArtifactModule()
+    const { resolveArtifactGenerator } = await import('./stage4ArtifactPrompts.js')
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    const job = plan.artifacts.find(a =>
+      a.artifactScope === 'bu' &&
+      a.artifactType === 'pdlc_epic_outline' &&
+      a.sourceBasis &&
+      a.generationUnits?.length
+    )
+    const generator = resolveArtifactGenerator(job?.artifactType)
+
+    expect(job).toBeDefined()
+    expect(job.artifactJobId).toBe(job.artifactId)
+    expect(job.readinessStatus).toBe(ARTIFACT_READINESS.READY)
+    expect(job.selected).toBe(true)
+    expect(generator).toEqual(expect.objectContaining({
+      artifactType: 'pdlc_epic_outline',
+      executionMode: 'atomic_section_child_units',
+    }))
+    expect(generator.getSectionOutline(job).map(section => section.id)).toEqual(job.generationUnits.map(unit => unit.sectionId))
+  })
+
+  it('unsupported BU artifact type remains blocked_unsupported_generator without blocking supported selected jobs', async () => {
+    const { buildArtifactPlan, ARTIFACT_READINESS } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    const supportedJob = plan.artifacts.find(a => a.artifactType === 'pdlc_epic_outline')
+    const unsupportedJob = plan.artifacts.find(a => a.artifactType === 'acceptance_criteria_draft')
+
+    expect(supportedJob.readinessStatus).toBe(ARTIFACT_READINESS.READY)
+    expect(supportedJob.selected).toBe(true)
+    expect(unsupportedJob.readinessStatus).toBe(ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR)
+    expect(unsupportedJob.selected).toBe(false)
+    expect(unsupportedJob.blockedReason).toContain(unsupportedJob.artifactType)
+  })
+
+  it('buildArtifactPlan blocks only artifacts with missing source atoms or unsupported generators', async () => {
+    const { buildArtifactPlan, ARTIFACT_READINESS, artifactReadinessBlocksGeneration } = await getArtifactModule()
+    const handoff = makeHandoff([['Engineering', 'ready']])
+    handoff.buHandoffs[0].sourceAtomIds = []
+    const plan = buildArtifactPlan(handoff, WID, S1, S2, S3)
+    const buJobs = plan.artifacts.filter(a => a.sourceBuName === 'Engineering')
+
+    expect(buJobs.length).toBeGreaterThan(0)
+    expect(buJobs.every(job => artifactReadinessBlocksGeneration(job.readinessStatus))).toBe(true)
+    expect(buJobs.some(job => job.readinessStatus === ARTIFACT_READINESS.BLOCKED_MISSING_SOURCE)).toBe(true)
+    expect(buJobs.some(job => job.readiness.blockers.some(blocker => blocker.type === 'missing_source_atoms'))).toBe(true)
+    expect(plan.planningDiagnostics.planningFailures.some(failure => failure.type === 'missing_source_atoms')).toBe(true)
   })
 
   it('selected artifacts persist and reload correctly', async () => {
@@ -1195,11 +1269,23 @@ describe('stage4ArtifactOutput — generation persist/verify contract', () => {
     const { buildArtifactPrompt } = await getPromptModule()
     const handoff = makeMockHandoff([['Engineering', 'ready']])
     const { isSupported, messages } = buildArtifactPrompt(
-      { artifactId: 'x', artifactType: 'pdlc_epic_outline', scope: 'business_unit', businessUnitName: 'Engineering', title: 'PDLC', sourceAtomIds: [] },
+      { artifactId: 'x', artifactType: 'acceptance_criteria_draft', scope: 'business_unit', businessUnitName: 'Engineering', title: 'Acceptance', sourceAtomIds: [] },
       handoff
     )
     expect(isSupported).toBe(false)
     expect(messages).toBeNull()
+  })
+
+  it('buildArtifactPrompt: returns messages for pdlc_epic_outline', async () => {
+    const { buildArtifactPrompt } = await getPromptModule()
+    const handoff = makeMockHandoff([['Engineering', 'ready']])
+    const { isSupported, messages } = buildArtifactPrompt(
+      { artifactId: 'x', artifactType: 'pdlc_epic_outline', scope: 'business_unit', businessUnitName: 'Engineering', title: 'PDLC', sourceAtomIds: ['atom_1'] },
+      handoff
+    )
+    expect(isSupported).toBe(true)
+    expect(messages[0].content).toContain('PDLC Epic Outline')
+    expect(messages[0].content).toContain('epic_candidates')
   })
 
   it('buildArtifactPrompt: returns messages for executive_decision_brief', async () => {

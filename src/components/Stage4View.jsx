@@ -13,6 +13,7 @@ import {
   isArtifactPlanStale,
   ARTIFACT_PLAN_STATUS,
   ARTIFACT_READINESS,
+  artifactReadinessBlocksGeneration,
 } from '../utils/stage4ArtifactPlan'
 import {
   buildArtifactOutput,
@@ -35,15 +36,13 @@ import {
   REVIEW_DIMENSIONS,
 } from '../utils/stage4ArtifactOutput'
 import {
-  buildArtifactSectionPrompt,
-  buildArtifactChildPrompt,
   deriveSectionChildDefs,
-  getArtifactSectionOutline,
   parseArtifactSectionResponse,
   parseArtifactChildResponse,
   generateMockArtifactSectionOutput,
   generateMockArtifactChildOutput,
   SUPPORTED_GENERATION_TYPES,
+  resolveArtifactGenerator,
 } from '../utils/stage4ArtifactPrompts'
 import { compileArtifactBasis, basisPreviewText, basisReadinessSummary } from '../utils/stage4ArtifactBasis'
 import { callAI, hasApiKey } from '../api/aiClient'
@@ -352,6 +351,10 @@ const readinessCfg = {
   [ARTIFACT_READINESS.READY]:   { color: '#00e5b4', label: 'READY' },
   [ARTIFACT_READINESS.PARTIAL]: { color: '#fb923c', label: 'PARTIAL' },
   [ARTIFACT_READINESS.BLOCKED]: { color: '#f87171', label: 'BLOCKED' },
+  [ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR]: { color: '#f87171', label: 'UNSUPPORTED GENERATOR' },
+  [ARTIFACT_READINESS.BLOCKED_MISSING_SOURCE]:        { color: '#f87171', label: 'MISSING SOURCE' },
+  [ARTIFACT_READINESS.BLOCKED_MISSING_MAPPING]:       { color: '#f87171', label: 'MISSING MAPPING' },
+  [ARTIFACT_READINESS.BLOCKED_MATERIALLY_STALE]:      { color: '#f87171', label: 'STALE SOURCE' },
 }
 
 function ReadinessBadge({ status }) {
@@ -416,7 +419,7 @@ function ArtifactCard({
   artifactGenerationStatus = null,
   sectionUnits = [],
 }) {
-  const isBlocked      = artifact.readinessStatus === ARTIFACT_READINESS.BLOCKED
+  const isBlocked      = artifactReadinessBlocksGeneration(artifact.readinessStatus)
   const isSupported    = SUPPORTED_GENERATION_TYPES.has(artifact.artifactType)
   const isGenerating   = ['generating', 'persisting', 'verifying'].includes(genPhase)
   const basisStatus = !isSupported ? 'generator_missing'
@@ -430,6 +433,10 @@ function ArtifactCard({
     basis_ready: 'Basis ready',
     basis_incomplete: 'Basis incomplete',
     generator_missing: 'Generator missing',
+    blocked_unsupported_generator: 'Unsupported generator',
+    blocked_missing_source: 'Missing source',
+    blocked_missing_mapping: 'Missing mapping',
+    blocked_materially_stale: 'Stale source',
   }[basisStatus]
   const generationLabel = generationStatus === 'generating'
     ? `Generating ${generatedCount}/${totalCount || '?'} sections`
@@ -494,6 +501,19 @@ function ArtifactCard({
         <div style={{ fontSize: 9, fontFamily: fm, color: 'var(--muted2)', lineHeight: 1.55 }}>
           {artifact.purpose}
         </div>
+        {!editing && selected && artifact.sourceBasis && (
+          <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--surface)' }}>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted)', marginBottom: 3 }}>
+              Source basis: {(artifact.sourceBasis.requiredPanels || []).join(', ') || 'no required panels'} · {(artifact.sourceBasis.sourceAtomRefs || []).length} atom refs
+            </div>
+            <div style={{ fontSize: 8, fontFamily: fm, color: 'var(--muted2)' }}>
+              Generation units: {(artifact.generationUnits || []).length} section{(artifact.generationUnits || []).length === 1 ? '' : 's'}
+              {' · '}
+              {(artifact.generationUnits || []).reduce((sum, unit) => sum + (unit.items || []).reduce((itemSum, item) => itemSum + (item.atoms || []).length, 0), 0)} atoms
+              {artifact.qualityPolicy?.checks?.length ? ` · ${artifact.qualityPolicy.checks.length} quality checks` : ''}
+            </div>
+          </div>
+        )}
         {isBlocked && artifact.blockedReason && (
           <div style={{ fontSize: 8, fontFamily: fm, color: '#f87171', marginTop: 3, lineHeight: 1.4 }}>
             Blocked: {artifact.blockedReason}
@@ -555,7 +575,7 @@ function ArtifactCard({
             )}
 
             {/* Generate / Regenerate button */}
-            {isSupported && !isGenerating && genPhase !== 'not_implemented' && (
+            {isSupported && !isGenerating && genPhase !== ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR && (
               <button
                 onClick={() => onGenerate && onGenerate(artifact)}
                 disabled={isGenerating}
@@ -994,8 +1014,8 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
   useEffect(() => {
     if (apPhase !== 'ready' || !plan || !workspaceId) return
     let cancelled = false
-    const allIds = [...(plan.globalArtifacts || []), ...(plan.businessUnitArtifacts || [])]
-      .filter(a => a.readinessStatus !== ARTIFACT_READINESS.BLOCKED)
+    const allIds = (plan.artifacts?.length ? plan.artifacts : [...(plan.globalArtifacts || []), ...(plan.businessUnitArtifacts || [])])
+      .filter(a => !artifactReadinessBlocksGeneration(a.readinessStatus))
       .map(a => a.artifactId)
     loadAllArtifactOutputs(workspaceId, stage1ActiveId, stage2ActiveId, stage3ActiveId, allIds)
       .then(loaded => { if (!cancelled) setOutputs(loaded) })
@@ -1018,13 +1038,20 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       if (!durablePlan) throw Object.assign(new Error('Artifact plan not found in storage. Save the artifact plan before generating.'), { failureType: 'generation_failed' })
 
       // Verify the artifact is still selected in the persisted plan
-      const allItems = [...(durablePlan.globalArtifacts || []), ...(durablePlan.businessUnitArtifacts || [])]
+      const allItems = durablePlan.artifacts?.length ? durablePlan.artifacts : [...(durablePlan.globalArtifacts || []), ...(durablePlan.businessUnitArtifacts || [])]
       const durableItem = allItems.find(a => a.artifactId === id)
       if (!durableItem?.selected) throw Object.assign(new Error('This artifact is not selected in the saved plan. Select it and save the plan first.'), { failureType: 'generation_failed' })
 
-      // Check support
-      if (!SUPPORTED_GENERATION_TYPES.has(durableItem.artifactType)) {
-        setGenState(prev => ({ ...prev, [id]: { phase: 'not_implemented', error: 'Generation not yet implemented for this artifact type.', failureType: null } }))
+      const generator = resolveArtifactGenerator(durableItem.artifactType)
+      if (!generator) {
+        setGenState(prev => ({
+          ...prev,
+          [id]: {
+            phase: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR,
+            error: `No registered generator for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`,
+            failureType: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR,
+          },
+        }))
         generatingRef.current.delete(id)
         return
       }
@@ -1035,9 +1062,24 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
       }
 
       // Build and call — mock when no API key
-      const sectionOutline = getArtifactSectionOutline(durableItem.artifactType)
+      const sectionOutline = durableItem.generationUnits?.length
+        ? durableItem.generationUnits.map(unit => ({
+            id: unit.sectionId,
+            heading: unit.heading,
+            purpose: unit.purpose,
+            generationMode: unit.generationMode,
+            staticAtoms: unit.items?.flatMap(item => (item.atoms || []).map(atom => ({
+              atomId: String(atom.atomId || '').startsWith(`${unit.sectionId}:`)
+                ? String(atom.atomId).slice(`${unit.sectionId}:`.length)
+                : atom.atomId,
+              atomType: atom.intendedOutputRole,
+              label: item.label || atom.itemId,
+              inputBasis: atom.promptPurpose,
+            }))),
+          }))
+        : generator.getSectionOutline(durableItem)
       if (!sectionOutline?.length) {
-        setGenState(prev => ({ ...prev, [id]: { phase: 'not_implemented', error: 'Generation not yet implemented for this artifact type.', failureType: null } }))
+        setGenState(prev => ({ ...prev, [id]: { phase: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR, error: `No executable section outline is registered for artifact type "${durableItem.artifactType}" on artifact "${durableItem.artifactId}".`, failureType: ARTIFACT_READINESS.BLOCKED_UNSUPPORTED_GENERATOR } }))
         generatingRef.current.delete(id)
         return
       }
@@ -1086,7 +1128,7 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
               continue
             }
 
-            const { messages } = buildArtifactChildPrompt(durableItem, durableHandoff, sectionDef, childDef, artifactBasis)
+            const { messages } = generator.buildChildPrompt(durableItem, durableHandoff, sectionDef, childDef, artifactBasis)
             const response = await callAI(messages, { temperature: 0.3, maxTokens: 700 })
             if (response.error) {
               // Atom failed — persist its failed state and continue to the next atom
@@ -1120,7 +1162,7 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
           continue
         }
 
-        const { messages } = buildArtifactSectionPrompt(durableItem, durableHandoff, sectionDef, artifactBasis)
+        const { messages } = generator.buildSectionPrompt(durableItem, durableHandoff, sectionDef, artifactBasis)
         const response = await callAI(messages, { temperature: 0.3, maxTokens: 900 })
         if (response.error) {
           sectionUnits[i] = applySectionGenerationFailure(currentUnit, response.error)
@@ -1260,14 +1302,22 @@ function ArtifactPlanningSection({ handoff, workspaceId, stage1ActiveId, stage2A
 
     const applySelections = artifacts => artifacts.map(a => ({
       ...a,
-      selected: a.readinessStatus !== ARTIFACT_READINESS.BLOCKED && selectedIds.has(a.artifactId),
+      selected: !artifactReadinessBlocksGeneration(a.readinessStatus) && selectedIds.has(a.artifactId),
       updatedAt: new Date().toISOString(),
     }))
 
+    const nextGlobalArtifacts = applySelections(editingPlan.globalArtifacts)
+    const nextBusinessUnitArtifacts = applySelections(editingPlan.businessUnitArtifacts)
+    const nextSelectedById = new Map([...nextGlobalArtifacts, ...nextBusinessUnitArtifacts].map(a => [a.artifactId, a.selected]))
     const planToSave = {
       ...editingPlan,
-      globalArtifacts:      applySelections(editingPlan.globalArtifacts),
-      businessUnitArtifacts: applySelections(editingPlan.businessUnitArtifacts),
+      globalArtifacts:      nextGlobalArtifacts,
+      businessUnitArtifacts: nextBusinessUnitArtifacts,
+      artifacts: (editingPlan.artifacts || [...nextGlobalArtifacts, ...nextBusinessUnitArtifacts]).map(a => ({
+        ...a,
+        selected: !artifactReadinessBlocksGeneration(a.readinessStatus) && Boolean(nextSelectedById.get(a.artifactId)),
+        updatedAt: new Date().toISOString(),
+      })),
       status,
     }
 

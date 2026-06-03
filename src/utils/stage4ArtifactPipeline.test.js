@@ -27,6 +27,7 @@ import {
   applySectionGenerationSuccess,
   applySectionGenerationFailure,
   buildArtifactProgressOutput,
+  auditArtifactOutput,
   OUTPUT_STATUS,
 } from './stage4ArtifactOutput'
 import { ARTIFACT_SECTION_LIFECYCLE, ARTIFACT_GENERATION_STATUS } from './stage4ArtifactLifecycle'
@@ -188,6 +189,46 @@ describe('atom identity', () => {
     expect(unit.inputBasis).toBe(atomDef.inputBasis)
     expect(unit.isStaticAtom).toBe(true)
     expect(unit.sourceAtomRefs).toEqual(atomDef.sourceAtomRefs)
+  })
+})
+
+describe('artifact quality issue taxonomy', () => {
+  it('flags truncation, repetition, copied source prose, and provides actionable remediation metadata', () => {
+    const copiedSource = 'Use before architecture sign-off when model explainability controls must be reviewed in detail by accountable reviewers and delivery owners.'
+    const basis = {
+      ...ARTIFACT_BASIS,
+      selectedExecutionTactics: [{ ...ARTIFACT_BASIS.selectedExecutionTactics[0], whenToUse: copiedSource }],
+    }
+    const audit = auditArtifactOutput({
+      artifactBasis: basis,
+      contentSections: [
+        {
+          sectionId: 's1',
+          heading: 'Section One',
+          purpose: 'Purpose',
+          body: `${copiedSource} ...`,
+          sourceAtomIds: ['atom_a'],
+        },
+        {
+          sectionId: 's2',
+          heading: 'Section Two',
+          purpose: 'Purpose',
+          body: `${copiedSource} ...`,
+          sourceAtomIds: ['atom_a'],
+        },
+      ],
+    })
+
+    expect(audit.status).toBe('needs_revision')
+    expect(audit.findings.some(f => f.issueType === 'genuinely_truncated')).toBe(true)
+    expect(audit.findings.some(f => f.issueType === 'repeated_content')).toBe(true)
+    expect(audit.findings.some(f => f.issueType === 'copied_source_prose')).toBe(true)
+    audit.findings.forEach(finding => {
+      expect(finding.exactReason).toBeTruthy()
+      expect(finding.remediationAction).toBeTruthy()
+      expect(finding).toHaveProperty('regenerationRequired')
+      expect(finding).toHaveProperty('autoFixable')
+    })
   })
 })
 
@@ -495,7 +536,6 @@ describe('atom prompt content', () => {
 
 describe('unsupported artifact types', () => {
   const UNSUPPORTED = [
-    'pdlc_epic_outline',
     'acceptance_criteria_draft',
     'implementation_governance_checklist',
     'risk_control_plan',
@@ -507,6 +547,15 @@ describe('unsupported artifact types', () => {
   it.each(UNSUPPORTED)('%s returns no section outline (safe no-op)', (artifactType) => {
     expect(getArtifactSectionOutline(artifactType)).toBeNull()
     expect(SUPPORTED_GENERATION_TYPES.has(artifactType)).toBe(false)
+  })
+})
+
+describe('pdlc epic outline generator registration', () => {
+  it('uses child-unit sections from the persisted generation-unit shape', () => {
+    const outline = getArtifactSectionOutline('pdlc_epic_outline')
+    expect(SUPPORTED_GENERATION_TYPES.has('pdlc_epic_outline')).toBe(true)
+    expect(outline.map(section => section.id)).toContain('epic_candidates')
+    expect(outline.every(section => section.generationMode === 'child_units')).toBe(true)
   })
 })
 
